@@ -1,0 +1,363 @@
+package poller
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/lifeart/tsctl/internal/store"
+)
+
+func nopLogf(string, ...any) {}
+
+// --- fakes --------------------------------------------------------------------
+
+type fakeNM struct {
+	nodes []store.NodeView
+	err   error
+}
+
+func (f *fakeNM) Inventory(ctx context.Context) ([]store.NodeView, error) { return f.nodes, f.err }
+
+type fakeRC struct {
+	mu         sync.Mutex
+	statusRT   store.RouterRuntime
+	statusErr  error
+	setRT      store.RouterRuntime
+	setErr     error
+	setCalls   int
+	lastAddr   string
+	lastTarget *store.ExitNodeRef
+	lastPrev   *store.ExitNodeRef
+}
+
+func (f *fakeRC) Status(ctx context.Context, addr string) (store.RouterRuntime, error) {
+	return f.statusRT, f.statusErr
+}
+
+func (f *fakeRC) SetExitNode(ctx context.Context, addr string, target, prev *store.ExitNodeRef) (store.RouterRuntime, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.setCalls++
+	f.lastAddr, f.lastTarget, f.lastPrev = addr, target, prev
+	return f.setRT, f.setErr
+}
+
+func (f *fakeRC) calls() int { f.mu.Lock(); defer f.mu.Unlock(); return f.setCalls }
+
+type fakeBC struct {
+	mu    sync.Mutex
+	snaps []*store.Snapshot
+	ch    chan *store.Snapshot
+}
+
+func newFakeBC() *fakeBC { return &fakeBC{ch: make(chan *store.Snapshot, 256)} }
+
+func (f *fakeBC) Broadcast(s *store.Snapshot) {
+	f.mu.Lock()
+	f.snaps = append(f.snaps, s)
+	f.mu.Unlock()
+	select {
+	case f.ch <- s:
+	default:
+	}
+}
+
+func (f *fakeBC) count() int { f.mu.Lock(); defer f.mu.Unlock(); return len(f.snaps) }
+
+// stderrError mimics the router package's error exposing Stderr().
+type stderrError struct{ msg, stderr string }
+
+func (e *stderrError) Error() string  { return e.msg }
+func (e *stderrError) Stderr() string { return e.stderr }
+
+// --- tests --------------------------------------------------------------------
+
+func TestRefresh_BuildsSnapshot(t *testing.T) {
+	routerIP, exitIP := "100.64.0.10", "100.64.0.20"
+	nm := &fakeNM{nodes: []store.NodeView{
+		{StableID: "router1", Name: "r1", TailscaleIPs: []string{routerIP}, Online: true, Type: store.NodeRouter},
+		{StableID: "exit1", Name: "e1", TailscaleIPs: []string{exitIP}, Online: true, ExitNodeOption: true, Type: store.NodeExitNode},
+	}}
+	rc := &fakeRC{statusRT: store.RouterRuntime{
+		Online:  true,
+		Current: &store.ExitNodeRef{StableID: "exit1", Name: "e1", IP: exitIP},
+		Stats:   store.RouterStats{RxBytes: 100, TxBytes: 200},
+	}}
+	bc := newFakeBC()
+	st := store.New()
+	p := New(st, nm, rc, []string{routerIP}, bc, make(chan int), time.Second, nopLogf)
+
+	if err := p.Refresh(context.Background()); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	snap := st.Load()
+	if len(snap.Nodes) != 2 {
+		t.Fatalf("nodes = %d, want 2", len(snap.Nodes))
+	}
+	if len(snap.Routers) != 1 {
+		t.Fatalf("routers = %d, want 1", len(snap.Routers))
+	}
+	rv := snap.Routers[0]
+	if !rv.Reachable {
+		t.Error("router should be reachable")
+	}
+	if rv.State != store.RouterOK {
+		t.Errorf("state = %q, want ok", rv.State)
+	}
+	if rv.Node.StableID != "router1" {
+		t.Errorf("router node matched by IP wrong: %+v", rv.Node)
+	}
+	if rv.CurrentExitNode == nil || rv.CurrentExitNode.StableID != "exit1" {
+		t.Errorf("currentExitNode = %+v", rv.CurrentExitNode)
+	}
+	if rv.Stats.RxBytes != 100 {
+		t.Errorf("stats not carried: %+v", rv.Stats)
+	}
+	if bc.count() == 0 {
+		t.Error("expected a broadcast")
+	}
+}
+
+func TestRefresh_NetmapErrSurfacedNotAborted(t *testing.T) {
+	nm := &fakeNM{err: errors.New("netmap down")}
+	rc := &fakeRC{statusErr: errors.New("ssh dial failed")}
+	bc := newFakeBC()
+	st := store.New()
+	p := New(st, nm, rc, []string{"100.64.0.10"}, bc, make(chan int), time.Second, nopLogf)
+
+	err := p.Refresh(context.Background())
+	if err == nil {
+		t.Error("expected inventory error to be returned")
+	}
+	snap := st.Load()
+	if snap.NetmapErr == "" {
+		t.Error("NetmapErr must be set")
+	}
+	if len(snap.Routers) != 1 {
+		t.Fatalf("router must still appear: routers = %d", len(snap.Routers))
+	}
+	rv := snap.Routers[0]
+	if rv.Reachable {
+		t.Error("router should be unreachable")
+	}
+	if rv.State != store.RouterUnreachable {
+		t.Errorf("state = %q, want unreachable", rv.State)
+	}
+	if rv.LastError == "" {
+		t.Error("LastError must be surfaced, never swallowed")
+	}
+	if bc.count() == 0 {
+		t.Error("snapshot must still be broadcast on error")
+	}
+}
+
+func seedSnapshot(st *store.Store, routerIP, exitIP string, exitOnline, exitApproved bool) {
+	st.Store(&store.Snapshot{
+		Nodes: []store.NodeView{
+			{StableID: "router1", TailscaleIPs: []string{routerIP}, Online: true, Type: store.NodeRouter},
+			{StableID: "exit1", Name: "e1", TailscaleIPs: []string{exitIP}, Online: exitOnline, ExitNodeOption: exitApproved, Type: store.NodeExitNode},
+		},
+		Routers: []store.RouterView{
+			{Node: store.NodeView{StableID: "router1", TailscaleIPs: []string{routerIP}}, Reachable: true, State: store.RouterOK},
+		},
+	})
+}
+
+func TestSetExitNode_Success(t *testing.T) {
+	routerIP, exitIP := "100.64.0.10", "100.64.0.20"
+	st := store.New()
+	seedSnapshot(st, routerIP, exitIP, true, true)
+	rc := &fakeRC{setRT: store.RouterRuntime{Online: true, Current: &store.ExitNodeRef{StableID: "exit1", IP: exitIP}}}
+	bc := newFakeBC()
+	p := New(st, &fakeNM{}, rc, []string{routerIP}, bc, make(chan int), time.Second, nopLogf)
+
+	rv, err := p.SetExitNode(context.Background(), "router1", "exit1")
+	if err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	if rv.State != store.RouterOK {
+		t.Errorf("state = %q, want ok", rv.State)
+	}
+	if rv.CurrentExitNode == nil || rv.CurrentExitNode.StableID != "exit1" {
+		t.Errorf("currentExitNode = %+v", rv.CurrentExitNode)
+	}
+	if rv.Desired != nil {
+		t.Errorf("desired should clear on confirmed success, got %+v", rv.Desired)
+	}
+	if rc.lastAddr != routerIP {
+		t.Errorf("dialed addr = %q, want %q", rc.lastAddr, routerIP)
+	}
+	if rc.lastTarget == nil || rc.lastTarget.IP != exitIP {
+		t.Errorf("target = %+v, want IP %s", rc.lastTarget, exitIP)
+	}
+	if bc.count() < 2 {
+		t.Errorf("broadcasts = %d, want >=2 (pending + final)", bc.count())
+	}
+}
+
+func TestSetExitNode_Clear(t *testing.T) {
+	routerIP := "100.64.0.10"
+	st := store.New()
+	seedSnapshot(st, routerIP, "100.64.0.20", true, true)
+	rc := &fakeRC{setRT: store.RouterRuntime{Online: true, Current: nil}}
+	p := New(st, &fakeNM{}, rc, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+
+	rv, err := p.SetExitNode(context.Background(), "router1", "") // "" = clear
+	if err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	if rv.CurrentExitNode != nil {
+		t.Errorf("currentExitNode should be nil after clear, got %+v", rv.CurrentExitNode)
+	}
+	if rc.lastTarget != nil {
+		t.Errorf("target should be nil for clear, got %+v", rc.lastTarget)
+	}
+	if rc.calls() != 1 {
+		t.Errorf("SetExitNode calls = %d, want 1", rc.calls())
+	}
+}
+
+func TestSetExitNode_PreflightRefusals(t *testing.T) {
+	routerIP, exitIP := "100.64.0.10", "100.64.0.20"
+
+	t.Run("offline target", func(t *testing.T) {
+		st := store.New()
+		seedSnapshot(st, routerIP, exitIP, false, true) // offline
+		rc := &fakeRC{}
+		p := New(st, &fakeNM{}, rc, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+		_, err := p.SetExitNode(context.Background(), "router1", "exit1")
+		assertPreflight(t, err)
+		if rc.calls() != 0 {
+			t.Errorf("router must not be touched on refusal, calls = %d", rc.calls())
+		}
+	})
+	t.Run("unapproved target", func(t *testing.T) {
+		st := store.New()
+		seedSnapshot(st, routerIP, exitIP, true, false) // not ExitNodeOption
+		rc := &fakeRC{}
+		p := New(st, &fakeNM{}, rc, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+		_, err := p.SetExitNode(context.Background(), "router1", "exit1")
+		assertPreflight(t, err)
+		if rc.calls() != 0 {
+			t.Errorf("router must not be touched on refusal, calls = %d", rc.calls())
+		}
+	})
+	t.Run("unknown router", func(t *testing.T) {
+		st := store.New()
+		seedSnapshot(st, routerIP, exitIP, true, true)
+		p := New(st, &fakeNM{}, &fakeRC{}, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+		_, err := p.SetExitNode(context.Background(), "ghost", "exit1")
+		assertPreflight(t, err)
+	})
+}
+
+func assertPreflight(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("expected a preflight error")
+	}
+	var hs interface{ HTTPStatus() int }
+	if !errors.As(err, &hs) || hs.HTTPStatus() != 400 {
+		t.Fatalf("expected 400 preflight error, got %v", err)
+	}
+}
+
+func TestSetExitNode_RouterFailureIs502WithStderr(t *testing.T) {
+	routerIP, exitIP := "100.64.0.10", "100.64.0.20"
+	st := store.New()
+	seedSnapshot(st, routerIP, exitIP, true, true)
+	rc := &fakeRC{setErr: &stderrError{msg: "ssh failed", stderr: "permission denied"}} // setRT zero => Online false
+	bc := newFakeBC()
+	p := New(st, &fakeNM{}, rc, []string{routerIP}, bc, make(chan int), time.Second, nopLogf)
+
+	rv, err := p.SetExitNode(context.Background(), "router1", "exit1")
+	if err == nil {
+		t.Fatal("expected a router error")
+	}
+	var hs interface{ HTTPStatus() int }
+	if !errors.As(err, &hs) || hs.HTTPStatus() != 502 {
+		t.Errorf("expected 502, got %v", err)
+	}
+	var se interface{ Stderr() string }
+	if !errors.As(err, &se) || se.Stderr() != "permission denied" {
+		t.Errorf("stderr not surfaced through the error: %v", err)
+	}
+	if rv.State != store.RouterUnreachable {
+		t.Errorf("state = %q, want unreachable", rv.State)
+	}
+	if rv.LastError == "" {
+		t.Error("LastError must be set")
+	}
+}
+
+func TestSetExitNode_AppliedButUnconfirmed(t *testing.T) {
+	routerIP, exitIP := "100.64.0.10", "100.64.0.20"
+	st := store.New()
+	seedSnapshot(st, routerIP, exitIP, true, true)
+	// Router answered (Online true) but the error signals the confirm didn't match.
+	rc := &fakeRC{
+		setRT:  store.RouterRuntime{Online: true, Current: nil},
+		setErr: errors.New("confirm read mismatch"),
+	}
+	p := New(st, &fakeNM{}, rc, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+
+	rv, err := p.SetExitNode(context.Background(), "router1", "exit1")
+	if err != nil {
+		t.Fatalf("an applied-but-unconfirmed result is reported via state, not a hard error: %v", err)
+	}
+	if rv.State != store.RouterUnconfirmed {
+		t.Errorf("state = %q, want unconfirmed", rv.State)
+	}
+	if rv.LastError == "" {
+		t.Error("LastError must carry the confirm failure")
+	}
+	if rv.Desired == nil || rv.Desired.StableID != "exit1" {
+		t.Errorf("desired must remain the requested target, got %+v", rv.Desired)
+	}
+}
+
+func TestRun_IdleSuspension(t *testing.T) {
+	routerIP := "100.64.0.10"
+	nm := &fakeNM{nodes: []store.NodeView{{StableID: "router1", TailscaleIPs: []string{routerIP}, Type: store.NodeRouter}}}
+	rc := &fakeRC{statusRT: store.RouterRuntime{Online: true}}
+	bc := newFakeBC()
+	st := store.New()
+	tr := make(chan int, 1)
+	p := New(st, nm, rc, []string{routerIP}, bc, tr, 10*time.Millisecond, nopLogf)
+	p.linger = 30 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go p.Run(ctx)
+
+	// No clients yet: nothing should be polled.
+	time.Sleep(40 * time.Millisecond)
+	if bc.count() != 0 {
+		t.Fatalf("poller ran while idle: %d broadcasts", bc.count())
+	}
+
+	// 0->1: first-viewer refresh + ticking starts.
+	tr <- 1
+	select {
+	case <-bc.ch:
+	case <-time.After(time.Second):
+		t.Fatal("no broadcast after 0->1 transition")
+	}
+	time.Sleep(60 * time.Millisecond)
+	if got := bc.count(); got < 2 {
+		t.Errorf("expected continued ticking while active, got %d broadcasts", got)
+	}
+
+	// 1->0: linger, then suspend.
+	tr <- 0
+	time.Sleep(p.linger + 80*time.Millisecond)
+	c1 := bc.count()
+	time.Sleep(80 * time.Millisecond)
+	c2 := bc.count()
+	if c2 != c1 {
+		t.Errorf("polling did not suspend after linger: %d -> %d", c1, c2)
+	}
+}

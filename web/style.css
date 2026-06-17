@@ -1,0 +1,423 @@
+/* tsctl SPA — Apple HIG (macOS/iOS Settings) inspired design.
+   Pure CSS, system fonts, inline SVG only. No build step, no external assets.
+   Hierarchy comes from type weight + spacing, not heavy borders. */
+
+:root {
+  color-scheme: light dark;
+
+  /* ---- light theme (default) ---- */
+  --bg: #f2f2f7;            /* iOS grouped background */
+  --card: #ffffff;          /* grouped card surface */
+  --card-nested: #f2f2f7;
+  --fill: rgba(120, 120, 128, 0.12);       /* control fill */
+  --fill-strong: rgba(120, 120, 128, 0.2);
+
+  --text: #1c1c1e;
+  --text-secondary: rgba(60, 60, 67, 0.6);
+  --text-tertiary: rgba(60, 60, 67, 0.3);
+  --separator: rgba(60, 60, 67, 0.16);     /* hairline */
+
+  --accent: #007aff;
+  --accent-tint: rgba(0, 122, 255, 0.12);
+  --c-accent: #0067d6;     /* readable accent text */
+
+  --green: #34c759;
+  --green-tint: rgba(52, 199, 89, 0.16);
+  --c-green: #248a3d;      /* readable on light tint */
+
+  --amber: #ff9500;
+  --amber-tint: rgba(255, 149, 0, 0.18);
+  --c-amber: #8a5300;
+
+  --red: #ff3b30;
+  --red-tint: rgba(255, 59, 48, 0.14);
+  --c-red: #c70d12;
+
+  --indigo: #5856d6;
+  --indigo-tint: rgba(88, 86, 214, 0.14);
+  --c-indigo: #413fb0;
+
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.05), 0 0 1px rgba(0, 0, 0, 0.04);
+  --topbar-bg: rgba(249, 249, 251, 0.72);
+
+  --radius: 12px;
+  --radius-lg: 16px;
+  --radius-pill: 999px;
+  --col: 44rem;
+
+  --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue",
+    system-ui, sans-serif;
+  --t: 220ms ease-out;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #000000;
+    --card: #1c1c1e;
+    --card-nested: #2c2c2e;
+    --fill: rgba(120, 120, 128, 0.24);
+    --fill-strong: rgba(120, 120, 128, 0.4);
+
+    --text: #ffffff;
+    --text-secondary: rgba(235, 235, 245, 0.6);
+    --text-tertiary: rgba(235, 235, 245, 0.3);
+    --separator: rgba(84, 84, 88, 0.6);
+
+    --accent: #0a84ff;
+    --accent-tint: rgba(10, 132, 255, 0.24);
+    --c-accent: #4da3ff;
+
+    --green: #30d158;
+    --green-tint: rgba(48, 209, 88, 0.22);
+    --c-green: #41d367;
+
+    --amber: #ff9f0a;
+    --amber-tint: rgba(255, 159, 10, 0.22);
+    --c-amber: #ffb340;
+
+    --red: #ff453b;
+    --red-tint: rgba(255, 69, 58, 0.22);
+    --c-red: #ff6961;
+
+    --indigo: #5e5ce6;
+    --indigo-tint: rgba(94, 92, 230, 0.26);
+    --c-indigo: #9b99ff;
+
+    --shadow: none;
+    --topbar-bg: rgba(22, 22, 24, 0.72);
+  }
+}
+
+* { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  font-family: var(--font);
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.4;
+  font-size: 16px;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* ------------------------------------------------------------ top bar --- */
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--topbar-bg);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  backdrop-filter: saturate(180%) blur(20px);
+  border-bottom: 1px solid var(--separator);
+}
+.topbar-inner {
+  max-width: var(--col);
+  margin: 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  min-height: 52px;
+  padding: 0.5rem max(1rem, env(safe-area-inset-right))
+    0.5rem max(1rem, env(safe-area-inset-left));
+}
+.topbar-title {
+  margin: 0;
+  font-size: 1.125rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+/* connection pill */
+.conn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  padding: 0.25rem 0.6rem;
+  border-radius: var(--radius-pill);
+  transition: color var(--t), background var(--t);
+  white-space: nowrap;
+}
+.conn-live { color: var(--c-green); background: var(--green-tint); }
+.conn-wait { color: var(--text-secondary); background: var(--fill); }
+.conn .dot,
+.conn .spinner { width: 0.7rem; height: 0.7rem; }
+
+/* ------------------------------------------------------------ layout ---- */
+.container {
+  max-width: var(--col);
+  margin: 0 auto;
+  padding: 1.25rem max(1rem, env(safe-area-inset-right))
+    3rem max(1rem, env(safe-area-inset-left));
+}
+.section { margin-top: 1.75rem; }
+.section:first-of-type { margin-top: 0.5rem; }
+.section-title {
+  margin: 0 0 0.5rem;
+  padding: 0 1rem;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--text-secondary);
+}
+
+/* ----------------------------------------------------------- banners ---- */
+#banners:not(:empty) { margin-bottom: 0.5rem; }
+.banner {
+  padding: 0.7rem 0.9rem;
+  border-radius: var(--radius);
+  margin-bottom: 0.5rem;
+  font-size: 0.875rem;
+  line-height: 1.35;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.banner-error { background: var(--red-tint); color: var(--c-red); }
+.banner-warn { background: var(--amber-tint); color: var(--c-amber); }
+
+/* ----------------------------------------------- grouped list (nodes) --- */
+.list-group {
+  background: var(--card);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.list-group:empty { display: none; }
+
+.node {
+  position: relative;
+  padding: 0.75rem 1rem;
+}
+.list-group > .node:not(:last-child)::after {
+  content: "";
+  position: absolute;
+  left: 1rem;
+  right: 0;
+  bottom: 0;
+  height: 1px;
+  background: var(--separator);
+}
+.node-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.node-head .dot { order: 0; }
+.node-name {
+  order: 1;
+  font-weight: 600;
+  font-size: 1rem;
+}
+.node-head .badge { order: 2; margin-left: auto; }
+
+.node-ips {
+  margin-top: 0.2rem;
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+  font-variant-numeric: tabular-nums;
+}
+.node-meta {
+  margin-top: 0.1rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+}
+
+/* ----------------------------------------------- router cards ----------- */
+.router-list { display: flex; flex-direction: column; gap: 0.85rem; }
+.router {
+  background: var(--card);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+  padding: 0.9rem 1rem 1rem;
+}
+.router-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.router-name { font-weight: 600; font-size: 1rem; }
+.router-head .state { margin-left: auto; }
+
+.router-ips {
+  margin-top: 0.25rem;
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.current {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-top: 0.6rem;
+  font-size: 0.9375rem;
+}
+.current-text { font-variant-numeric: tabular-nums; }
+.arrow-icon { flex: none; color: var(--text-secondary); }
+
+/* ----------------------------------------------- dots & icons ---------- */
+.dot {
+  display: inline-block;
+  flex: none;
+  width: 0.62rem;
+  height: 0.62rem;
+}
+.dot circle { fill: currentColor; }
+.dot-on { color: var(--green); }
+.dot-off { color: var(--text-tertiary); }
+
+.spinner {
+  display: inline-block;
+  flex: none;
+  width: 0.9rem;
+  height: 0.9rem;
+  color: currentColor;
+  animation: spin 0.8s linear infinite;
+  transform-origin: center;
+}
+
+/* ----------------------------------------------- badges & state -------- */
+.badge,
+.state {
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  padding: 0.15rem 0.5rem;
+  border-radius: var(--radius-pill);
+  white-space: nowrap;
+}
+.badge { background: var(--fill); color: var(--text-secondary); }
+.badge-exit-node { background: var(--accent-tint); color: var(--c-accent); }
+.badge-router { background: var(--indigo-tint); color: var(--c-indigo); }
+.badge-generic { background: var(--fill); color: var(--text-secondary); }
+
+.state-ok { background: var(--green-tint); color: var(--c-green); }
+.state-pending { background: var(--amber-tint); color: var(--c-amber); }
+.state-unconfirmed { background: var(--amber-tint); color: var(--c-amber); }
+.state-unreachable { background: var(--red-tint); color: var(--c-red); }
+.state-unknown { background: var(--fill); color: var(--text-secondary); }
+
+/* ----------------------------------------------- picker / select ------- */
+.picker {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin-top: 0.75rem;
+}
+.picker-label {
+  font-size: 0.875rem;
+  color: var(--text-secondary);
+}
+.select-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  flex: 1 1 14rem;
+  min-width: 12rem;
+  max-width: 26rem;
+}
+.exit-select {
+  font: inherit;
+  font-size: 1rem;
+  color: var(--text);
+  background: var(--fill);
+  border: none;
+  border-radius: 10px;
+  width: 100%;
+  min-height: 44px;            /* 44px hit target */
+  padding: 0 2.25rem 0 0.85rem;
+  margin: 0;
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+  transition: background var(--t);
+}
+.exit-select:hover { background: var(--fill-strong); }
+.exit-select:disabled {
+  color: var(--text-secondary);
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+.select-chevron {
+  position: absolute;
+  right: 0.7rem;
+  color: var(--text-secondary);
+  pointer-events: none;
+}
+.exit-select:disabled + .select-chevron { opacity: 0.5; }
+
+/* ----------------------------------------------- pending indicator ----- */
+.pending {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.8125rem;
+  flex: 1 1 100%;
+}
+.pending-spin { color: var(--c-amber); }
+.pending-amber { color: var(--c-amber); }
+
+/* ----------------------------------------------- stats & errors -------- */
+.stats {
+  margin-top: 0.7rem;
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+  font-variant-numeric: tabular-nums;
+}
+.error-box {
+  margin-top: 0.7rem;
+  padding: 0.6rem 0.75rem;
+  border-radius: var(--radius);
+  background: var(--red-tint);
+  color: var(--c-red);
+  font-size: 0.8125rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ----------------------------------------------- empty / footer -------- */
+.empty {
+  color: var(--text-secondary);
+  font-size: 0.9375rem;
+  text-align: center;
+  padding: 1.75rem 1rem;
+}
+.footer {
+  margin-top: 1.75rem;
+  padding: 0 1rem;
+  color: var(--text-tertiary);
+  font-size: 0.8125rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.hidden { display: none !important; }
+
+/* ----------------------------------------------- focus & motion -------- */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 8px;
+}
+.exit-select:focus-visible { outline-offset: 1px; }
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}

@@ -2,19 +2,47 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>tsctl — scaffold</title>
-    <style>
-      body { font-family: system-ui, sans-serif; margin: 3rem auto; max-width: 40rem; color: #1a1a1a; }
-      code { background: #f0f0f0; padding: 0.1rem 0.3rem; border-radius: 3px; }
-    </style>
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#f2f2f7" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)" />
+    <title>tsctl — exit-node manager</title>
+    <link rel="stylesheet" href="style.css" />
   </head>
   <body>
-    <h1>tsctl — scaffold</h1>
-    <p>Tailscale exit-node manager. This is the Phase A placeholder UI.</p>
-    <p>The real SPA (node list, exit-node picker, pending/actual state, live SSE
-      updates) is built in Phase B by the frontend agent.</p>
-    <p>API surface: <code>GET /api/nodes</code>, <code>GET /api/routers/{id}</code>,
-      <code>POST /api/routers/{id}/exit-node</code>, <code>GET /api/events</code> (SSE).</p>
+    <header class="topbar">
+      <div class="topbar-inner">
+        <h1 class="topbar-title">tsctl</h1>
+        <div id="conn-status" class="conn conn-wait" role="status" aria-live="polite">
+          connecting…
+        </div>
+      </div>
+    </header>
+
+    <main class="container">
+      <div id="banners" aria-live="polite">
+        <div id="global-error" class="banner banner-error hidden" role="alert"></div>
+        <div id="netmap-err" class="banner banner-error hidden" role="alert"></div>
+        <div id="stale-banner" class="banner banner-warn hidden" role="status"></div>
+      </div>
+
+      <section class="section">
+        <h2 class="section-title">Routers</h2>
+        <div id="routers" class="router-list"></div>
+        <p id="routers-empty" class="empty hidden">No routers configured.</p>
+      </section>
+
+      <section class="section">
+        <h2 class="section-title">Nodes</h2>
+        <div id="nodes" class="list-group"></div>
+        <p id="nodes-empty" class="empty hidden">No nodes in the netmap yet.</p>
+      </section>
+
+      <footer class="footer">
+        <span id="updated"></span>
+      </footer>
+    </main>
+
+    <script src="app.js"></script>
   </body>
 </html>

@@ -6,5 +6,5 @@ import "embed"
 
 // FS holds the embedded static assets. Serve with http.FileServerFS(web.FS).
 //
-//go:embed index.html
+//go:embed index.html app.js style.css
 var FS embed.FS

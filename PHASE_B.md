@@ -106,6 +106,19 @@ Double-submit cookie + Host pinning + Origin check on every non-GET/HEAD:
 
 Vanilla JS (no build step) embedded via the existing `web` package. On load: `GET /api/csrf` (store token), open `EventSource('/api/events')`, render from Snapshot frames (fall back to `GET /api/nodes` if SSE not yet open). Show: node list with type badge + online/lastSeen + IPs/OS; for each `RouterView`, current exit node + a picker of the approved exit-node options (nodes with `exitNodeOption`), stats, and `state`. On pick → `POST /api/routers/{id}/exit-node` with the CSRF header; reflect the returned/streamed **actual** state — show `pending`/`unconfirmed` distinctly, never optimistic success. Surface `lastError`/`netmapErr` and snapshot staleness (`builtAt`). Keep it lightweight.
 
+### 8a. Visual design — Apple-like (required)
+
+Model the look on Apple HIG (macOS/iOS Settings). Restraint over decoration; hierarchy from type weight + spacing, not borders. Still no build step / no external assets / no CDN — pure CSS, system fonts, inline SVG only.
+
+- **Type:** system stack `-apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", system-ui, sans-serif`; tabular figures (`font-variant-numeric: tabular-nums`) for stats/IPs. Hierarchy via weight (600 headings / 400 body) and size, generous line-height.
+- **Color via CSS variables, light + dark (`prefers-color-scheme`):** layered neutral surfaces (light: `#f2f2f7` bg / `#ffffff` card; dark: `#000` bg / `#1c1c1e` / `#2c2c2e`), single accent Apple blue (`#007AFF` light / `#0A84FF` dark). Semantic: green online/ok, orange/amber pending·unconfirmed, red offline·error. Hairline separators (1px, low-opacity label color).
+- **Layout:** centered max-width column, generous whitespace, grouped **inset rounded cards/lists** (radius ~12–16px) like iOS Settings; section headers small, uppercase-ish, secondary color.
+- **Controls:** pill/rounded buttons; status as soft **tinted badges** (light tint bg + saturated text); the exit-node picker reads as a clean native-feeling select or tidy custom dropdown; 44px hit targets; visible accessible focus rings. Online state = small colored dot.
+- **Materials & motion:** sticky top bar with subtle `backdrop-filter: blur()` translucency + hairline bottom border; soft shadows (not heavy); transitions ~200–250ms ease-out; spinner for `pending`; **respect `prefers-reduced-motion`**.
+- **States:** tasteful empty/loading/reconnecting; error/staleness as a soft inset banner (amber/red tint), never a raw alert.
+
+Accessibility: sufficient contrast in both themes, semantic HTML, keyboard operable, `aria-live` on the status banner.
+
 ## 9. Tests required per agent
 
 - **A netmap:** `classify` table tests; `Inventory` mapping with a fake `lc.Status` payload (or a thin seam over the status call).

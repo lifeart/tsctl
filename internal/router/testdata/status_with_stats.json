@@ -1,0 +1,82 @@
+{
+  "Version": "",
+  "TUN": false,
+  "BackendState": "Running",
+  "AuthURL": "",
+  "TailscaleIPs": null,
+  "Self": {
+    "ID": "self-id",
+    "PublicKey": "nodekey:0000000000000000000000000000000000000000000000000000000000000000",
+    "HostName": "tsctl",
+    "DNSName": "tsctl.tail-scale.ts.net.",
+    "OS": "linux",
+    "UserID": 0,
+    "TailscaleIPs": null,
+    "Addrs": null,
+    "CurAddr": "",
+    "Relay": "",
+    "PeerRelay": "",
+    "RxBytes": 0,
+    "TxBytes": 0,
+    "Created": "0001-01-01T00:00:00Z",
+    "LastWrite": "0001-01-01T00:00:00Z",
+    "LastSeen": "0001-01-01T00:00:00Z",
+    "LastHandshake": "0001-01-01T00:00:00Z",
+    "Online": true,
+    "ExitNode": false,
+    "ExitNodeOption": false,
+    "Active": false,
+    "PeerAPIURL": null,
+    "TaildropTarget": 0,
+    "NoFileSharingReason": "",
+    "InNetworkMap": false,
+    "InMagicSock": false,
+    "InEngine": false
+  },
+  "ExitNodeStatus": {
+    "ID": "n-exit-fr",
+    "Online": true,
+    "TailscaleIPs": [
+      "100.64.0.7/32"
+    ]
+  },
+  "Health": null,
+  "MagicDNSSuffix": "",
+  "CurrentTailnet": null,
+  "CertDomains": null,
+  "Peer": {
+    "nodekey:e8b09efd75e83add38f0d0d98b1f9dc198ec32f3ab571cefe573393cd850102c": {
+      "ID": "n-exit-fr",
+      "PublicKey": "nodekey:0000000000000000000000000000000000000000000000000000000000000000",
+      "HostName": "exit-fr",
+      "DNSName": "exit-fr.tail-scale.ts.net.",
+      "OS": "linux",
+      "UserID": 0,
+      "TailscaleIPs": [
+        "100.64.0.7"
+      ],
+      "Addrs": null,
+      "CurAddr": "",
+      "Relay": "",
+      "PeerRelay": "",
+      "RxBytes": 987654,
+      "TxBytes": 123456,
+      "Created": "0001-01-01T00:00:00Z",
+      "LastWrite": "0001-01-01T00:00:00Z",
+      "LastSeen": "0001-01-01T00:00:00Z",
+      "LastHandshake": "2026-06-17T12:00:00Z",
+      "Online": true,
+      "ExitNode": true,
+      "ExitNodeOption": true,
+      "Active": false,
+      "PeerAPIURL": null,
+      "TaildropTarget": 0,
+      "NoFileSharingReason": "",
+      "InNetworkMap": false,
+      "InMagicSock": false,
+      "InEngine": false
+    }
+  },
+  "User": null,
+  "ClientVersion": null
+}

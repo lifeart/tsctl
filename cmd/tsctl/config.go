@@ -14,15 +14,18 @@ import (
 // Config is the fully-resolved runtime configuration. Source is flags + env
 // only (DESIGN §5: no YAML, no committed secrets).
 type Config struct {
-	Hostname   string        // tsnet hostname presented to the control server
-	StateDir   string        // tsnet state dir (the crown jewel -- 0700, DESIGN §7)
-	Listen     string        // tailnet-side listen addr (tsnet.Listen)
-	HealthAddr string        // 127.0.0.1-only /healthz host socket
-	Routers    []string      // managed router 100.x IPv4s
-	SSHUser    string        // OpenWRT login ("root" in v1)
-	AuthKey    string        // one-time tagged enrollment key (env or LoadCredential)
-	Debug      bool          // forward verbose tsnet backend logs
-	SSHTimeout time.Duration // per dial/exec deadline
+	Hostname     string        // tsnet hostname presented to the control server
+	StateDir     string        // tsnet state dir (the crown jewel -- 0700, DESIGN §7)
+	Listen       string        // tailnet-side listen addr (tsnet.Listen)
+	HealthAddr   string        // 127.0.0.1-only /healthz host socket
+	Routers      []string      // managed router 100.x IPv4s
+	SSHUser      string        // OpenWRT login ("root" in v1)
+	AuthKey      string        // one-time tagged enrollment key (env or LoadCredential)
+	Debug        bool          // forward verbose tsnet backend logs
+	SSHTimeout   time.Duration // per dial/exec deadline
+	Owner        string        // tailnet login allowed to control (RequireOwner, DESIGN §7)
+	AllowedHosts []string      // Host-header allowlist for CSRF/rebinding defense (DESIGN §7)
+	PollInterval time.Duration // refresh cadence while ≥1 client is connected (DESIGN §6)
 }
 
 // env returns the env var or a default.
@@ -50,6 +53,9 @@ func loadConfig(args []string) (*Config, error) {
 	fs.BoolVar(&c.Debug, "debug", env("TSCTL_DEBUG", "") != "", "forward verbose tsnet backend logs")
 	routers := fs.String("routers", env("TSCTL_ROUTERS", ""), "comma-separated router 100.x IPv4s")
 	fs.DurationVar(&c.SSHTimeout, "ssh-timeout", 15*time.Second, "per dial/exec SSH deadline")
+	fs.StringVar(&c.Owner, "owner", env("TSCTL_OWNER", ""), "tailnet login (email) allowed to control")
+	allowed := fs.String("allowed-hosts", env("TSCTL_ALLOWED_HOSTS", ""), "extra comma-separated Host values to allow (DNS-rebinding defense)")
+	fs.DurationVar(&c.PollInterval, "poll-interval", 30*time.Second, "refresh cadence while a client is connected")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -57,6 +63,18 @@ func loadConfig(args []string) (*Config, error) {
 	for _, r := range strings.Split(*routers, ",") {
 		if r = strings.TrimSpace(r); r != "" {
 			c.Routers = append(c.Routers, r)
+		}
+	}
+
+	// Host allowlist: always trust our own tsnet hostname and the listen host;
+	// the composition root adds the discovered MagicDNS FQDN + 100.x after Up.
+	c.AllowedHosts = []string{c.Hostname}
+	if host, _, err := net.SplitHostPort(c.Listen); err == nil && host != "" {
+		c.AllowedHosts = append(c.AllowedHosts, host)
+	}
+	for _, h := range strings.Split(*allowed, ",") {
+		if h = strings.TrimSpace(h); h != "" {
+			c.AllowedHosts = append(c.AllowedHosts, h)
 		}
 	}
 

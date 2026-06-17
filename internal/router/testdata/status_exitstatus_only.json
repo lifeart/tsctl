@@ -1,0 +1,82 @@
+{
+  "Version": "",
+  "TUN": false,
+  "BackendState": "Running",
+  "AuthURL": "",
+  "TailscaleIPs": null,
+  "Self": {
+    "ID": "self-id",
+    "PublicKey": "nodekey:0000000000000000000000000000000000000000000000000000000000000000",
+    "HostName": "tsctl",
+    "DNSName": "tsctl.tail-scale.ts.net.",
+    "OS": "linux",
+    "UserID": 0,
+    "TailscaleIPs": null,
+    "Addrs": null,
+    "CurAddr": "",
+    "Relay": "",
+    "PeerRelay": "",
+    "RxBytes": 0,
+    "TxBytes": 0,
+    "Created": "0001-01-01T00:00:00Z",
+    "LastWrite": "0001-01-01T00:00:00Z",
+    "LastSeen": "0001-01-01T00:00:00Z",
+    "LastHandshake": "0001-01-01T00:00:00Z",
+    "Online": true,
+    "ExitNode": false,
+    "ExitNodeOption": false,
+    "Active": false,
+    "PeerAPIURL": null,
+    "TaildropTarget": 0,
+    "NoFileSharingReason": "",
+    "InNetworkMap": false,
+    "InMagicSock": false,
+    "InEngine": false
+  },
+  "ExitNodeStatus": {
+    "ID": "n-exit-de",
+    "Online": true,
+    "TailscaleIPs": [
+      "100.64.0.5/32"
+    ]
+  },
+  "Health": null,
+  "MagicDNSSuffix": "",
+  "CurrentTailnet": null,
+  "CertDomains": null,
+  "Peer": {
+    "nodekey:e4be3ab5201953b08a52539e45e5efe217c92372e487a2e47503f6564b835f60": {
+      "ID": "n-exit-de",
+      "PublicKey": "nodekey:0000000000000000000000000000000000000000000000000000000000000000",
+      "HostName": "exit-de",
+      "DNSName": "exit-de.tail-scale.ts.net.",
+      "OS": "linux",
+      "UserID": 0,
+      "TailscaleIPs": [
+        "100.64.0.5"
+      ],
+      "Addrs": null,
+      "CurAddr": "",
+      "Relay": "",
+      "PeerRelay": "",
+      "RxBytes": 5,
+      "TxBytes": 6,
+      "Created": "0001-01-01T00:00:00Z",
+      "LastWrite": "0001-01-01T00:00:00Z",
+      "LastSeen": "0001-01-01T00:00:00Z",
+      "LastHandshake": "2026-06-17T12:00:00Z",
+      "Online": true,
+      "ExitNode": false,
+      "ExitNodeOption": true,
+      "Active": false,
+      "PeerAPIURL": null,
+      "TaildropTarget": 0,
+      "NoFileSharingReason": "",
+      "InNetworkMap": false,
+      "InMagicSock": false,
+      "InEngine": false
+    }
+  },
+  "User": null,
+  "ClientVersion": null
+}

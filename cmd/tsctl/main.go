@@ -17,12 +17,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"tailscale.com/client/local"
 	"tailscale.com/tsnet"
 
 	"github.com/lifeart/tsctl/internal/api"
@@ -92,6 +94,11 @@ func runServe(args []string, lg *log.Logger) error {
 	if err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
+	// serve requires an owner (RequireOwner fails closed); the spike subcommand
+	// does not. Surface this as a fail-fast config error, not a silent lockout.
+	if cfg.Owner == "" {
+		return errors.New("owner must be set (TSCTL_OWNER or --owner): the tailnet login allowed to control")
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -117,9 +124,14 @@ func runServe(args []string, lg *log.Logger) error {
 	st := store.New()
 	mapper := netmap.New(lc) // implements poller.Netmapper AND api.WhoIser
 	rc := router.New(srv.Dial, cfg.SSHUser, cfg.SSHTimeout)
-	hub := sse.New()
-	pol := poller.New(st, mapper, rc, cfg.Routers, hub, lg.Printf)
-	apiH := api.New(st, mapper, pol)
+	// hub.Transitions() drives the poller's idle suspension; api.EncodeSnapshot
+	// makes SSE frames identical to the REST Snapshot DTO (PHASE_B §3).
+	hub := sse.New(st, api.EncodeSnapshot)
+	pol := poller.New(st, mapper, rc, cfg.Routers, hub, hub.Transitions(), cfg.PollInterval, lg.Printf)
+	apiH := api.New(st, mapper, pol, api.Config{
+		Owner:        cfg.Owner,
+		AllowedHosts: allowedHosts(ctx, cfg, lc, lg),
+	})
 
 	// Long-lived workers run off appCtx so shutdown can stop them in order.
 	appCtx, appCancel := context.WithCancel(context.Background())
@@ -142,7 +154,7 @@ func runServe(args []string, lg *log.Logger) error {
 	// tailnet HTTP surface: SPA + REST + SSE. Go 1.22 mux: the more specific
 	// "/api/events" wins over "/api/".
 	mux := http.NewServeMux()
-	mux.Handle("/api/events", hub)
+	mux.Handle("/api/events", apiH.RequireOwner(hub)) // SSE stream is owner-gated too (DESIGN §7)
 	mux.Handle("/api/", apiH.Routes())
 	mux.Handle("/", http.FileServerFS(web.FS))
 
@@ -154,6 +166,10 @@ func runServe(args []string, lg *log.Logger) error {
 		Handler:           mux,
 		WriteTimeout:      0, // SSE: a write deadline silently kills long-lived streams (DESIGN §2)
 		ReadHeaderTimeout: 10 * time.Second,
+		// Derive every request context from appCtx so cancelling it on shutdown
+		// releases the long-lived SSE handlers (an SSE stream never ends on its
+		// own; Shutdown would otherwise block until the WriteTimeout-free conns).
+		BaseContext: func(net.Listener) context.Context { return appCtx },
 	}
 	go func() {
 		if err := httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -202,23 +218,52 @@ func runServe(args []string, lg *log.Logger) error {
 		lg.Printf("sd_notify STOPPING: %v", err)
 	}
 
-	// Ordered shutdown (DESIGN §9): drain HTTP -> stop workers -> tsnet.Close.
+	// Ordered shutdown (DESIGN §9, adapted for SSE): stop workers first by
+	// cancelling appCtx -- this releases the long-lived SSE handlers (their
+	// request contexts derive from appCtx via BaseContext, and the hub closes),
+	// so the subsequent HTTP drain can actually complete. Then tsnet.Close.
+	healthy.Store(false)
+	appCancel()
+	wg.Wait() // hub + poller stopped; SSE handlers have returned
 	shCtx, shCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shCancel()
-	healthy.Store(false)
 	if err := httpSrv.Shutdown(shCtx); err != nil {
 		lg.Printf("tailnet http shutdown: %v", err)
 	}
 	if err := healthSrv.Shutdown(shCtx); err != nil {
 		lg.Printf("healthz shutdown: %v", err)
 	}
-	appCancel()
-	wg.Wait()
 	if err := srv.Close(); err != nil {
 		return fmt.Errorf("tsnet close: %w", err)
 	}
 	lg.Printf("clean shutdown")
 	return nil
+}
+
+// allowedHosts builds the Host-header allowlist for DNS-rebinding defense: the
+// statically configured hosts (hostname, listen host, TSCTL_ALLOWED_HOSTS) plus
+// the tsnet node's discovered MagicDNS FQDN and 100.x addresses (best-effort --
+// a status read failure is logged, never fatal, never swallowed).
+func allowedHosts(ctx context.Context, cfg *Config, lc *local.Client, lg *log.Logger) []string {
+	hosts := append([]string(nil), cfg.AllowedHosts...)
+	st, err := lc.Status(ctx)
+	if err != nil {
+		lg.Printf("warning: could not read self status for Host allowlist: %v", err)
+		return hosts
+	}
+	if st == nil || st.Self == nil {
+		return hosts
+	}
+	if dn := strings.TrimSuffix(st.Self.DNSName, "."); dn != "" {
+		hosts = append(hosts, dn)
+		if i := strings.IndexByte(dn, '.'); i > 0 {
+			hosts = append(hosts, dn[:i]) // bare label
+		}
+	}
+	for _, ip := range st.Self.TailscaleIPs {
+		hosts = append(hosts, ip.String())
+	}
+	return hosts
 }
 
 // runSpike is a REAL, runnable diagnostic (DESIGN §9): bring tsnet up, dial the
