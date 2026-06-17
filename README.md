@@ -7,11 +7,13 @@ lists Tailscale nodes, and lets you set which exit node each OpenWRT router uses
 
 See [DESIGN.md](DESIGN.md) — the locked single source of truth.
 
-> **Status: Phase A scaffold.** The contract (`internal/store` types + the
-> consumer-side interfaces), the composition root, the embedded SPA placeholder,
-> the systemd unit, and a real `spike` subcommand are in place and compile.
-> Package bodies (netmap, router, poller, sse, api handlers, the SPA) are stubs
-> that return explicit `not implemented` errors — filled in Phase B.
+> **Status: feature-complete (v1), verified in-repo.** All packages (netmap,
+> router, poller, sse, api, the SPA) are implemented; `go build ./...`,
+> `go vet ./...`, and `go test -race ./...` pass, including a full-stack
+> integration test (`internal/integration`) that drives api→poller→router→
+> store→SSE end to end. The **live** UI→router→UI flow still needs a real
+> tailnet — see [End-to-end verification](#end-to-end-verification). Known v1
+> limitations are listed at the bottom.
 
 ## Build & run
 
@@ -91,6 +93,53 @@ guaranteed and automation never needs a browser. OpenWRT logs in as **root**;
 
 Also ensure the `tsctl` node retains ACL **visibility** to every router/peer you
 inventory, or nodes silently vanish from the list (DESIGN §7).
+
+## End-to-end verification
+
+No agent has a live tailnet, so the real UI → router → UI flow can only be run by
+**you**. The unit + seam tests prove the wiring; this proves the world. Run the
+steps in order — each gates the next.
+
+1. **Apply the ACL** above (`tag:tsctl` src → `tag:router:22` dst for the SSH
+   transport, plus the `ssh` rule `action:"accept"`, `users:["root"]`). A tagged
+   src cannot use `check` mode, so `accept` is guaranteed and unattended.
+2. **Enable Tailscale SSH on each router.** The ACL only grants access; the
+   router must also be running the Tailscale SSH server, or the dial reaches
+   `:22` but no SSH responds:
+
+   ```sh
+   # on each OpenWRT router (logged in as root)
+   tailscale set --ssh        # or: tailscale up --ssh ...
+   tailscale status           # confirm the node is up and tagged tag:router
+   ```
+
+3. **Prove the SSH path with `spike`** before trusting the full binary:
+
+   ```sh
+   ./tsctl spike 100.64.0.10        # the router's 100.x IPv4
+   ```
+
+   It must print the router's `tailscale status --json`. If it errors, fix the
+   ACL / SSH-enable (steps 1–2) before going further — the full binary uses the
+   exact same path.
+
+4. **Run the full binary** (see “Build & run”) and open the UI at the tsctl
+   node's MagicDNS name over the tailnet (e.g. `http://tsctl/`). You should see
+   the node list and a card per configured router.
+5. **Exercise the control flow and observe all three layers:**
+   - In the UI, on a router card, **pick an exit node** from the picker. The card
+     shows `pending` / `applying` (never optimistic success).
+   - On that router, `tailscale status` (or `tailscale status --json`) shows the
+     **exit node actually switched** to the one you picked.
+   - The UI **reflects the confirmed state**: the card flips to `ok` with the new
+     `currentExitNode`, fed live by the SSE Snapshot stream. Picking “none”
+     clears it the same way.
+
+   If the change can't be confirmed within the revert window, the router's
+   dead-man's-switch self-heals to the previous selection and the UI shows
+   `unconfirmed` / `unreachable` with the error — never a false success.
+
+Do not claim e2e success without completing steps 3–5 against a real router.
 
 ## Known limitations (v1)
 
