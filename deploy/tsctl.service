@@ -1,0 +1,69 @@
+[Unit]
+Description=tsctl - Tailscale exit-node manager
+Documentation=https://github.com/lifeart/tsctl
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/local/bin/tsctl
+Restart=on-failure
+RestartSec=5
+
+# Watchdog: tsctl must ping sd_notify within this window or systemd restarts it.
+WatchdogSec=60
+
+# Dedicated unprivileged user; systemd creates it (DynamicUser keeps no static
+# account around). The state dir is owned by this user only.
+DynamicUser=yes
+
+# The tsnet state dir IS root on the fleet (it holds the node key) -- treat it
+# as a private key. StateDirectory lives under /var/lib and is created 0700.
+StateDirectory=tsctl
+StateDirectoryMode=0700
+Environment=TSCTL_STATE_DIR=%S/tsctl
+
+# Tailnet-side listen + loopback healthz (override per host as needed).
+Environment=TSCTL_LISTEN=:80
+Environment=TSCTL_HEALTH_ADDR=127.0.0.1:8088
+# Environment=TSCTL_ROUTERS=100.x.y.z,100.a.b.c
+
+# One-time tagged auth key delivered via tmpfs credential, never via env/log.
+# Place the key at /etc/tsctl/ts_authkey (root:root 0600). After first
+# enrollment the node key lives in StateDirectory and this can be removed.
+LoadCredential=ts_authkey:/etc/tsctl/ts_authkey
+
+# --- Hardening (DESIGN §7) ---
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+
+# Userspace netstack needs no capabilities at all.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# IPv4/IPv6 sockets only (tailnet + loopback healthz); netstack is userspace.
+RestrictAddressFamilies=AF_INET AF_INET6
+
+# Syscall allowlist for ordinary services.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

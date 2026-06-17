@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>tsctl — scaffold</title>
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 3rem auto; max-width: 40rem; color: #1a1a1a; }
+      code { background: #f0f0f0; padding: 0.1rem 0.3rem; border-radius: 3px; }
+    </style>
+  </head>
+  <body>
+    <h1>tsctl — scaffold</h1>
+    <p>Tailscale exit-node manager. This is the Phase A placeholder UI.</p>
+    <p>The real SPA (node list, exit-node picker, pending/actual state, live SSE
+      updates) is built in Phase B by the frontend agent.</p>
+    <p>API surface: <code>GET /api/nodes</code>, <code>GET /api/routers/{id}</code>,
+      <code>POST /api/routers/{id}/exit-node</code>, <code>GET /api/events</code> (SSE).</p>
+  </body>
+</html>
