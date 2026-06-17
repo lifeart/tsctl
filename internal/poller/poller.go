@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -74,6 +75,12 @@ type Poller struct {
 	linger      time.Duration
 	logf        Logf
 	group       singleflight.Group // collapse concurrent first-viewer refreshes (DESIGN §6)
+
+	// mu serializes the read-modify-write on the atomic Store across the poller
+	// (Refresh) and handler (SetExitNode) goroutines (M3). Both do Load→copy→
+	// modify→Store; without this they clobber each other. Readers still Load()
+	// lock-free -- mu only guards writers, never the read path.
+	mu sync.Mutex
 }
 
 // New constructs a Poller. transitions is the SSE hub's Transitions() channel
@@ -144,7 +151,10 @@ func (p *Poller) SetExitNode(ctx context.Context, routerID, targetStableID strin
 	if addr == "" {
 		return store.RouterView{}, preflightErr("router %q has no Tailscale IPv4 address", routerID)
 	}
-	prev := prevRV.CurrentExitNode
+	// Defensive COPY (low fix): prevRV.CurrentExitNode aliases a pointer inside the
+	// shared, stored snapshot. Hand the router layer an independent value, never an
+	// alias into the immutable snapshot.
+	prev := copyExitRef(prevRV.CurrentExitNode)
 
 	// Resolve + pre-flight the target (nil target == clear).
 	var target *store.ExitNodeRef
@@ -174,21 +184,35 @@ func (p *Poller) SetExitNode(ctx context.Context, routerID, targetStableID strin
 		target = &store.ExitNodeRef{StableID: nv.StableID, Name: nv.Name, IP: ip}
 	}
 
-	// Show intent immediately as PENDING (intent, never success).
-	pending := p.withRouter(routerID, func(rv *store.RouterView) {
+	// Show intent immediately as PENDING (intent, never success). The RMW is
+	// guarded by mu (M3) and the router is matched by its configured IP `addr`
+	// (M4) -- not StableID, which goes empty for a router missing from the netmap,
+	// which would make this a silent no-op that stores a blank RouterView.
+	p.mu.Lock()
+	pending, ok := p.withRouter(addr, func(rv *store.RouterView) {
 		rv.Desired = target
 		rv.State = store.RouterPending
 		rv.LastError = ""
 	})
-	p.store.Store(pending)
+	if ok {
+		p.store.Store(pending)
+	}
+	p.mu.Unlock()
+	if !ok {
+		// The configured router is no longer in the snapshot; do not publish a
+		// blank RouterView -- surface it (M4).
+		return store.RouterView{}, preflightErr("router %q is no longer present in the snapshot", routerID)
+	}
 	p.bc.Broadcast(pending)
 
-	// Dead-man's-switch on the router (arm → apply → confirm → keep).
+	// Dead-man's-switch on the router (arm → apply → confirm → keep). Run OUTSIDE
+	// mu: it can take the whole revert window, and must not block the poll loop.
 	rt, setErr := p.rc.SetExitNode(ctx, addr, target, prev)
 	now := time.Now()
 
 	var updated store.RouterView
-	final := p.withRouter(routerID, func(rv *store.RouterView) {
+	p.mu.Lock()
+	final, ok := p.withRouter(addr, func(rv *store.RouterView) {
 		rv.Stats = rt.Stats
 		switch {
 		case setErr == nil: // confirmed
@@ -212,7 +236,23 @@ func (p *Poller) SetExitNode(ctx context.Context, routerID, targetStableID strin
 		}
 		updated = *rv
 	})
-	p.store.Store(final)
+	if ok {
+		p.store.Store(final)
+	}
+	p.mu.Unlock()
+	if !ok {
+		// Router vanished from the snapshot between apply and reconcile (M4):
+		// never return/store a blank RouterView. Surface the underlying router
+		// error if there was one, else report the reconcile gap.
+		if setErr != nil {
+			return store.RouterView{}, routerControlError(setErr)
+		}
+		return store.RouterView{}, &controlError{
+			status: statusBadGateway,
+			msg:    "router state unavailable",
+			detail: fmt.Sprintf("router %q vanished from the snapshot before its result could be reconciled", routerID),
+		}
+	}
 	p.bc.Broadcast(final)
 
 	switch {
@@ -221,13 +261,20 @@ func (p *Poller) SetExitNode(ctx context.Context, routerID, targetStableID strin
 		// truth; unconfirmed is NOT shown as success by the UI.
 		return updated, nil
 	default:
-		return updated, &controlError{
-			status: statusBadGateway,
-			msg:    "router command failed",
-			detail: setErr.Error(),
-			stderr: extractStderr(setErr),
-			err:    setErr,
-		}
+		return updated, routerControlError(setErr)
+	}
+}
+
+// routerControlError maps a router-layer failure to the 502 the api surfaces,
+// carrying the detail + stderr structurally (extractStderr reaches a
+// *router.CommandError, including through the %w-wrapped confirm-read failure).
+func routerControlError(setErr error) *controlError {
+	return &controlError{
+		status: statusBadGateway,
+		msg:    "router command failed",
+		detail: setErr.Error(),
+		stderr: extractStderr(setErr),
+		err:    setErr,
 	}
 }
 
@@ -237,8 +284,14 @@ func (p *Poller) SetExitNode(ctx context.Context, routerID, targetStableID strin
 // in Snapshot.NetmapErr); a snapshot is ALWAYS built and broadcast regardless.
 func (p *Poller) Refresh(ctx context.Context) error {
 	_, err, _ := p.group.Do("refresh", func() (any, error) {
+		// Hold mu across build (which Loads prev) AND the Store so the whole
+		// read-modify-write is atomic vs a concurrent SetExitNode (M3). The slow
+		// rc.SetExitNode network call in SetExitNode runs OUTSIDE mu, so it never
+		// blocks the poll loop for the dead-man's-switch window.
+		p.mu.Lock()
 		snap, invErr := p.build(ctx)
 		p.store.Store(snap)
+		p.mu.Unlock()
 		p.bc.Broadcast(snap)
 		return nil, invErr
 	})
@@ -389,14 +442,24 @@ func (p *Poller) Run(ctx context.Context) error {
 }
 
 // withRouter returns a fresh Snapshot copied from the current one with mutate
-// applied to the RouterView whose router StableID matches (immutable swap-in).
-func (p *Poller) withRouter(routerID string, mutate func(*store.RouterView)) *store.Snapshot {
+// applied to the RouterView for the router at addr -- its configured 100.x IP,
+// the SAME key build/findRouterView use. addr is the stable identity: a router
+// missing from the netmap keeps its configured IP but loses its StableID (M4),
+// so matching by StableID here would silently no-op and publish a blank
+// RouterView. The bool reports whether a router matched; callers must NOT
+// store/return the result when it is false. Caller holds p.mu (M3).
+func (p *Poller) withRouter(addr string, mutate func(*store.RouterView)) (*store.Snapshot, bool) {
 	cur := p.store.Load()
 	routers := make([]store.RouterView, len(cur.Routers))
 	copy(routers, cur.Routers)
+	matched := false
 	for i := range routers {
-		if routers[i].Node.StableID == routerID {
-			mutate(&routers[i])
+		for _, ip := range routers[i].Node.TailscaleIPs {
+			if ip == addr {
+				mutate(&routers[i])
+				matched = true
+				break
+			}
 		}
 	}
 	return &store.Snapshot{
@@ -405,7 +468,7 @@ func (p *Poller) withRouter(routerID string, mutate func(*store.RouterView)) *st
 		NetmapAt:  cur.NetmapAt,
 		NetmapErr: cur.NetmapErr,
 		BuiltAt:   time.Now(),
-	}
+	}, matched
 }
 
 // reconcileState derives State from the reachable/desired/current fields.
@@ -420,6 +483,16 @@ func reconcileState(rv *store.RouterView) {
 	}
 	rv.Desired = nil
 	rv.State = store.RouterOK
+}
+
+// copyExitRef returns an independent copy of ref (nil-safe) so a value handed to
+// the router layer is never an alias into the stored, shared snapshot (low fix).
+func copyExitRef(ref *store.ExitNodeRef) *store.ExitNodeRef {
+	if ref == nil {
+		return nil
+	}
+	cp := *ref
+	return &cp
 }
 
 func sameExitNode(a, b *store.ExitNodeRef) bool {

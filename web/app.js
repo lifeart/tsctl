@@ -280,11 +280,11 @@
   }
 
   // build the shared exit-node option list from the snapshot's nodes
-  function exitOptionsFor(snap, selfID) {
+  function exitOptionsFor(snap) {
     var opts = [{ value: "", label: "Direct (no exit node)" }];
     var nodes = snap && Array.isArray(snap.nodes) ? snap.nodes : [];
     nodes.forEach(function (n) {
-      if (n.exitNodeOption === true && n.stableID && n.stableID !== selfID) {
+      if (n.exitNodeOption === true && n.stableID) {
         var label = n.name || n.hostname || n.stableID;
         if (n.online !== true) label += " (offline)";
         opts.push({ value: n.stableID, label: label });
@@ -373,7 +373,14 @@
     var online = node.online === true;
     var st = rv.state || (online ? "ok" : "unreachable");
 
-    setText(rec.name, node.name || node.hostname || node.stableID || "(router)");
+    var routerName = node.name || node.hostname || node.stableID || "(router)";
+    setText(rec.name, routerName);
+    // a11y: name the exit-node picker per router so screen readers don't just
+    // announce a bare "Exit node" for every router (low fix).
+    var pickerLabel = "Exit node for " + routerName;
+    if (rec.select.getAttribute("aria-label") !== pickerLabel) {
+      rec.select.setAttribute("aria-label", pickerLabel);
+    }
     setDot(rec.dot, online);
     applyStateBadge(rec.stateBadge, st);
 

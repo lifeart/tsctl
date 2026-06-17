@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -310,5 +311,61 @@ func TestStatus_NonZeroExit(t *testing.T) {
 	c := newFakeClient(f, "")
 	if _, err := c.Status(context.Background(), "100.64.0.1"); err == nil {
 		t.Fatal("expected error for non-zero exit, got nil")
+	}
+}
+
+// serialRunner records the maximum number of run() calls in flight at once so a
+// test can prove the per-router lock keeps it at 1 (DESIGN §6).
+type serialRunner struct {
+	mu       sync.Mutex
+	inflight int
+	maxSeen  int
+	respond  func(cmd string) ([]byte, []byte, int, error)
+}
+
+func (r *serialRunner) run(_ context.Context, _ string, cmd string) ([]byte, []byte, int, error) {
+	r.mu.Lock()
+	r.inflight++
+	if r.inflight > r.maxSeen {
+		r.maxSeen = r.inflight
+	}
+	r.mu.Unlock()
+	time.Sleep(time.Millisecond) // widen the race window
+	r.mu.Lock()
+	r.inflight--
+	r.mu.Unlock()
+	if r.respond != nil {
+		return r.respond(cmd)
+	}
+	return nil, nil, 0, nil
+}
+
+// TestSerializedPerRouter fires many concurrent Status + SetExitNode(clear) calls
+// at the SAME router and asserts no two router commands ever overlap. Run under
+// -race this also catches any unsynchronized state. Different routers are NOT
+// serialized against each other, but same-router commands must be.
+func TestSerializedPerRouter(t *testing.T) {
+	sr := &serialRunner{respond: statusRespondingWith(readFixture(t, "status_no_exit.json"))}
+	c := &Client{
+		user:      "root",
+		timeout:   time.Second,
+		runner:    sr,
+		newMarker: func() string { return "/tmp/tsctl-keep-serial" },
+		locks:     make(map[string]*sync.Mutex),
+	}
+
+	const addr = "100.64.0.1"
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(2)
+		go func() { defer wg.Done(); _, _ = c.Status(context.Background(), addr) }()
+		go func() { defer wg.Done(); _, _ = c.SetExitNode(context.Background(), addr, nil, nil) }()
+	}
+	wg.Wait()
+
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	if sr.maxSeen != 1 {
+		t.Errorf("max concurrent router commands = %d, want 1 (DESIGN §6: one in flight per router)", sr.maxSeen)
 	}
 }

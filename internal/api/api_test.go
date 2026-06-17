@@ -116,9 +116,8 @@ func TestRequireCSRF(t *testing.T) {
 	if got := run(build(func(r *http.Request) { r.Header.Del("Cookie") })); got != 403 {
 		t.Errorf("missing cookie: got %d want 403", got)
 	}
-	if got := run(build(func(r *http.Request) { r.Host = "evil.example.com" })); got != 403 {
-		t.Errorf("bad Host: got %d want 403", got)
-	}
+	// Host pinning is no longer RequireCSRF's job (it moved to RequireHost, which
+	// runs on every request including reads); see TestRequireHost.
 	if got := run(build(func(r *http.Request) { r.Header.Set("Origin", "http://evil.example.com") })); got != 403 {
 		t.Errorf("bad Origin: got %d want 403", got)
 	}
@@ -130,6 +129,50 @@ func TestRequireCSRF(t *testing.T) {
 	}
 	if got := run(build(func(r *http.Request) { r.Header.Set("Sec-Fetch-Site", "same-origin") })); got != 200 {
 		t.Errorf("same-origin Sec-Fetch-Site: got %d want 200", got)
+	}
+}
+
+func TestRequireHost(t *testing.T) {
+	const host = "tsctl.example.ts.net"
+	a := New(store.New(), fakeWhoIs{login: "alice"}, &fakeController{}, Config{Owner: "alice", AllowedHosts: []string{host}})
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+	h := a.RequireHost(next)
+
+	run := func(reqHost string) int {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/nodes", nil)
+		req.Host = reqHost
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	if got := run("evil.example.com"); got != 403 {
+		t.Errorf("GET with disallowed Host: got %d want 403", got)
+	}
+	if got := run(host); got != 200 {
+		t.Errorf("GET with allowed Host: got %d want 200", got)
+	}
+}
+
+// TestRoutes_HostPinnedOnReads proves a GET read (not just a write) is rejected
+// for a disallowed Host through the real Routes() chain, and passes for an
+// allowed Host -- the DNS-rebinding read hole H2 closed.
+func TestRoutes_HostPinnedOnReads(t *testing.T) {
+	const host = "tsctl.example.ts.net"
+	a := New(store.New(), fakeWhoIs{login: "alice"}, &fakeController{}, Config{Owner: "alice", AllowedHosts: []string{host}})
+	h := a.Routes()
+
+	get := func(reqHost string) int {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/nodes", nil)
+		req.Host = reqHost
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	if got := get("evil.example.com"); got != 403 {
+		t.Errorf("GET /api/nodes with disallowed Host: got %d want 403", got)
+	}
+	if got := get(host); got != 200 {
+		t.Errorf("GET /api/nodes with allowed Host: got %d want 200", got)
 	}
 }
 

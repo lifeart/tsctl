@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strings"
 
 	"tailscale.com/client/local"
 	"tailscale.com/ipn/ipnstate"
@@ -72,8 +73,10 @@ func buildInventory(st *ipnstate.Status) []store.NodeView {
 // mapPeer projects one PeerStatus into the read-only store.NodeView.
 func mapPeer(p *ipnstate.PeerStatus) store.NodeView {
 	return store.NodeView{
-		StableID:       string(p.ID),
-		Name:           p.DNSName,
+		StableID: string(p.ID),
+		// Trim the trailing MagicDNS dot for display parity with the router
+		// package's trimmed ExitNodeRef.Name (low fix).
+		Name:           strings.TrimSuffix(p.DNSName, "."),
 		Hostname:       p.HostName,
 		TailscaleIPs:   peerIPs(p),
 		OS:             p.OS,

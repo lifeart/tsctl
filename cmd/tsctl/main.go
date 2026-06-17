@@ -154,7 +154,7 @@ func runServe(args []string, lg *log.Logger) error {
 	// tailnet HTTP surface: SPA + REST + SSE. Go 1.22 mux: the more specific
 	// "/api/events" wins over "/api/".
 	mux := http.NewServeMux()
-	mux.Handle("/api/events", apiH.RequireOwner(hub)) // SSE stream is owner-gated too (DESIGN §7)
+	mux.Handle("/api/events", apiH.RequireOwner(apiH.RequireHost(hub))) // SSE: owner-gated AND host-pinned (DESIGN §7)
 	mux.Handle("/api/", apiH.Routes())
 	mux.Handle("/", http.FileServerFS(web.FS))
 

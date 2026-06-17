@@ -52,7 +52,10 @@ const (
 	RouterUnreachable RouterState = "unreachable"
 )
 
-// RouterStats are the router node's own counters, from its tailscale status.
+// RouterStats are the counters of the router's CURRENT exit-node peer, read from
+// the router's own `tailscale status --json` (PHASE_B §6): rx/tx and the last
+// handshake to that exit node. A router using no exit node (Direct) has no such
+// peer, so its stats are zero.
 type RouterStats struct {
 	RxBytes       int64
 	TxBytes       int64
@@ -68,7 +71,7 @@ type RouterStats struct {
 type RouterRuntime struct {
 	Current *ExitNodeRef  // currently selected exit node (nil = none)
 	Options []ExitNodeRef // selectable exit nodes (ExitNodeOption == true)
-	Stats   RouterStats   // the router node's own counters
+	Stats   RouterStats   // counters for the current exit-node peer (zero if Direct)
 	Online  bool          // router self-reports online
 }
 

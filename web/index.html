@@ -20,7 +20,10 @@
     </header>
 
     <main class="container">
-      <div id="banners" aria-live="polite">
+      <!-- No aria-live on this wrapper: each banner is its own live region
+           (role="alert" / role="status"); a live-region wrapper around them
+           would double-announce every message. -->
+      <div id="banners">
         <div id="global-error" class="banner banner-error hidden" role="alert"></div>
         <div id="netmap-err" class="banner banner-error hidden" role="alert"></div>
         <div id="stale-banner" class="banner banner-warn hidden" role="status"></div>

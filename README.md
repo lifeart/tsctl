@@ -92,6 +92,23 @@ guaranteed and automation never needs a browser. OpenWRT logs in as **root**;
 Also ensure the `tsctl` node retains ACL **visibility** to every router/peer you
 inventory, or nodes silently vanish from the list (DESIGN §7).
 
+## Known limitations (v1)
+
+- **Confirmation is selection + tailnet reachability, not egress.** When you set
+  a router's exit node, the dead-man's-switch (DESIGN §8) re-reads the router's
+  `tailscale status --json` and treats the change as confirmed when the device
+  reports the target exit node **selected** and **reachable over the tailnet**.
+  It does **not** probe actual internet **egress** through that exit node — a
+  router that selected the exit node but cannot reach the internet through it
+  still shows as `ok`.
+- **No explicit user "Keep".** DESIGN §8 step 5 envisages an explicit operator
+  "Keep" within the revert window. v1 instead **auto-keeps on confirmation**: the
+  armed local revert fires only if the device can't be confirmed **at all** (the
+  apply failed, the confirm read failed, or the selection didn't take). It does
+  not fire merely because egress is broken while the selection looks correct.
+- **Planned:** an explicit-user "Keep" gate plus an egress-reachability probe
+  before keeping (tracked as Sec-M4).
+
 ## Deploy (systemd)
 
 [`deploy/tsctl.service`](deploy/tsctl.service) is hardened per DESIGN §7:

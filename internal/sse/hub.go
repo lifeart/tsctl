@@ -40,7 +40,17 @@ type Hub struct {
 	transitions  chan int      // 0->1 emits 1, 1->0 emits 0 (cap-1, latest-wins)
 	done         chan struct{} // closed when Run returns (unblocks handlers)
 	pingInterval time.Duration
+	writeTimeout time.Duration // per-write deadline; detects half-open peers (M5)
 }
+
+// defaultWriteTimeout bounds a single frame/ping write. The server keeps
+// WriteTimeout:0 (a server-wide deadline would silently kill long-lived SSE
+// streams, DESIGN §2); instead each write gets a fresh deadline via
+// http.ResponseController so a peer that vanished without a FIN is detected --
+// the write errors, the handler returns, and the client is unregistered (so the
+// poller's active count can reach 0). Without this such a connection blocks the
+// write for minutes and stays registered (M5).
+const defaultWriteTimeout = 10 * time.Second
 
 // New constructs a Hub. st supplies the current snapshot sent on connect; encode
 // produces frame bodies.
@@ -54,6 +64,7 @@ func New(st *store.Store, encode SnapshotEncoder) *Hub {
 		transitions:  make(chan int, 1),
 		done:         make(chan struct{}),
 		pingInterval: 20 * time.Second,
+		writeTimeout: defaultWriteTimeout,
 	}
 }
 
@@ -191,6 +202,12 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		case <-ping.C:
+			// Fresh per-write deadline (M5): a dead peer makes this write block
+			// otherwise; with the deadline it errors and we return + unregister.
+			if err := rc.SetWriteDeadline(time.Now().Add(h.writeTimeout)); err != nil {
+				log.Printf("sse: set write deadline: %v", err)
+				return
+			}
 			if _, err := io.WriteString(w, ": ping\n\n"); err != nil {
 				return
 			}
@@ -209,6 +226,12 @@ func (h *Hub) writeFrame(w http.ResponseWriter, rc *http.ResponseController, sna
 	if err != nil {
 		log.Printf("sse: encode snapshot: %v", err)
 		return true // skip this frame; keep the stream open
+	}
+	// Fresh per-write deadline (M5) so a vanished peer can't block this frame for
+	// minutes; on a dead peer the writes below error and the caller unregisters.
+	if err := rc.SetWriteDeadline(time.Now().Add(h.writeTimeout)); err != nil {
+		log.Printf("sse: set write deadline: %v", err)
+		return false
 	}
 	if _, err := io.WriteString(w, "data: "); err != nil {
 		return false

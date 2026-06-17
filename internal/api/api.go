@@ -79,16 +79,34 @@ func New(st *store.Store, who WhoIser, ctrl Controller, cfg Config) *API {
 	return &API{store: st, whois: who, ctrl: ctrl, owner: cfg.Owner, allowedHosts: allowed}
 }
 
-// Routes returns the /api/* handler, wrapped fail-closed in the owner + CSRF
-// middleware. Mount it at "/api/" in the composition root. (GET /api/events is
-// mounted separately by main and wrapped in RequireOwner only.)
+// Routes returns the /api/* handler, wrapped fail-closed in the owner + host +
+// CSRF middleware. Mount it at "/api/" in the composition root. RequireHost runs
+// on EVERY request (so /api/csrf, /api/nodes, /api/routers/{id} reads are all
+// host-pinned, not just the writes) -- a DNS-rebinding page must not be able to
+// read the Snapshot either (DESIGN §7). (GET /api/events is mounted separately
+// by main and wrapped in RequireOwner(RequireHost(...)).)
 func (a *API) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/csrf", a.handleCSRF)
 	mux.HandleFunc("GET /api/nodes", a.handleNodes)
 	mux.HandleFunc("GET /api/routers/{id}", a.handleRouter)
 	mux.HandleFunc("POST /api/routers/{id}/exit-node", a.handleSetExitNode)
-	return a.RequireOwner(a.RequireCSRF(mux))
+	return a.RequireOwner(a.RequireHost(a.RequireCSRF(mux)))
+}
+
+// RequireHost pins the Host header to the configured allowlist on EVERY request
+// regardless of method (DESIGN §7 / PHASE_B §7 step 3). GET reads and the SSE
+// stream are host-checked here exactly once; the write-only double-submit /
+// Origin / Sec-Fetch-Site checks stay in RequireCSRF. 403 on a Host outside the
+// allowlist (rejects DNS rebinding before any data is read or mutated).
+func (a *API) RequireHost(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !a.hostAllowed(r.Host) {
+			writeErr(w, http.StatusForbidden, "bad Host header")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // RequireOwner identifies the caller via WhoIs and fails closed: deny on any
@@ -105,20 +123,17 @@ func (a *API) RequireOwner(next http.Handler) http.Handler {
 	})
 }
 
-// RequireCSRF guards every non-GET/HEAD request with, in order (DESIGN §7):
-//  1. Host pinning   -- r.Host must be in the allowlist (rejects DNS rebinding);
-//  2. Origin check   -- if present, its host must equal r.Host;
-//  3. Sec-Fetch-Site -- if present, must be same-origin or none;
-//  4. double-submit  -- X-Tsctl-CSRF header present AND equal to the tsctl_csrf
+// RequireCSRF guards every non-GET/HEAD (state-changing) request with, in order
+// (DESIGN §7). Host pinning is NOT here -- it is enforced for EVERY request,
+// reads included, by RequireHost; this middleware owns only the write-side checks:
+//  1. Origin check   -- if present, its host must equal r.Host;
+//  2. Sec-Fetch-Site -- if present, must be same-origin or none;
+//  3. double-submit  -- X-Tsctl-CSRF header present AND equal to the tsctl_csrf
 //     cookie (simple cross-origin requests can set neither).
 func (a *API) RequireCSRF(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet || r.Method == http.MethodHead {
 			next.ServeHTTP(w, r)
-			return
-		}
-		if !a.hostAllowed(r.Host) {
-			writeErr(w, http.StatusForbidden, "bad Host header")
 			return
 		}
 		if origin := r.Header.Get("Origin"); origin != "" {

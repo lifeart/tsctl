@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lifeart/tsctl/internal/router"
 	"github.com/lifeart/tsctl/internal/store"
 )
 
@@ -66,12 +67,6 @@ func (f *fakeBC) Broadcast(s *store.Snapshot) {
 }
 
 func (f *fakeBC) count() int { f.mu.Lock(); defer f.mu.Unlock(); return len(f.snaps) }
-
-// stderrError mimics the router package's error exposing Stderr().
-type stderrError struct{ msg, stderr string }
-
-func (e *stderrError) Error() string  { return e.msg }
-func (e *stderrError) Stderr() string { return e.stderr }
 
 // --- tests --------------------------------------------------------------------
 
@@ -269,7 +264,17 @@ func TestSetExitNode_RouterFailureIs502WithStderr(t *testing.T) {
 	routerIP, exitIP := "100.64.0.10", "100.64.0.20"
 	st := store.New()
 	seedSnapshot(st, routerIP, exitIP, true, true)
-	rc := &fakeRC{setErr: &stderrError{msg: "ssh failed", stderr: "permission denied"}} // setRT zero => Online false
+	// Drive the REAL router.CommandError end to end (not a look-alike fake): a
+	// non-zero apply exit. This is exactly what router.Client returns, so the
+	// seam (router error -> poller controlError -> api {stderr}) is exercised for
+	// real. StderrText is untrimmed; Stderr() must trim it.
+	cmdErr := &router.CommandError{
+		Addr:       routerIP,
+		Cmd:        "apply exit-node",
+		StderrText: "  permission denied\n",
+		Exit:       1,
+	}
+	rc := &fakeRC{setErr: cmdErr} // setRT zero => Online false
 	bc := newFakeBC()
 	p := New(st, &fakeNM{}, rc, []string{routerIP}, bc, make(chan int), time.Second, nopLogf)
 
@@ -281,9 +286,17 @@ func TestSetExitNode_RouterFailureIs502WithStderr(t *testing.T) {
 	if !errors.As(err, &hs) || hs.HTTPStatus() != 502 {
 		t.Errorf("expected 502, got %v", err)
 	}
+	// The controlError the api receives must carry the trimmed router stderr in
+	// its Stderr() -- this is precisely the value the {stderr} response field gets.
 	var se interface{ Stderr() string }
 	if !errors.As(err, &se) || se.Stderr() != "permission denied" {
-		t.Errorf("stderr not surfaced through the error: %v", err)
+		t.Errorf("stderr not surfaced through the error: %v (stderr=%q)", err, extractStderr(err))
+	}
+	// And the underlying *router.CommandError must still be reachable through the
+	// chain (errors.As across the seam).
+	var ce *router.CommandError
+	if !errors.As(err, &ce) {
+		t.Errorf("real *router.CommandError not reachable via errors.As: %v", err)
 	}
 	if rv.State != store.RouterUnreachable {
 		t.Errorf("state = %q, want unreachable", rv.State)
@@ -316,6 +329,55 @@ func TestSetExitNode_AppliedButUnconfirmed(t *testing.T) {
 	}
 	if rv.Desired == nil || rv.Desired.StableID != "exit1" {
 		t.Errorf("desired must remain the requested target, got %+v", rv.Desired)
+	}
+}
+
+// dropMidOpRC simulates a concurrent Refresh that drops the router from the
+// netmap (StableID goes empty, configured IP preserved) WHILE the dead-man's-
+// switch runs -- the M4 race that used to make withRouter a silent no-op and
+// publish a blank RouterView.
+type dropMidOpRC struct {
+	st       *store.Store
+	routerIP string
+	rt       store.RouterRuntime
+}
+
+func (d *dropMidOpRC) Status(ctx context.Context, addr string) (store.RouterRuntime, error) {
+	return d.rt, nil
+}
+
+func (d *dropMidOpRC) SetExitNode(ctx context.Context, addr string, target, prev *store.ExitNodeRef) (store.RouterRuntime, error) {
+	// Same IP, empty StableID -- the buildRouterView fallback for a configured
+	// router missing from inventory.
+	d.st.Store(&store.Snapshot{
+		Routers: []store.RouterView{
+			{Node: store.NodeView{TailscaleIPs: []string{d.routerIP}, Type: store.NodeRouter}},
+		},
+	})
+	return d.rt, nil
+}
+
+func TestSetExitNode_RouterDropsFromNetmapMidOp(t *testing.T) {
+	routerIP, exitIP := "100.64.0.10", "100.64.0.20"
+	st := store.New()
+	seedSnapshot(st, routerIP, exitIP, true, true)
+	rc := &dropMidOpRC{
+		st: st, routerIP: routerIP,
+		rt: store.RouterRuntime{Online: true, Current: &store.ExitNodeRef{StableID: "exit1", IP: exitIP}},
+	}
+	p := New(st, &fakeNM{}, rc, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+
+	rv, err := p.SetExitNode(context.Background(), "router1", "exit1")
+	if err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	// M4: matching by configured IP (not StableID) must still reconcile a real
+	// RouterView -- never a blank one -- even though StableID changed mid-op.
+	if rv.State != store.RouterOK {
+		t.Errorf("state = %q, want ok (blank-RouterView regression)", rv.State)
+	}
+	if rv.CurrentExitNode == nil || rv.CurrentExitNode.IP != exitIP {
+		t.Errorf("currentExitNode = %+v, want IP %s", rv.CurrentExitNode, exitIP)
 	}
 }
 

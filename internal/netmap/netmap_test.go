@@ -150,8 +150,9 @@ func TestBuildInventoryMapping(t *testing.T) {
 	}
 
 	// Self mapped, with tag:tsctl -> generic (not a router, not an exit node).
+	// Name has the trailing MagicDNS dot trimmed (low fix, parity with router).
 	gotSelf := byID["self-0001"]
-	if gotSelf.Name != "tsctl.example.ts.net." || gotSelf.Hostname != "tsctl" || gotSelf.OS != "linux" {
+	if gotSelf.Name != "tsctl.example.ts.net" || gotSelf.Hostname != "tsctl" || gotSelf.OS != "linux" {
 		t.Errorf("self field mapping wrong: %+v", gotSelf)
 	}
 	if !gotSelf.Online {
