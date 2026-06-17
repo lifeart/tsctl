@@ -26,15 +26,25 @@ type WhoIser interface {
 	WhoIs(ctx context.Context, remoteAddr string) (login string, tagged bool, err error)
 }
 
+// Controller performs the actual exit-node mutation: the dead-man's-switch
+// sequence on the router, then reconcile + broadcast (DESIGN §8). Implemented by
+// *poller.Poller. Declared here (consumer side) so api never imports poller.
+// targetStableID == "" clears the exit node; it returns the reconciled
+// RouterView (the device's ACTUAL state, never optimistic).
+type Controller interface {
+	SetExitNode(ctx context.Context, routerID, targetStableID string) (store.RouterView, error)
+}
+
 // API holds the handler dependencies.
 type API struct {
 	store *store.Store
 	whois WhoIser
+	ctrl  Controller
 }
 
 // New constructs the API.
-func New(st *store.Store, who WhoIser) *API {
-	return &API{store: st, whois: who}
+func New(st *store.Store, who WhoIser, ctrl Controller) *API {
+	return &API{store: st, whois: who, ctrl: ctrl}
 }
 
 // Routes returns the /api/* handler, wrapped fail-closed in the owner + CSRF

@@ -59,6 +59,19 @@ type RouterStats struct {
 	LastHandshake time.Time
 }
 
+// RouterRuntime is the parsed result of `tailscale status --json` on a router:
+// its current exit node, the selectable options, and its own stats. Produced by
+// router.ParseStatus (a pure function) and returned by a RouterClient.
+//
+// It lives in store (a leaf package) so the router package depends only on store
+// and never on poller -- keeping the two Phase B packages build-decoupled.
+type RouterRuntime struct {
+	Current *ExitNodeRef  // currently selected exit node (nil = none)
+	Options []ExitNodeRef // selectable exit nodes (ExitNodeOption == true)
+	Stats   RouterStats   // the router node's own counters
+	Online  bool          // router self-reports online
+}
+
 // RouterView is the full state of one managed OpenWRT router.
 //
 // The device's ACTUAL selection (CurrentExitNode) is the source of truth; the

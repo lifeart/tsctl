@@ -18,15 +18,9 @@ import (
 	"github.com/lifeart/tsctl/internal/store"
 )
 
-// RouterRuntime is the parsed result of `tailscale status --json` on a router:
-// its current exit node, the selectable options, and its own stats. Produced by
-// router.ParseStatus (a pure function) and by RouterClient.
-type RouterRuntime struct {
-	Current *store.ExitNodeRef  // currently selected exit node (nil = none)
-	Options []store.ExitNodeRef // selectable exit nodes (ExitNodeOption == true)
-	Stats   store.RouterStats   // the router node's own counters
-	Online  bool                // router self-reports online
-}
+// RouterRuntime moved to package store (a leaf) so the router package depends
+// only on store, never on poller -- the two Phase B packages stay build-
+// decoupled. See store.RouterRuntime.
 
 // Netmapper supplies inventory from the tsnet node's local netmap.
 // Implemented by *netmap.Mapper.
@@ -37,8 +31,16 @@ type Netmapper interface {
 // RouterClient talks to a single OpenWRT router over Tailscale SSH.
 // Implemented by *router.Client. addr is the router's 100.x IPv4 (no port).
 type RouterClient interface {
-	Status(ctx context.Context, addr string) (RouterRuntime, error)
-	SetExitNode(ctx context.Context, addr string, target *store.ExitNodeRef, prev *store.ExitNodeRef) (RouterRuntime, error)
+	Status(ctx context.Context, addr string) (store.RouterRuntime, error)
+	SetExitNode(ctx context.Context, addr string, target *store.ExitNodeRef, prev *store.ExitNodeRef) (store.RouterRuntime, error)
+}
+
+// Broadcaster receives each freshly built Snapshot for fan-out to SSE clients.
+// Implemented by *sse.Hub. The poller calls Broadcast after every Store so the
+// browser sees changes in real time; declared here (consumer side) so the
+// poller never imports sse.
+type Broadcaster interface {
+	Broadcast(snap *store.Snapshot)
 }
 
 // Logf is the minimal logging sink the poller surfaces stub/refresh errors to.
@@ -50,14 +52,27 @@ type Poller struct {
 	store   *store.Store
 	nm      Netmapper
 	rc      RouterClient
+	bc      Broadcaster
 	routers []string // router 100.x IPv4s
 	logf    Logf
 	group   singleflight.Group // collapse concurrent first-viewer refreshes (DESIGN §6)
 }
 
 // New constructs a Poller. logf must be non-nil; pass log.Printf or similar.
-func New(st *store.Store, nm Netmapper, rc RouterClient, routers []string, logf Logf) *Poller {
-	return &Poller{store: st, nm: nm, rc: rc, routers: routers, logf: logf}
+// bc receives every freshly built Snapshot -- Phase B calls bc.Broadcast after
+// each Store so SSE clients update in real time.
+func New(st *store.Store, nm Netmapper, rc RouterClient, routers []string, bc Broadcaster, logf Logf) *Poller {
+	return &Poller{store: st, nm: nm, rc: rc, bc: bc, routers: routers, logf: logf}
+}
+
+// SetExitNode is the api.Controller seam (DESIGN §8). It resolves routerID -> the
+// router's addr and targetStableID -> *store.ExitNodeRef from the current
+// snapshot, runs the dead-man's-switch SetExitNode on the RouterClient,
+// reconciles the device's ACTUAL selection into a fresh Snapshot, Broadcasts it,
+// and returns the updated RouterView. targetStableID == "" clears the exit node.
+// Phase B implements the body.
+func (p *Poller) SetExitNode(ctx context.Context, routerID, targetStableID string) (store.RouterView, error) {
+	return store.RouterView{}, errors.New("not implemented: poller.SetExitNode")
 }
 
 // Refresh builds one fresh Snapshot (inventory + per-router status) and stores

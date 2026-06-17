@@ -18,7 +18,6 @@ import (
 	"golang.org/x/crypto/ssh"
 	"tailscale.com/ipn/ipnstate"
 
-	"github.com/lifeart/tsctl/internal/poller"
 	"github.com/lifeart/tsctl/internal/store"
 )
 
@@ -39,24 +38,24 @@ func New(dial DialFunc, user string, timeout time.Duration) *Client {
 
 // Status reads `tailscale status --json` from the router and parses it.
 // addr is the router's 100.x IPv4 (no port). Phase B fills in the body.
-func (c *Client) Status(ctx context.Context, addr string) (poller.RouterRuntime, error) {
-	return poller.RouterRuntime{}, errors.New("not implemented: router.Status")
+func (c *Client) Status(ctx context.Context, addr string) (store.RouterRuntime, error) {
+	return store.RouterRuntime{}, errors.New("not implemented: router.Status")
 }
 
 // SetExitNode applies the dead-man's-switch sequence (DESIGN §8): arm a local
 // revert on the router, apply `tailscale set --exit-node=<target.IP>` (empty
 // clears), then re-read and reconcile. Phase B fills in the body.
-func (c *Client) SetExitNode(ctx context.Context, addr string, target *store.ExitNodeRef, prev *store.ExitNodeRef) (poller.RouterRuntime, error) {
-	return poller.RouterRuntime{}, errors.New("not implemented: router.SetExitNode")
+func (c *Client) SetExitNode(ctx context.Context, addr string, target *store.ExitNodeRef, prev *store.ExitNodeRef) (store.RouterRuntime, error) {
+	return store.RouterRuntime{}, errors.New("not implemented: router.SetExitNode")
 }
 
 // ParseStatus turns the bytes of `tailscale status --json` into a RouterRuntime.
 // Pure and version-tolerant. Phase B unmarshals into ipnstate.Status and maps
 // Self / Peer / ExitNodeStatus into the result.
-func ParseStatus(raw []byte) (poller.RouterRuntime, error) {
+func ParseStatus(raw []byte) (store.RouterRuntime, error) {
 	// anchor: this is the exact wire shape ParseStatus consumes (DESIGN §4).
 	var _ ipnstate.Status
-	return poller.RouterRuntime{}, errors.New("not implemented: router.ParseStatus")
+	return store.RouterRuntime{}, errors.New("not implemented: router.ParseStatus")
 }
 
 // runSSH dials addr:22, runs one command over a `none`-auth SSH session, and

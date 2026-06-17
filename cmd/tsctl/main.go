@@ -40,7 +40,9 @@ import (
 var (
 	_ poller.Netmapper    = (*netmap.Mapper)(nil)
 	_ poller.RouterClient = (*router.Client)(nil)
+	_ poller.Broadcaster  = (*sse.Hub)(nil)
 	_ api.WhoIser         = (*netmap.Mapper)(nil)
+	_ api.Controller      = (*poller.Poller)(nil)
 )
 
 func main() {
@@ -116,8 +118,8 @@ func runServe(args []string, lg *log.Logger) error {
 	mapper := netmap.New(lc) // implements poller.Netmapper AND api.WhoIser
 	rc := router.New(srv.Dial, cfg.SSHUser, cfg.SSHTimeout)
 	hub := sse.New()
-	pol := poller.New(st, mapper, rc, cfg.Routers, lg.Printf)
-	apiH := api.New(st, mapper)
+	pol := poller.New(st, mapper, rc, cfg.Routers, hub, lg.Printf)
+	apiH := api.New(st, mapper, pol)
 
 	// Long-lived workers run off appCtx so shutdown can stop them in order.
 	appCtx, appCancel := context.WithCancel(context.Background())
