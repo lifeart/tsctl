@@ -1,0 +1,24 @@
+# Build artifacts
+/tsctl
+/dist/
+*.exe
+
+# Go
+vendor/
+*.test
+*.out
+
+# tsnet state / secrets
+/tsnet-state/
+config.local.yaml
+*.authkey
+.env
+
+# Frontend
+web/node_modules/
+web/dist/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
