@@ -6,7 +6,7 @@ ownership + acceptance spec layered on top.**
 
 ## Ground rules (all agents)
 
-- **Toolchain is pinned. Do NOT** run `go get -u`, bump `tailscale.com` (frozen at **v1.94.2** — newer needs Go ≥1.26.4, we are on 1.25.5), or change the `go` directive. If you think you need a new dependency, STOP and report instead.
+- **Toolchain is pinned. Do NOT** run `go get -u`, bump `tailscale.com` (frozen at **v1.94.2** — newer needs Go ≥1.26.4, we are on 1.25.5), or change the `go` directive. If you think you need a new dependency, STOP and report instead. *(Post-Phase-B update: this pin has since been lifted — the project now builds on Go 1.26.4 with tailscale.com v1.100.0. See README "Building".)*
 - **Own only your directory** (see ownership). Do not edit other packages' files. Only the api+sse+poller agent touches `cmd/tsctl/main.go`.
 - **Frozen cross-agent seams — never change these signatures:** the interfaces `poller.Netmapper`, `poller.RouterClient`, `poller.Broadcaster`, `api.WhoIser`, `api.Controller`; all `store` types incl. `store.RouterRuntime`; and the HTTP/JSON wire contract in §3. Constructor arities (`api.New`, `poller.New`) are owned by the api+sse+poller agent (it owns both the constructors and `main.go`), so it may extend them (e.g. add a config param) as long as it keeps the frozen interfaces and updates `main.go`.
 - **No silent error swallowing** (global rule + DESIGN §8). Every error path surfaces: into `Snapshot.NetmapErr`, `RouterView.LastError`, an HTTP error body, or a log line — never an empty `catch`/ignored `err`.

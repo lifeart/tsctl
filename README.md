@@ -15,13 +15,20 @@ See [DESIGN.md](DESIGN.md) — the locked single source of truth.
 > tailnet — see [End-to-end verification](#end-to-end-verification). Known v1
 > limitations are listed at the bottom.
 
-## Build & run
+## Building
+
+Requires **Go 1.26.4+** (the `go` directive in `go.mod`); with `GOTOOLCHAIN=auto`
+(the default) an older `go` will fetch the right toolchain automatically. Built
+against **tailscale.com v1.100.0**. CI (`.github/workflows/ci.yml`) runs gofmt,
+`go vet`, `go build`, `go test -race`, and a `go mod tidy` check on every push/PR.
 
 ```sh
 go build ./...                 # build everything
 go vet  ./...                  # vet everything
+go test -race ./...            # tests, race detector on
 go build -o tsctl ./cmd/tsctl  # produce the binary
 ```
+
 
 Run the server (serves the SPA + API over the tailnet, `/healthz` on loopback):
 

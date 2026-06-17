@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # Reads the `go` directive from go.mod (1.26.4); keeps CI in lockstep
+          # with the module so the tailscale pin can't silently regress.
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: gofmt
+        run: |
+          # Exclude generated fixtures under testdata/.
+          unformatted="$(gofmt -l $(git ls-files '*.go' | grep -v '/testdata/') )"
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: build
+        run: go build ./...
+
+      - name: test (race)
+        run: go test -race -count=1 ./...
+
+      - name: go.mod tidy check
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum || {
+            echo "go.mod/go.sum not tidy — run 'go mod tidy' and commit."; exit 1;
+          }
