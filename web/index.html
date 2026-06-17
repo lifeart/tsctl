@@ -12,39 +12,126 @@
   <body>
     <header class="topbar">
       <div class="topbar-inner">
-        <h1 class="topbar-title">tsctl</h1>
-        <div id="conn-status" class="conn conn-wait" role="status" aria-live="polite">
-          connecting…
+        <div class="brand">
+          <h1 class="topbar-title">tsctl</h1>
+          <p class="topbar-subtitle">Choose each router’s exit node, live.</p>
+        </div>
+        <div class="topbar-right">
+          <span id="updated" class="updated" aria-live="off"></span>
+          <div id="conn-status" class="conn conn-wait" role="status" aria-live="polite">
+            connecting…
+          </div>
+          <button
+            id="help-btn"
+            class="icon-btn"
+            type="button"
+            aria-expanded="false"
+            aria-controls="legend"
+            aria-label="What do these mean?"
+            title="What do these mean?"
+          >?</button>
         </div>
       </div>
     </header>
 
     <main class="container">
+      <!-- Collapsible help legend (toggled by the ? button; keyboard operable). -->
+      <section id="legend" class="legend hidden" aria-label="Legend" hidden>
+        <h2 class="legend-title">Quick guide</h2>
+        <ul class="legend-list">
+          <li>
+            <span class="legend-icon"><span class="dot dot-on legend-dot"></span></span>
+            <span><strong>Green dot</strong> — the device is online right now. A grey
+            dot means it’s offline (you’ll see when it was last seen).</span>
+          </li>
+          <li>
+            <span class="legend-icon"><span class="badge badge-exit-node">exit node</span></span>
+            <span>An <strong>exit node</strong> routes a router’s internet traffic
+            through it. Only <em>approved</em> exit nodes can be selected.</span>
+          </li>
+          <li>
+            <span class="legend-icon"><span class="badge badge-router">router</span></span>
+            <span>A <strong>router</strong> you control. Pick where its internet
+            goes with “Route internet through”.</span>
+          </li>
+          <li>
+            <span class="legend-icon">↑↓</span>
+            <span><strong>Stats</strong> show traffic carried through the current exit
+            node, and when it last completed a handshake.</span>
+          </li>
+        </ul>
+      </section>
+
       <!-- No aria-live on this wrapper: each banner is its own live region
            (role="alert" / role="status"); a live-region wrapper around them
            would double-announce every message. -->
       <div id="banners">
         <div id="global-error" class="banner banner-error hidden" role="alert"></div>
-        <div id="netmap-err" class="banner banner-error hidden" role="alert"></div>
+        <div id="fallback-banner" class="banner banner-warn hidden" role="status"></div>
+        <div id="netmap-err" class="banner banner-warn hidden" role="status"></div>
         <div id="stale-banner" class="banner banner-warn hidden" role="status"></div>
       </div>
 
-      <section class="section">
+      <!-- Skeleton, shown until the first data (snapshot or /api/nodes) arrives. -->
+      <div id="loading" class="loading" aria-hidden="true">
+        <div class="skeleton skeleton-section"></div>
+        <div class="skeleton skeleton-card"></div>
+        <div class="skeleton skeleton-card"></div>
+      </div>
+
+      <section class="section" id="routers-section" hidden>
         <h2 class="section-title">Routers</h2>
         <div id="routers" class="router-list"></div>
-        <p id="routers-empty" class="empty hidden">No routers configured.</p>
+        <p id="routers-empty" class="empty hidden"></p>
       </section>
 
-      <section class="section">
-        <h2 class="section-title">Nodes</h2>
+      <section class="section" id="nodes-section" hidden>
+        <div class="section-head">
+          <h2 class="section-title">Devices</h2>
+          <span id="nodes-count" class="section-count" aria-live="off"></span>
+        </div>
+        <div id="nodes-tools" class="tools hidden">
+          <div class="search-wrap">
+            <svg class="search-icon" viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
+              <circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.6" />
+              <path d="M10.5 10.5 14 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+            </svg>
+            <input
+              id="node-search"
+              class="search-input"
+              type="search"
+              placeholder="Filter devices…"
+              aria-label="Filter devices by name, host, IP, or type"
+              autocomplete="off"
+              spellcheck="false"
+            />
+          </div>
+          <div id="filter-chips" class="chips" role="group" aria-label="Filter devices by type"></div>
+        </div>
         <div id="nodes" class="list-group"></div>
-        <p id="nodes-empty" class="empty hidden">No nodes in the netmap yet.</p>
+        <p id="nodes-empty" class="empty hidden"></p>
       </section>
-
-      <footer class="footer">
-        <span id="updated"></span>
-      </footer>
     </main>
+
+    <!-- Full-view message when the API rejects us as not the configured owner. -->
+    <div id="auth-error" class="auth-error hidden" role="alert" hidden>
+      <div class="auth-error-card">
+        <svg viewBox="0 0 24 24" width="40" height="40" aria-hidden="true" class="auth-error-icon">
+          <path d="M12 2 3 6v6c0 5 3.8 8.4 9 10 5.2-1.6 9-5 9-10V6l-9-4Z"
+            fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" />
+          <path d="M12 8v5M12 16v.01" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+        </svg>
+        <h2>Not authorized</h2>
+        <p id="auth-error-detail">
+          Your tailnet identity isn’t the configured owner, so tsctl won’t show or
+          change anything. Sign in to the tailnet as the owner account, or update
+          the <code>--owner</code> / <code>TSCTL_OWNER</code> setting on the server.
+        </p>
+      </div>
+    </div>
+
+    <!-- Toasts: stacked, auto-dismissing, polite announcements. -->
+    <div id="toasts" class="toasts" aria-live="polite" aria-relevant="additions"></div>
 
     <script src="app.js"></script>
   </body>

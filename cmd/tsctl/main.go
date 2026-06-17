@@ -28,6 +28,7 @@ import (
 	"tailscale.com/tsnet"
 
 	"github.com/lifeart/tsctl/internal/api"
+	"github.com/lifeart/tsctl/internal/demo"
 	"github.com/lifeart/tsctl/internal/netmap"
 	"github.com/lifeart/tsctl/internal/poller"
 	"github.com/lifeart/tsctl/internal/router"
@@ -45,7 +46,16 @@ var (
 	_ poller.Broadcaster  = (*sse.Hub)(nil)
 	_ api.WhoIser         = (*netmap.Mapper)(nil)
 	_ api.Controller      = (*poller.Poller)(nil)
+
+	// The demo World plays the Mapper (Netmapper+WhoIser) and RouterClient roles
+	// against the SAME frozen seams, so `tsctl demo` exercises the real stack.
+	_ poller.Netmapper    = (*demo.World)(nil)
+	_ poller.RouterClient = (*demo.World)(nil)
+	_ api.WhoIser         = (*demo.World)(nil)
 )
+
+// demoListen is the plain loopback address `tsctl demo` serves on (no tsnet).
+const demoListen = "127.0.0.1:8089"
 
 func main() {
 	lg := log.New(os.Stderr, "tsctl: ", log.LstdFlags|log.Lmsgprefix)
@@ -57,6 +67,12 @@ func main() {
 		}
 		if err := runSpike(args[1], lg); err != nil {
 			lg.Fatalf("spike: %v", err)
+		}
+		return
+	}
+	if len(args) > 0 && args[0] == "demo" {
+		if err := runDemo(lg); err != nil {
+			lg.Fatalf("demo: %v", err)
 		}
 		return
 	}
@@ -353,5 +369,86 @@ func runSpike(addr string, lg *log.Logger) error {
 	if stderr.Len() > 0 {
 		fmt.Printf("--- stderr ---\n%s\n", stderr.String())
 	}
+	return nil
+}
+
+// runDemo serves the web UI offline against scripted fixtures (internal/demo).
+// It NEVER starts tsnet and never touches the real serve/auth path: it wires the
+// REAL store/sse/poller/api stack -- the exact same mux runServe builds -- but
+// against a demo.World that plays the Mapper (Inventory+WhoIs) and RouterClient
+// roles, on a PLAIN loopback listener. "What you see is what prod renders."
+func runDemo(lg *log.Logger) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	world := demo.New()
+
+	// --- wiring (mirrors runServe, with the demo World as both edges) ---
+	st := store.New()
+	hub := sse.New(st, api.EncodeSnapshot)
+	// Short poll interval so live SSE updates (ticking stats, the flipping node)
+	// are visibly streamed to the browser.
+	pol := poller.New(st, world, world, world.RouterIPs(), hub, hub.Transitions(), demo.TickInterval, lg.Printf)
+	apiH := api.New(st, world, pol, api.Config{
+		Owner:        demo.Owner,
+		AllowedHosts: world.AllowedHosts(),
+	})
+
+	// Long-lived workers run off appCtx so shutdown stops them in order; SSE
+	// request contexts derive from appCtx (BaseContext) so cancelling it releases
+	// the long-lived handlers and the HTTP drain can complete.
+	appCtx, appCancel := context.WithCancel(context.Background())
+	defer appCancel()
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		if err := hub.Run(appCtx); err != nil && !errors.Is(err, context.Canceled) {
+			lg.Printf("sse hub stopped: %v", err)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if err := pol.Run(appCtx); err != nil && !errors.Is(err, context.Canceled) {
+			lg.Printf("poller stopped: %v", err)
+		}
+	}()
+	go func() { defer wg.Done(); world.Run(appCtx) }() // time-variation goroutine
+
+	// EXACTLY the mux runServe builds: SSE (owner+host gated), REST API, SPA.
+	mux := http.NewServeMux()
+	mux.Handle("/api/events", apiH.RequireOwner(apiH.RequireHost(hub)))
+	mux.Handle("/api/", apiH.Routes())
+	mux.Handle("/", http.FileServerFS(web.FS))
+
+	ln, err := net.Listen("tcp", demoListen) // PLAIN loopback -- no tsnet
+	if err != nil {
+		return fmt.Errorf("demo listen: %w", err)
+	}
+	httpSrv := &http.Server{
+		Handler:           mux,
+		WriteTimeout:      0, // SSE: a write deadline silently kills long-lived streams
+		ReadHeaderTimeout: 10 * time.Second,
+		BaseContext:       func(net.Listener) context.Context { return appCtx },
+	}
+	go func() {
+		if err := httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			lg.Printf("demo http server: %v", err)
+		}
+	}()
+
+	lg.Printf("demo UI (offline, no tsnet) on http://%s/ -- Ctrl-C to stop", demoListen)
+	fmt.Printf("\n  tsctl demo: open http://%s/ in your browser\n\n", demoListen)
+
+	<-ctx.Done()
+	lg.Printf("shutdown signal received; draining")
+	appCancel()
+	wg.Wait()
+	shCtx, shCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shCancel()
+	if err := httpSrv.Shutdown(shCtx); err != nil {
+		lg.Printf("demo http shutdown: %v", err)
+	}
+	lg.Printf("clean shutdown")
 	return nil
 }

@@ -274,7 +274,10 @@ func TestSetExitNode_RouterFailureIs502WithStderr(t *testing.T) {
 		StderrText: "  permission denied\n",
 		Exit:       1,
 	}
-	rc := &fakeRC{setErr: cmdErr} // setRT zero => Online false
+	// A hard apply failure means the change did NOT take: the device kept its
+	// previous selection (here: Direct, from the seed) and is still reachable.
+	// The poller best-effort re-reads via Status to learn that actual state.
+	rc := &fakeRC{setErr: cmdErr, statusRT: store.RouterRuntime{Online: true, Current: nil}}
 	bc := newFakeBC()
 	p := New(st, &fakeNM{}, rc, []string{routerIP}, bc, make(chan int), time.Second, nopLogf)
 
@@ -298,8 +301,52 @@ func TestSetExitNode_RouterFailureIs502WithStderr(t *testing.T) {
 	if !errors.As(err, &ce) {
 		t.Errorf("real *router.CommandError not reachable via errors.As: %v", err)
 	}
+	// MUST-FIX #1: a hard command failure is COHERENT -- the device kept its
+	// previous (unchanged) selection, so State is ok (not "unconfirmed"), nothing
+	// is pending (Desired cleared), and the actual selection is shown. The error
+	// is still surfaced (502 above + LastError) -- never swallowed, never an
+	// "auto-revert/unconfirmed" line.
+	if rv.State != store.RouterOK {
+		t.Errorf("state = %q, want ok (device still on its previous selection)", rv.State)
+	}
+	if rv.Desired != nil {
+		t.Errorf("desired must be cleared on a hard failure (nothing pending), got %+v", rv.Desired)
+	}
+	if rv.CurrentExitNode != nil {
+		t.Errorf("currentExitNode = %+v, want nil (unchanged: still Direct)", rv.CurrentExitNode)
+	}
+	if !rv.Reachable {
+		t.Error("router should be reachable (the re-read succeeded)")
+	}
+	if rv.LastError == "" {
+		t.Error("LastError must be set")
+	}
+}
+
+// When the best-effort re-read after a hard failure ALSO fails, the poller can't
+// learn the actual selection, so it keeps the last-known selection and marks the
+// router unreachable (still surfacing the original command error + 502).
+func TestSetExitNode_HardFailureRereadFails(t *testing.T) {
+	routerIP, exitIP := "100.64.0.10", "100.64.0.20"
+	st := store.New()
+	seedSnapshot(st, routerIP, exitIP, true, true)
+	cmdErr := &router.CommandError{Addr: routerIP, Cmd: "apply exit-node", StderrText: "permission denied", Exit: 1}
+	rc := &fakeRC{setErr: cmdErr, statusErr: errors.New("ssh dial failed")}
+	p := New(st, &fakeNM{}, rc, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+
+	rv, err := p.SetExitNode(context.Background(), "router1", "exit1")
+	if err == nil {
+		t.Fatal("expected a router error")
+	}
+	var hs interface{ HTTPStatus() int }
+	if !errors.As(err, &hs) || hs.HTTPStatus() != 502 {
+		t.Errorf("expected 502, got %v", err)
+	}
 	if rv.State != store.RouterUnreachable {
-		t.Errorf("state = %q, want unreachable", rv.State)
+		t.Errorf("state = %q, want unreachable (re-read failed)", rv.State)
+	}
+	if rv.Desired != nil {
+		t.Errorf("desired must be cleared on a hard failure, got %+v", rv.Desired)
 	}
 	if rv.LastError == "" {
 		t.Error("LastError must be set")

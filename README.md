@@ -29,6 +29,10 @@ go test -race ./...            # tests, race detector on
 go build -o tsctl ./cmd/tsctl  # produce the binary
 ```
 
+Preview the web UI offline (no tsnet, no tailnet, no router) with scripted,
+time-varying fixtures — `./tsctl demo` serves the real SPA + API on
+<http://127.0.0.1:8089> (Ctrl-C to stop). What you see is what prod renders.
+
 
 Run the server (serves the SPA + API over the tailnet, `/healthz` on loopback):
 

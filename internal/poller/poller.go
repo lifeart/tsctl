@@ -4,7 +4,11 @@
 // RouterClient) and the RouterRuntime type, per DESIGN §4: interfaces live at
 // the CONSUMER to avoid import cycles. The concrete *netmap.Mapper and
 // *router.Client are injected by the composition root (cmd/tsctl), so this
-// package never imports netmap or router.
+// package never imports netmap. It does import router for one purpose only: to
+// recognise a definitive *router.CommandError (a command that RAN and failed)
+// so SetExitNode can tell a hard apply failure -- the change did NOT take --
+// apart from an applied-but-unconfirmed result. No import cycle: router depends
+// only on store, never on poller.
 //
 // FROZEN CONTRACT: the interface and type names below are the seam.
 package poller
@@ -19,6 +23,7 @@ import (
 
 	"golang.org/x/sync/singleflight"
 
+	"github.com/lifeart/tsctl/internal/router"
 	"github.com/lifeart/tsctl/internal/store"
 )
 
@@ -210,25 +215,63 @@ func (p *Poller) SetExitNode(ctx context.Context, routerID, targetStableID strin
 	rt, setErr := p.rc.SetExitNode(ctx, addr, target, prev)
 	now := time.Now()
 
+	// Distinguish a DEFINITIVE command failure (the arm/apply command RAN and
+	// exited non-zero, surfaced as *router.CommandError) from an applied-but-
+	// unconfirmed result. A *router.CommandError means the change did NOT take:
+	// the device kept its PREVIOUS selection and nothing is pending -- so it is
+	// wrong to show it as "unconfirmed / will auto-revert". For a hard failure we
+	// best-effort re-read the device's ACTUAL (unchanged) selection so the card
+	// shows the truth. The re-read is a network round-trip, so it runs OUTSIDE mu.
+	var cmdErr *router.CommandError
+	hardFail := setErr != nil && errors.As(setErr, &cmdErr)
+	var reread store.RouterRuntime
+	rereadOK := false
+	if hardFail {
+		if rr, rrErr := p.rc.Status(ctx, addr); rrErr == nil {
+			reread, rereadOK = rr, true
+		}
+	}
+
 	var updated store.RouterView
 	p.mu.Lock()
 	final, ok := p.withRouter(addr, func(rv *store.RouterView) {
-		rv.Stats = rt.Stats
 		switch {
 		case setErr == nil: // confirmed
+			rv.Stats = rt.Stats
 			rv.Reachable = true
 			rv.CurrentExitNode = rt.Current
 			rv.Desired = nil
 			rv.State = store.RouterOK
 			rv.LastError = ""
 			rv.LastConfirmedAt = now
-		case rt.Online: // applied but not confirmed equal (or confirm read mismatch)
+		case hardFail:
+			// The apply did not take; nothing is pending. Reflect the device's
+			// ACTUAL, unchanged selection from the best-effort re-read. Surface the
+			// command error in LastError (never swallow) -- the HTTP layer also
+			// returns it (non-2xx) via the return switch below.
+			rv.Desired = nil
+			rv.LastError = setErr.Error()
+			if rereadOK {
+				// Reachable and simply still on its previous exit node.
+				rv.Reachable = true
+				rv.CurrentExitNode = reread.Current
+				rv.Stats = reread.Stats
+				rv.State = store.RouterOK
+				rv.LastConfirmedAt = now
+			} else {
+				// Couldn't re-read: keep the last-known selection, mark unreachable.
+				rv.Reachable = false
+				rv.State = store.RouterUnreachable
+			}
+		case rt.Online: // applied but not confirmed equal (confirm-read mismatch)
+			rv.Stats = rt.Stats
 			rv.Reachable = true
 			rv.CurrentExitNode = rt.Current
 			rv.Desired = target
 			rv.State = store.RouterUnconfirmed
 			rv.LastError = setErr.Error()
-		default: // could not reach / apply
+		default: // could not reach / apply (transport failure, not a CommandError)
+			rv.Stats = rt.Stats
 			rv.Reachable = false
 			rv.Desired = target
 			rv.State = store.RouterUnreachable
@@ -256,9 +299,17 @@ func (p *Poller) SetExitNode(ctx context.Context, routerID, targetStableID strin
 	p.bc.Broadcast(final)
 
 	switch {
-	case setErr == nil, rt.Online:
-		// Honest non-error: the RouterView's State (ok / unconfirmed) tells the
-		// truth; unconfirmed is NOT shown as success by the UI.
+	case setErr == nil:
+		return updated, nil
+	case hardFail:
+		// Definitive command failure: the reconciled view above already reflects
+		// the device's actual, unchanged selection, but the HTTP layer MUST still
+		// surface the failure (non-2xx {error,detail,stderr}) so the caller knows
+		// the requested change did not take.
+		return updated, routerControlError(setErr)
+	case rt.Online:
+		// Applied-but-unconfirmed: honest non-error -- the RouterView's State
+		// (unconfirmed) tells the truth and is NOT shown as success by the UI.
 		return updated, nil
 	default:
 		return updated, routerControlError(setErr)
