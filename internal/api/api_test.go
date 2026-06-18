@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -51,30 +53,270 @@ func (e *ctrlErr) Stderr() string  { return e.serr }
 
 // --- middleware ---------------------------------------------------------------
 
-func TestRequireOwner(t *testing.T) {
+func TestRequireAuth(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
-	cases := []struct {
+
+	// Tailnet (WhoIs) path: only the untagged owner is admitted.
+	t.Run("owner whois allows", func(t *testing.T) {
+		a := New(store.New(), fakeWhoIs{login: "alice@example.com"}, &fakeController{}, Config{Owner: "alice@example.com"})
+		rec := httptest.NewRecorder()
+		a.RequireAuth(next).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/nodes", nil))
+		if rec.Code != 200 {
+			t.Errorf("owner: code = %d want 200", rec.Code)
+		}
+	})
+
+	// Everything that is NOT the owner and has no session → 401 (fail-closed,
+	// including on a WhoIs error: it must NOT grant access).
+	deny := []struct {
 		name  string
 		who   fakeWhoIs
 		owner string
-		want  int
 	}{
-		{"whois error", fakeWhoIs{err: errors.New("x")}, "alice@example.com", 403},
-		{"tagged peer", fakeWhoIs{login: "tag:tsctl", tagged: true}, "alice@example.com", 403},
-		{"empty login", fakeWhoIs{login: ""}, "alice@example.com", 403},
-		{"non-owner", fakeWhoIs{login: "bob@example.com"}, "alice@example.com", 403},
-		{"empty owner denies all", fakeWhoIs{login: "alice@example.com"}, "", 403},
-		{"owner ok", fakeWhoIs{login: "alice@example.com"}, "alice@example.com", 200},
+		{"whois error", fakeWhoIs{err: errors.New("x")}, "alice@example.com"},
+		{"tagged peer", fakeWhoIs{login: "tag:tsctl", tagged: true}, "alice@example.com"},
+		{"empty login", fakeWhoIs{login: ""}, "alice@example.com"},
+		{"non-owner", fakeWhoIs{login: "bob@example.com"}, "alice@example.com"},
+		{"empty owner denies tailnet", fakeWhoIs{login: "alice@example.com"}, ""},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, tc := range deny {
+		t.Run(tc.name+" -> 401", func(t *testing.T) {
 			a := New(store.New(), tc.who, &fakeController{}, Config{Owner: tc.owner})
 			rec := httptest.NewRecorder()
-			a.RequireOwner(next).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/nodes", nil))
-			if rec.Code != tc.want {
-				t.Errorf("status = %d, want %d", rec.Code, tc.want)
+			a.RequireAuth(next).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/nodes", nil))
+			if rec.Code != http.StatusUnauthorized {
+				t.Errorf("status = %d, want 401", rec.Code)
 			}
 		})
+	}
+
+	// Password/session path: a valid session admits even a non-owner WhoIs.
+	t.Run("valid session allows (non-owner whois)", func(t *testing.T) {
+		a := New(store.New(), fakeWhoIs{login: "intruder@example.com"}, &fakeController{},
+			Config{Owner: "alice@example.com", UIPassword: "hunter2"})
+		val, err := a.newSessionValue()
+		if err != nil {
+			t.Fatalf("newSessionValue: %v", err)
+		}
+		req := httptest.NewRequest(http.MethodGet, "/api/nodes", nil)
+		req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: val})
+		rec := httptest.NewRecorder()
+		a.RequireAuth(next).ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Errorf("valid session: code = %d want 200", rec.Code)
+		}
+	})
+
+	// Neither path: no owner, no session → 401.
+	t.Run("no owner no session -> 401", func(t *testing.T) {
+		a := New(store.New(), fakeWhoIs{login: "x"}, &fakeController{}, Config{UIPassword: "hunter2"})
+		rec := httptest.NewRecorder()
+		a.RequireAuth(next).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/nodes", nil))
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("code = %d want 401", rec.Code)
+		}
+	})
+}
+
+func TestSessionSignVerify(t *testing.T) {
+	a := New(store.New(), fakeWhoIs{}, &fakeController{}, Config{UIPassword: "pw"})
+	withCookie := func(v string) *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "/api/nodes", nil)
+		r.AddCookie(&http.Cookie{Name: sessionCookieName, Value: v})
+		return r
+	}
+
+	val, err := a.newSessionValue()
+	if err != nil {
+		t.Fatalf("newSessionValue: %v", err)
+	}
+	if !a.validSession(withCookie(val)) {
+		t.Error("freshly minted session should validate")
+	}
+	if a.validSession(httptest.NewRequest(http.MethodGet, "/api/nodes", nil)) {
+		t.Error("missing cookie should not validate")
+	}
+	if a.validSession(withCookie("not valid base64 $$")) {
+		t.Error("garbage cookie should not validate")
+	}
+
+	// Tampered MAC (flip a byte, re-encode) → reject.
+	raw, err := base64.RawURLEncoding.DecodeString(val)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	raw[len(raw)-1] ^= 0xFF
+	if a.validSession(withCookie(base64.RawURLEncoding.EncodeToString(raw))) {
+		t.Error("tampered MAC should not validate")
+	}
+
+	// A cookie signed by a different per-process secret must be rejected.
+	other := New(store.New(), fakeWhoIs{}, &fakeController{}, Config{UIPassword: "pw"})
+	if other.validSession(withCookie(val)) {
+		t.Error("cookie from a different secret should not validate")
+	}
+
+	// Expired but correctly signed → reject.
+	expired := make([]byte, sessionRawLen)
+	binary.BigEndian.PutUint64(expired[:sessionExpiryLen], uint64(time.Now().Add(-time.Hour).Unix()))
+	mac := a.sessionMAC(expired[:sessionExpiryLen+sessionNonceLen])
+	copy(expired[sessionExpiryLen+sessionNonceLen:], mac)
+	if a.validSession(withCookie(base64.RawURLEncoding.EncodeToString(expired))) {
+		t.Error("expired session should not validate")
+	}
+}
+
+func TestHandleLogin(t *testing.T) {
+	loginFailDelay = 0 // keep the suite fast; brute-force delay is exercised in prod
+	const host = "tsctl"
+	newAPI := func(pw string) *API {
+		return New(store.New(), fakeWhoIs{login: "nobody"}, &fakeController{},
+			Config{Owner: "alice", UIPassword: pw, AllowedHosts: []string{host}})
+	}
+	post := func(a *API, bodyJSON string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		a.handleLogin(rec, httptest.NewRequest(http.MethodPost, "/api/login", strings.NewReader(bodyJSON)))
+		return rec
+	}
+
+	// Correct password → 200 + a usable HttpOnly/Strict session cookie.
+	a := newAPI("hunter2")
+	rec := post(a, `{"password":"hunter2"}`)
+	if rec.Code != 200 {
+		t.Fatalf("correct login code = %d want 200 body=%s", rec.Code, rec.Body)
+	}
+	var sc *http.Cookie
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == sessionCookieName {
+			sc = c
+		}
+	}
+	if sc == nil || sc.Value == "" {
+		t.Fatal("correct login set no session cookie")
+	}
+	if !sc.HttpOnly {
+		t.Error("session cookie must be HttpOnly")
+	}
+	if sc.SameSite != http.SameSiteStrictMode {
+		t.Errorf("session cookie SameSite = %v want Strict", sc.SameSite)
+	}
+	if sc.Path != "/" {
+		t.Errorf("session cookie Path = %q want /", sc.Path)
+	}
+	rv := httptest.NewRequest(http.MethodGet, "/", nil)
+	rv.AddCookie(sc)
+	if !a.validSession(rv) {
+		t.Error("issued session cookie should validate")
+	}
+
+	// Wrong password → 401, no cookie. (subtle.ConstantTimeCompare in source.)
+	rec = post(newAPI("hunter2"), `{"password":"nope"}`)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("wrong login code = %d want 401", rec.Code)
+	}
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == sessionCookieName && c.Value != "" {
+			t.Error("wrong login must not set a session cookie")
+		}
+	}
+
+	// Password path disabled → 404 (endpoint does not exist).
+	rec = post(newAPI(""), `{"password":"whatever"}`)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("disabled login code = %d want 404", rec.Code)
+	}
+}
+
+// TestRoutes_LoginLogoutChain proves login/logout are reachable WITHOUT a session
+// but still enforce RequireHost + RequireCSRF, and that the issued session then
+// authorizes a data route even when the WhoIs identity is NOT the owner.
+func TestRoutes_LoginLogoutChain(t *testing.T) {
+	loginFailDelay = 0
+	const host = "tsctl"
+	a := New(store.New(), fakeWhoIs{login: "nobody@example.com"}, &fakeController{},
+		Config{Owner: "alice@example.com", UIPassword: "pw", AllowedHosts: []string{host}})
+	h := a.Routes()
+
+	login := func(reqHost string, withCSRF bool) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/login", strings.NewReader(`{"password":"pw"}`))
+		req.Host = reqHost
+		req.Header.Set("Content-Type", "application/json")
+		if withCSRF {
+			req.Header.Set("X-Tsctl-CSRF", "tok")
+			req.AddCookie(&http.Cookie{Name: "tsctl_csrf", Value: "tok"})
+		}
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	if got := login("evil.example", true).Code; got != http.StatusForbidden {
+		t.Errorf("login bad Host = %d want 403 (RequireHost)", got)
+	}
+	if got := login(host, false).Code; got != http.StatusForbidden {
+		t.Errorf("login missing CSRF = %d want 403 (RequireCSRF)", got)
+	}
+
+	rec := login(host, true)
+	if rec.Code != 200 {
+		t.Fatalf("good login = %d want 200 body=%s", rec.Code, rec.Body)
+	}
+	var sc *http.Cookie
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == sessionCookieName {
+			sc = c
+		}
+	}
+	if sc == nil {
+		t.Fatal("good login set no session cookie")
+	}
+
+	// The session authorizes a data GET despite a non-owner WhoIs.
+	getNodes := func(c *http.Cookie) int {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/nodes", nil)
+		req.Host = host
+		if c != nil {
+			req.AddCookie(c)
+		}
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	if got := getNodes(sc); got != 200 {
+		t.Errorf("session GET /api/nodes = %d want 200", got)
+	}
+	if got := getNodes(nil); got != http.StatusUnauthorized {
+		t.Errorf("no-session GET /api/nodes = %d want 401", got)
+	}
+
+	// Logout requires Host + CSRF and clears the cookie.
+	logout := func(withCSRF bool) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/logout", nil)
+		req.Host = host
+		req.AddCookie(sc)
+		if withCSRF {
+			req.Header.Set("X-Tsctl-CSRF", "tok")
+			req.AddCookie(&http.Cookie{Name: "tsctl_csrf", Value: "tok"})
+		}
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	if got := logout(false).Code; got != http.StatusForbidden {
+		t.Errorf("logout missing CSRF = %d want 403", got)
+	}
+	lrec := logout(true)
+	if lrec.Code != 200 {
+		t.Errorf("logout = %d want 200", lrec.Code)
+	}
+	cleared := false
+	for _, c := range lrec.Result().Cookies() {
+		if c.Name == sessionCookieName && c.MaxAge < 0 {
+			cleared = true
+		}
+	}
+	if !cleared {
+		t.Error("logout must clear the session cookie (MaxAge<0)")
 	}
 }
 
@@ -383,7 +625,9 @@ func TestRoutes_FullChain(t *testing.T) {
 		t.Errorf("controller called with (%q, %q)", fc.gotRouterID, fc.gotTarget)
 	}
 
-	// A non-owner is rejected before reaching the handler.
+	// A non-owner with no session is rejected before reaching the handler. This
+	// is now 401 ("authenticate") rather than 403: RequireOwner was replaced by
+	// RequireAuth, and 403 is reserved for Host/CSRF failures.
 	a2 := New(store.New(), fakeWhoIs{login: "bob"}, fc, Config{Owner: "alice", AllowedHosts: []string{host}})
 	rec2 := httptest.NewRecorder()
 	req2 := httptest.NewRequest(http.MethodPost, "/api/routers/r1/exit-node", strings.NewReader(`{"exitNode":"n2"}`))
@@ -391,7 +635,7 @@ func TestRoutes_FullChain(t *testing.T) {
 	req2.Header.Set("X-Tsctl-CSRF", "tok")
 	req2.AddCookie(&http.Cookie{Name: "tsctl_csrf", Value: "tok"})
 	a2.Routes().ServeHTTP(rec2, req2)
-	if rec2.Code != 403 {
-		t.Errorf("non-owner POST code = %d want 403", rec2.Code)
+	if rec2.Code != http.StatusUnauthorized {
+		t.Errorf("non-owner POST code = %d want 401", rec2.Code)
 	}
 }

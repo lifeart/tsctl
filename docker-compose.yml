@@ -8,8 +8,10 @@
 # tsctl-state volume and TS_AUTHKEY is no longer needed — you can remove it.
 #
 # Networking: tsnet is userspace — NO cap_add, NO /dev/net/tun, NO host network.
-# The web UI is on the TAILNET: open http://tsctl/ (the -hostname) from any
-# tailnet device. There is intentionally NO published UI port.
+# The web UI is always served on the TAILNET: open http://tsctl/ (the -hostname)
+# from any tailnet device. This compose ALSO publishes the UI on a host port so
+# you can reach it from your LAN without joining the tailnet — that path is
+# password-protected (TSCTL_UI_PASSWORD); the tailnet path still works too.
 
 services:
   tsctl:
@@ -23,6 +25,17 @@ services:
       # --- required ---
       TSCTL_OWNER: ${TSCTL_OWNER:?your tailnet login email, e.g. you@example.com}
       TSCTL_ROUTERS: ${TSCTL_ROUTERS:?comma-separated router 100.x IPv4s, e.g. 100.64.0.10,100.64.0.11}
+      # --- host-port UI (reach the UI from your LAN, password-protected) ---
+      # Listen on a host socket INSIDE the container (all interfaces); the ports:
+      # mapping below publishes it to the NAS. Exposing the UI on a host port
+      # REQUIRES a password — tsctl refuses to start an unauthenticated host UI.
+      TSCTL_HTTP_LISTEN: ":8080"
+      TSCTL_UI_PASSWORD: ${TSCTL_UI_PASSWORD:?set a strong UI password to expose the UI on a host port}
+      # The Host header you browse to MUST be on the allowlist (DNS-rebinding
+      # defense). Add your NAS hostname/IP (WITHOUT the port), comma-separated —
+      # e.g. nas.local,192.168.1.50. The tsnet hostname/MagicDNS/100.x are
+      # trusted automatically; the host-listen host is added for you.
+      TSCTL_ALLOWED_HOSTS: ${TSCTL_ALLOWED_HOSTS:?your NAS hostname/IP, e.g. nas.local,192.168.1.50}
       # --- optional ---
       TSCTL_HOSTNAME: tsctl
       TSCTL_SSH_USER: root
@@ -31,7 +44,12 @@ services:
       TSCTL_EXIT_NODE_LAN_ACCESS: preserve
     volumes:
       - tsctl-state:/var/lib/tsctl        # PERSISTENT — holds the node key; do not lose it
-    # No ports: the UI is tailnet-only. No cap_add / devices: userspace netstack.
+    ports:
+      # host:container — browse to http://<nas>:8088/. The container's loopback
+      # /healthz (127.0.0.1:8088 INSIDE the container) is NOT published and does
+      # not collide with this host-side port. Change 8088 to any free host port.
+      - "8088:8080"
+    # No cap_add / devices: userspace netstack needs none.
     security_opt:
       - no-new-privileges:true
 

@@ -22,6 +22,12 @@
             connecting…
           </div>
           <button
+            id="signout-btn"
+            class="text-btn hidden"
+            type="button"
+            hidden
+          >Sign out</button>
+          <button
             id="help-btn"
             class="icon-btn"
             type="button"
@@ -113,7 +119,42 @@
       </section>
     </main>
 
-    <!-- Full-view message when the API rejects us as not the configured owner. -->
+    <!-- Login overlay: shown on a 401 (authenticate). The SPA fetches a CSRF
+         token, then POSTs the password to /api/login; on success it resumes. -->
+    <div
+      id="login-overlay"
+      class="login-overlay hidden"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="login-title"
+      aria-describedby="login-desc"
+      hidden
+    >
+      <form id="login-form" class="login-card" novalidate>
+        <svg viewBox="0 0 24 24" width="38" height="38" aria-hidden="true" class="login-icon">
+          <rect x="4" y="10.5" width="16" height="10" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.6" />
+          <path d="M8 10.5V8a4 4 0 0 1 8 0v2.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+        </svg>
+        <h2 id="login-title">Sign in</h2>
+        <p id="login-desc" class="login-desc">Enter the tsctl password to continue.</p>
+        <label class="login-label" for="login-password">Password</label>
+        <input
+          id="login-password"
+          class="login-input"
+          type="password"
+          name="password"
+          autocomplete="current-password"
+          autocapitalize="off"
+          spellcheck="false"
+          aria-describedby="login-desc login-error"
+        />
+        <div id="login-error" class="login-error" role="alert" aria-live="assertive"></div>
+        <button id="login-submit" class="btn btn-primary login-submit" type="submit">Sign in</button>
+      </form>
+    </div>
+
+    <!-- Full-view message when a request is BLOCKED by Host/CSRF protection
+         (DNS-rebinding defense) — distinct from a 401 (authenticate). -->
     <div id="auth-error" class="auth-error hidden" role="alert" hidden>
       <div class="auth-error-card">
         <svg viewBox="0 0 24 24" width="40" height="40" aria-hidden="true" class="auth-error-icon">
@@ -121,11 +162,12 @@
             fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" />
           <path d="M12 8v5M12 16v.01" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
         </svg>
-        <h2>Not authorized</h2>
+        <h2>Request blocked</h2>
         <p id="auth-error-detail">
-          Your tailnet identity isn’t the configured owner, so tsctl won’t show or
-          change anything. Sign in to the tailnet as the owner account, or update
-          the <code>--owner</code> / <code>TSCTL_OWNER</code> setting on the server.
+          This request was rejected by tsctl’s anti-DNS-rebinding protection
+          (the page’s host isn’t on the allowlist). Open the UI at the tsctl
+          node’s MagicDNS name, its <code>100.x</code> address, or a host you’ve
+          added to <code>TSCTL_ALLOWED_HOSTS</code>.
         </p>
       </div>
     </div>

@@ -34,8 +34,13 @@
     gotSseFrame: false,
     connection: "connecting", // connecting | open | reconnecting | offline
     globalError: "",
-    authError: false,
+    authError: false,   // 403: request BLOCKED by Host/CSRF (DNS-rebinding) — full view
     authDetail: "",
+    needsLogin: false,  // 401: authenticate — show the password login overlay
+    loginBusy: false,   // a POST /api/login is in flight
+    loginError: "",     // last login failure message (e.g. "Incorrect password.")
+    loginDisabled: false, // server has no UI password (login returns 404) — tailnet-only
+    sessionActive: false, // signed in via password → show the "Sign out" affordance
     busyRouters: {},   // stableID -> true while a POST is in flight
     busyTarget: {},    // stableID -> the value picked while busy
     actionErrors: {},  // stableID -> {error, detail, stderr}
@@ -719,6 +724,8 @@
       return resp.text().then(function (text) {
         var data = null;
         try { data = text ? JSON.parse(text) : null; } catch (e) { data = null; }
+        // Session expired / not authenticated → show the login overlay.
+        if (resp.status === 401) { promptLogin(); return; }
         // CSRF 403: transparently refresh the token and retry ONCE.
         if (resp.status === 403 && !retried) {
           return fetchCSRF().then(function () { return doPostExitNode(sid, value, true); });
@@ -919,25 +926,75 @@
     } else { show(emptyEl, false); }
   }
 
+  // 403 full view: a request was blocked by Host/CSRF (DNS-rebinding) protection.
   function renderAuth() {
     var ae = $("#auth-error");
+    if (!ae) return;
     if (state.authError) {
       var d = $("#auth-error-detail");
       if (d && state.authDetail) {
-        // keep the standard explanation, append the server's words if useful
-        d.textContent = "Your tailnet identity isn’t the configured owner, so tsctl won’t show or change anything. "
-          + "Sign in to the tailnet as the owner account, or update the owner setting on the server. "
+        d.textContent = "This request was rejected by tsctl’s anti-DNS-rebinding protection "
+          + "(the page’s host isn’t on the allowlist). Open the UI at the tsctl node’s MagicDNS name, "
+          + "its 100.x address, or a host you’ve added to TSCTL_ALLOWED_HOSTS. "
           + "(Server said: " + state.authDetail + ")";
       }
       ae.hidden = false; show(ae, true);
     } else { ae.hidden = true; show(ae, false); }
   }
 
+  // 401 overlay: prompt for the UI password (or explain that password sign-in is
+  // disabled on a tailnet-only server).
+  function renderLogin() {
+    var ov = $("#login-overlay");
+    if (!ov) return;
+    if (!state.needsLogin) {
+      ov.hidden = true; show(ov, false);
+      ov._shown = false;
+      var clear = $("#login-password");
+      if (clear) clear.value = "";
+      return;
+    }
+    ov.hidden = false; show(ov, true);
+    var desc = $("#login-desc");
+    var input = $("#login-password");
+    var submit = $("#login-submit");
+    var errEl = $("#login-error");
+    if (state.loginDisabled) {
+      setText(desc, "Password sign-in is disabled on this server. Access requires signing in to the tailnet as the configured owner.");
+      if (input) input.disabled = true;
+      if (submit) { submit.disabled = true; setText(submit, "Sign in"); }
+      setText(errEl, "");
+    } else {
+      setText(desc, "Enter the tsctl password to continue.");
+      if (input) input.disabled = state.loginBusy;
+      if (submit) { submit.disabled = state.loginBusy; setText(submit, state.loginBusy ? "Signing in…" : "Sign in"); }
+      setText(errEl, state.loginError || "");
+    }
+    // Focus the field once, when the overlay first appears.
+    if (!ov._shown && input && !input.disabled) {
+      ov._shown = true;
+      try { input.focus(); } catch (e) { /* not focusable yet */ }
+    }
+  }
+
+  // "Sign out" is only meaningful when a password session is in use.
+  function renderSignout() {
+    var b = $("#signout-btn");
+    if (!b) return;
+    var vis = state.sessionActive && !state.needsLogin && !state.authError;
+    show(b, vis);
+    b.hidden = !vis;
+  }
+
   function render() {
     renderAuth();
-    if (state.authError) { renderConn(); return; }
-
+    renderLogin();
+    renderSignout();
     renderConn();
+    // A blocking overlay (403 forbidden or 401 login) owns the screen; don't
+    // also paint the (stale/empty) data behind it.
+    if (state.authError || state.needsLogin) return;
+
     renderUpdated();
     renderGlobalError();
     renderFallbackBanner();
@@ -955,18 +1012,126 @@
   }
 
   // ----------------------------------------------------------- networking ---
-  function handleAuth403(body) {
+  // A blocking overlay is up (401 login or 403 forbidden): suppress SSE
+  // reconnects and the poll fallback so we don't hammer a closed door.
+  function blocked() { return state.authError || state.needsLogin; }
+
+  // Map an /api auth failure to the right overlay: 401 → authenticate (login
+  // form); 403 → blocked by Host/CSRF (DNS-rebinding) full view.
+  function handleAuthFailure(status, body) {
+    if (status === 401) { promptLogin(); }
+    else { showForbidden(body); }
+  }
+
+  // 403: request blocked (Host/CSRF). Full-screen, no retry — it's a config/URL
+  // problem, not a credential the user can supply here.
+  function showForbidden(body) {
     state.authError = true;
     state.authDetail = (body && body.error) || "";
+    state.needsLogin = false;
     stopPollFallback();
     if (state.es) { try { state.es.close(); } catch (e) { /* already closed */ } state.es = null; }
     render();
   }
 
+  // 401: show the login overlay. errMsg (optional) replaces the current message;
+  // omit it to keep whatever's there (e.g. a background 401 shouldn't say
+  // "incorrect password").
+  function promptLogin(errMsg) {
+    state.needsLogin = true;
+    if (errMsg !== undefined) state.loginError = errMsg;
+    stopPollFallback();
+    if (state.es) { try { state.es.close(); } catch (e) { /* already closed */ } state.es = null; }
+    render();
+  }
+
+  // POST the password to /api/login (CSRF-protected). On success, drop the
+  // overlay and resume the normal data flow; on failure, explain in the overlay.
+  function submitLogin(password) {
+    state.loginBusy = true;
+    state.loginError = "";
+    state.loginDisabled = false;
+    renderLogin();
+    ensureCSRF()
+      .then(function () {
+        return fetch("/api/login", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-Tsctl-CSRF": state.csrfToken || "",
+          },
+          body: JSON.stringify({ password: password }),
+        });
+      })
+      .then(function (resp) {
+        return resp.text().then(function (text) {
+          var data = null;
+          try { data = text ? JSON.parse(text) : null; } catch (e) { data = null; }
+          if (resp.ok) {
+            state.needsLogin = false;
+            state.loginError = "";
+            state.loginDisabled = false;
+            state.sessionActive = true;
+            resumeAfterLogin();
+            return;
+          }
+          if (resp.status === 404) {
+            // Password sign-in is disabled (tailnet-only server).
+            state.loginDisabled = true;
+            state.loginError = "";
+          } else if (resp.status === 401) {
+            state.loginError = "Incorrect password.";
+          } else if (resp.status === 403) {
+            state.loginError = (data && data.error) || "Request blocked.";
+          } else {
+            state.loginError = (data && data.error) || ("Sign-in failed (HTTP " + resp.status + ").");
+          }
+        });
+      })
+      .catch(function (err) {
+        state.loginError = "Network error: " + ((err && err.message) || err);
+      })
+      .then(function () {
+        state.loginBusy = false;
+        renderLogin();
+      });
+  }
+
+  // After a successful login: hide the overlay and re-bootstrap the data flow.
+  function resumeAfterLogin() {
+    render();
+    fetchNodes();   // first paint with the new session
+    connectSSE();   // re-open the live stream
+  }
+
+  // "Sign out": clear the server session, then fall back to the login overlay.
+  function doLogout() {
+    ensureCSRF()
+      .then(function () {
+        return fetch("/api/logout", {
+          method: "POST",
+          headers: { "Accept": "application/json", "X-Tsctl-CSRF": state.csrfToken || "" },
+        });
+      })
+      .then(function () {
+        state.sessionActive = false;
+        state.snapshot = null;
+        state.nodesOnly = null;
+        state.gotSseFrame = false;
+        promptLogin("");
+      })
+      .catch(function (err) {
+        toast("err", "Sign out failed", String((err && err.message) || err));
+      });
+  }
+
   function fetchCSRF() {
     return fetch("/api/csrf", { headers: { Accept: "application/json" } })
       .then(function (r) {
-        if (r.status === 403) { return r.json().catch(function () { return {}; }).then(handleAuth403); }
+        if (r.status === 401 || r.status === 403) {
+          return r.json().catch(function () { return {}; }).then(function (b) { handleAuthFailure(r.status, b); });
+        }
         if (!r.ok) throw new Error("CSRF HTTP " + r.status);
         return r.json().then(function (d) {
           state.csrfToken = (d && d.token) || null;
@@ -988,7 +1153,9 @@
   function fetchNodes() {
     return fetch("/api/nodes", { headers: { Accept: "application/json" } })
       .then(function (r) {
-        if (r.status === 403) { return r.json().catch(function () { return {}; }).then(handleAuth403); }
+        if (r.status === 401 || r.status === 403) {
+          return r.json().catch(function () { return {}; }).then(function (b) { handleAuthFailure(r.status, b); });
+        }
         if (!r.ok) throw new Error("nodes HTTP " + r.status);
         return r.json().then(function (d) { state.nodesOnly = d; render(); });
       })
@@ -1017,7 +1184,7 @@
     if (state.openWatchdog || state.pollFallback) return;
     state.openWatchdog = setTimeout(function () {
       state.openWatchdog = null;
-      if (!state.authError) startPollFallback(); // never opened / long outage → poll
+      if (!blocked()) startPollFallback(); // never opened / long outage → poll
     }, OPEN_WATCHDOG_MS);
   }
   function clearOpenWatchdog() {
@@ -1025,7 +1192,7 @@
   }
 
   function connectSSE() {
-    if (state.authError) return;
+    if (blocked()) return;
     var es;
     try { es = new EventSource("/api/events"); }
     catch (e) { state.connection = "reconnecting"; renderConn(); scheduleReconnect(); return; }
@@ -1055,7 +1222,7 @@
       render();
     };
     es.onerror = function () {
-      if (state.authError) return;
+      if (blocked()) return;
       state.connection = state.pollFallback ? "offline" : "reconnecting";
       renderConn();
       armOpenWatchdog();
@@ -1067,7 +1234,7 @@
   }
 
   function scheduleReconnect() {
-    if (state.reconnectTimer || state.authError) return;
+    if (state.reconnectTimer || blocked()) return;
     var delay = state.reconnectDelay;
     state.reconnectDelay = Math.min(state.reconnectDelay * 2, RECONNECT_MAX);
     state.reconnectTimer = setTimeout(function () {
@@ -1109,6 +1276,19 @@
     if (search) {
       search.addEventListener("input", function () { state.filter.text = search.value || ""; renderNodes(); });
     }
+    // Login overlay: submit the password (CSRF-protected) on form submit.
+    var loginForm = $("#login-form");
+    if (loginForm) {
+      loginForm.addEventListener("submit", function (e) {
+        e.preventDefault();
+        if (state.loginBusy || state.loginDisabled) return;
+        var input = $("#login-password");
+        submitLogin(input ? input.value : "");
+      });
+    }
+    // "Sign out" (only shown when a password session is in use).
+    var signout = $("#signout-btn");
+    if (signout) signout.addEventListener("click", doLogout);
     // Esc closes any open modal even if focus drifted off the dialog.
     document.addEventListener("keydown", function (e) {
       if (e.key === "Escape" && activeModal) {

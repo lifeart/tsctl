@@ -23,9 +23,18 @@ type Config struct {
 	AuthKey      string        // one-time tagged enrollment key (env or LoadCredential)
 	Debug        bool          // forward verbose tsnet backend logs
 	SSHTimeout   time.Duration // per dial/exec deadline
-	Owner        string        // tailnet login allowed to control (RequireOwner, DESIGN §7)
+	Owner        string        // tailnet login allowed to control (RequireAuth, DESIGN §7); optional if UIPassword set
 	AllowedHosts []string      // Host-header allowlist for CSRF/rebinding defense (DESIGN §7)
 	PollInterval time.Duration // refresh cadence while ≥1 client is connected (DESIGN §6)
+
+	// HTTPListen, when non-empty (e.g. ":8080" or "0.0.0.0:8080"), runs a SECOND
+	// http.Server on this HOST socket serving the SAME UI+API as the tailnet
+	// listener, so the UI can be reached from a published Docker/NAS port. It is
+	// distinct from the loopback-only /healthz socket. Requires UIPassword.
+	HTTPListen string
+	// UIPassword is the shared password for the host-socket/session auth path
+	// (api.RequireAuth). Empty disables password login (tailnet-owner path only).
+	UIPassword string
 
 	// ExitNodeLANAccess controls the only non-exit-node pref tsctl ever writes.
 	// nil = PRESERVE the router's existing --exit-node-allow-lan-access (default);
@@ -84,7 +93,9 @@ func loadConfig(args []string) (*Config, error) {
 	fs.BoolVar(&c.Debug, "debug", env("TSCTL_DEBUG", "") != "", "forward verbose tsnet backend logs")
 	routers := fs.String("routers", env("TSCTL_ROUTERS", ""), "comma-separated router 100.x IPv4s")
 	fs.DurationVar(&c.SSHTimeout, "ssh-timeout", sshTimeoutDef, "per dial/exec SSH deadline")
-	fs.StringVar(&c.Owner, "owner", env("TSCTL_OWNER", ""), "tailnet login (email) allowed to control")
+	fs.StringVar(&c.Owner, "owner", env("TSCTL_OWNER", ""), "tailnet login (email) allowed to control (optional if -ui-password is set)")
+	fs.StringVar(&c.HTTPListen, "http-listen", env("TSCTL_HTTP_LISTEN", ""), "host-socket listen address for the UI/API, e.g. :8080 (off by default; requires -ui-password)")
+	fs.StringVar(&c.UIPassword, "ui-password", env("TSCTL_UI_PASSWORD", ""), "shared password for the host-socket/session auth path")
 	allowed := fs.String("allowed-hosts", env("TSCTL_ALLOWED_HOSTS", ""), "extra comma-separated Host values to allow (DNS-rebinding defense)")
 	fs.DurationVar(&c.PollInterval, "poll-interval", pollIntervalDef, "refresh cadence while a client is connected")
 	lanAccess := fs.String("exit-node-lan-access", env("TSCTL_EXIT_NODE_LAN_ACCESS", "preserve"),
@@ -121,6 +132,15 @@ func loadConfig(args []string) (*Config, error) {
 	for _, h := range strings.Split(*allowed, ",") {
 		if h = strings.TrimSpace(h); h != "" {
 			c.AllowedHosts = append(c.AllowedHosts, h)
+		}
+	}
+	// Auto-allow the host-listen host so reaching the UI at that bind address
+	// works out of the box. A wildcard bind (":8080" → empty host) adds nothing;
+	// the user must still add the NAS hostname/IP they browse to via
+	// TSCTL_ALLOWED_HOSTS (documented in the README / .env.example).
+	if c.HTTPListen != "" {
+		if host, _, err := net.SplitHostPort(c.HTTPListen); err == nil && host != "" {
+			c.AllowedHosts = append(c.AllowedHosts, host)
 		}
 	}
 
@@ -171,6 +191,11 @@ func (c *Config) validate() error {
 	}
 	if err := requireLoopback(c.HealthAddr); err != nil {
 		return fmt.Errorf("healthz address %q: %w", c.HealthAddr, err)
+	}
+	if c.HTTPListen != "" {
+		if _, _, err := net.SplitHostPort(c.HTTPListen); err != nil {
+			return fmt.Errorf("http-listen %q: %w (want host:port, e.g. :8080)", c.HTTPListen, err)
+		}
 	}
 	for _, r := range c.Routers {
 		if _, err := netip.ParseAddr(r); err != nil {

@@ -3,11 +3,15 @@
 // interface at the consumer) and is injected with a concrete WhoIser
 // (*netmap.Mapper) and the Store by the composition root.
 //
-// Security posture (DESIGN §7): every request is identified via WhoIs
-// (fail-closed -- deny on ANY error, deny tagged/unknown, require login==owner),
-// and every state-changing request additionally requires a valid X-Tsctl-CSRF
-// header (double-submit cookie) plus Host pinning and Origin/Sec-Fetch-Site
-// validation against an allowlist (DNS-rebinding defense).
+// Security posture (DESIGN §7): every data request must authenticate via
+// RequireAuth, which accepts EITHER the tailnet path (WhoIs identifies the peer
+// as the configured owner, untagged -- fail-closed: any WhoIs error / tagged /
+// non-owner does NOT grant, it falls through) OR the host/password path (a valid
+// signed tsctl_session cookie established by POST /api/login). Every request is
+// additionally Host-pinned (RequireHost, rejects DNS rebinding) and every
+// state-changing request requires a valid X-Tsctl-CSRF header (double-submit
+// cookie) plus Origin/Sec-Fetch-Site validation. A failed authentication is 401
+// ("authenticate" -- the SPA shows the login form); a Host/CSRF failure is 403.
 //
 // Wire contract (PHASE_B §3): response DTOs are defined HERE with camelCase JSON
 // tags (the store types carry no JSON tags). EncodeSnapshot is the shared
@@ -17,8 +21,12 @@ package api
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -50,25 +58,37 @@ type Controller interface {
 }
 
 // Config carries the security configuration the middleware needs (wired from
-// cmd/tsctl). Owner is the single tailnet login allowed to control; AllowedHosts
-// is the Host-header allowlist (tsnet hostname / MagicDNS FQDN / 100.x / listen
-// host) used for DNS-rebinding defense.
+// cmd/tsctl). Owner is the tailnet login allowed to control (may be "" when only
+// the password path is used); UIPassword is the shared secret for the
+// host-socket/session path ("" disables password login). AllowedHosts is the
+// Host-header allowlist (tsnet hostname / MagicDNS FQDN / 100.x / listen host)
+// used for DNS-rebinding defense.
 type Config struct {
 	Owner        string
+	UIPassword   string
 	AllowedHosts []string
 }
 
 // API holds the handler dependencies.
 type API struct {
-	store        *store.Store
-	whois        WhoIser
-	ctrl         Controller
-	owner        string
-	allowedHosts map[string]struct{} // normalized (lowercase, port-stripped)
+	store         *store.Store
+	whois         WhoIser
+	ctrl          Controller
+	owner         string
+	uiPassword    string
+	sessionSecret []byte              // HMAC key for signed session cookies (per-process)
+	allowedHosts  map[string]struct{} // normalized (lowercase, port-stripped)
 }
 
-// New constructs the API. cfg.Owner gates RequireOwner; cfg.AllowedHosts gates
-// the Host pinning in RequireCSRF.
+// New constructs the API. cfg.Owner enables the tailnet auth path in RequireAuth;
+// cfg.UIPassword enables the password/session path; cfg.AllowedHosts gates Host
+// pinning in RequireHost.
+//
+// A random 32-byte session secret is generated here (crypto/rand): it never
+// leaves the process, so a restart invalidates all outstanding sessions (an
+// acceptable, documented trade-off -- users simply sign in again). A crypto/rand
+// failure means the OS CSPRNG is broken; we panic rather than run with a
+// predictable secret (loud, never swallowed).
 func New(st *store.Store, who WhoIser, ctrl Controller, cfg Config) *API {
 	allowed := make(map[string]struct{}, len(cfg.AllowedHosts))
 	for _, h := range cfg.AllowedHosts {
@@ -76,22 +96,47 @@ func New(st *store.Store, who WhoIser, ctrl Controller, cfg Config) *API {
 			allowed[n] = struct{}{}
 		}
 	}
-	return &API{store: st, whois: who, ctrl: ctrl, owner: cfg.Owner, allowedHosts: allowed}
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err != nil {
+		panic("api: generating session secret: " + err.Error())
+	}
+	return &API{
+		store:         st,
+		whois:         who,
+		ctrl:          ctrl,
+		owner:         cfg.Owner,
+		uiPassword:    cfg.UIPassword,
+		sessionSecret: secret,
+		allowedHosts:  allowed,
+	}
 }
 
-// Routes returns the /api/* handler, wrapped fail-closed in the owner + host +
-// CSRF middleware. Mount it at "/api/" in the composition root. RequireHost runs
-// on EVERY request (so /api/csrf, /api/nodes, /api/routers/{id} reads are all
-// host-pinned, not just the writes) -- a DNS-rebinding page must not be able to
-// read the Snapshot either (DESIGN §7). (GET /api/events is mounted separately
-// by main and wrapped in RequireOwner(RequireHost(...)).)
+// Routes returns the /api/* handler. The outer layers run on EVERY request:
+// RequireHost (host-pinned -- a DNS-rebinding page can't even read the Snapshot,
+// DESIGN §7) then RequireCSRF (a no-op for GET/HEAD; enforces double-submit +
+// Origin on every state change, including login/logout).
+//
+// Mount order so the SPA can BOOTSTRAP without a session: /api/csrf, /api/login
+// and /api/logout are reachable WITHOUT RequireAuth (they only need Host + CSRF),
+// while the data routes (/api/nodes, /api/routers/{id}, .../exit-node) sit behind
+// RequireAuth. (GET /api/events is mounted separately by main and wrapped in
+// RequireAuth(RequireHost(...)).)
 func (a *API) Routes() http.Handler {
+	// Data routes: require an authenticated caller (tailnet owner OR session).
+	data := http.NewServeMux()
+	data.HandleFunc("GET /api/nodes", a.handleNodes)
+	data.HandleFunc("GET /api/routers/{id}", a.handleRouter)
+	data.HandleFunc("POST /api/routers/{id}/exit-node", a.handleSetExitNode)
+
 	mux := http.NewServeMux()
+	// Bootstrap endpoints (no session required; still Host-pinned + CSRF-checked):
 	mux.HandleFunc("GET /api/csrf", a.handleCSRF)
-	mux.HandleFunc("GET /api/nodes", a.handleNodes)
-	mux.HandleFunc("GET /api/routers/{id}", a.handleRouter)
-	mux.HandleFunc("POST /api/routers/{id}/exit-node", a.handleSetExitNode)
-	return a.RequireOwner(a.RequireHost(a.RequireCSRF(mux)))
+	mux.HandleFunc("POST /api/login", a.handleLogin)
+	mux.HandleFunc("POST /api/logout", a.handleLogout)
+	// Everything else under /api/ requires authentication.
+	mux.Handle("/api/", a.RequireAuth(data))
+
+	return a.RequireHost(a.RequireCSRF(mux))
 }
 
 // RequireHost pins the Host header to the configured allowlist on EVERY request
@@ -109,18 +154,151 @@ func (a *API) RequireHost(next http.Handler) http.Handler {
 	})
 }
 
-// RequireOwner identifies the caller via WhoIs and fails closed: deny on any
-// error, on a tagged peer, on an empty login, or on a login that is not the
-// configured owner (DESIGN §7). An empty configured owner denies everyone.
-func (a *API) RequireOwner(next http.Handler) http.Handler {
+// Session cookie parameters. The value is base64(expiry||nonce||HMAC); see
+// newSessionValue / validSession. HttpOnly (JS never needs it), SameSite=Strict,
+// Path=/, Secure=false (the listeners are plain HTTP -- WireGuard encrypts the
+// tailnet transport, and the host-socket path is documented as plain HTTP).
+const (
+	sessionCookieName = "tsctl_session"
+	sessionTTL        = 7 * 24 * time.Hour
+	sessionExpiryLen  = 8  // int64 unix seconds, big-endian
+	sessionNonceLen   = 16 // random, makes each cookie unique
+	sessionMACLen     = 32 // HMAC-SHA256
+	sessionRawLen     = sessionExpiryLen + sessionNonceLen + sessionMACLen
+)
+
+// loginFailDelay is a small fixed delay applied to a wrong-password login to
+// blunt online brute force. A var so tests can shorten it.
+var loginFailDelay = 500 * time.Millisecond
+
+// RequireAuth admits a request when EITHER auth path succeeds, else replies 401
+// (the SPA shows the login form). It is used on BOTH listeners (tailnet + host
+// socket) and gates the data routes + the SSE stream.
+//
+//   - tailnet path: owner configured AND WhoIs identifies the peer as that owner,
+//     untagged. Fail-closed: any WhoIs error, a tagged peer, an empty or
+//     non-owner login does NOT grant -- it falls through to the session check.
+//   - password path: a valid signed tsctl_session cookie (HMAC + not expired).
+//
+// 401 means "authenticate" (reserve 403 for Host/CSRF failures, which are about
+// WHICH page asked, not WHO).
+func (a *API) RequireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		login, tagged, err := a.whois.WhoIs(r.Context(), r.RemoteAddr)
-		if err != nil || tagged || login == "" || login != a.owner {
-			writeErr(w, http.StatusForbidden, "Not authorized")
+		if a.authenticated(r) {
+			next.ServeHTTP(w, r)
 			return
 		}
-		next.ServeHTTP(w, r)
+		writeErr(w, http.StatusUnauthorized, "login required")
 	})
+}
+
+// authenticated reports whether the request satisfies either auth path. Tailnet
+// (WhoIs==owner) is tried first; on any failure it falls through to the session
+// cookie -- never granting on a WhoIs error (fail-closed).
+func (a *API) authenticated(r *http.Request) bool {
+	if a.owner != "" {
+		login, tagged, err := a.whois.WhoIs(r.Context(), r.RemoteAddr)
+		if err == nil && !tagged && login != "" && login == a.owner {
+			return true
+		}
+	}
+	return a.validSession(r)
+}
+
+// newSessionValue mints a signed session cookie value valid for sessionTTL:
+// base64url(expiryUnix(8) || nonce(16) || HMAC-SHA256(secret, expiry||nonce)).
+func (a *API) newSessionValue() (string, error) {
+	raw := make([]byte, sessionRawLen)
+	binary.BigEndian.PutUint64(raw[:sessionExpiryLen], uint64(time.Now().Add(sessionTTL).Unix()))
+	if _, err := rand.Read(raw[sessionExpiryLen : sessionExpiryLen+sessionNonceLen]); err != nil {
+		return "", err
+	}
+	mac := a.sessionMAC(raw[:sessionExpiryLen+sessionNonceLen])
+	copy(raw[sessionExpiryLen+sessionNonceLen:], mac)
+	return base64.RawURLEncoding.EncodeToString(raw), nil
+}
+
+// sessionMAC is HMAC-SHA256(secret, signed) over the expiry||nonce prefix.
+func (a *API) sessionMAC(signed []byte) []byte {
+	mac := hmac.New(sha256.New, a.sessionSecret)
+	mac.Write(signed)
+	return mac.Sum(nil)
+}
+
+// validSession constant-time-verifies the tsctl_session cookie's HMAC and that
+// it has not expired. Any decode/length/MAC/expiry problem → false (fail-closed).
+func (a *API) validSession(r *http.Request) bool {
+	c, err := r.Cookie(sessionCookieName)
+	if err != nil || c.Value == "" {
+		return false
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(c.Value)
+	if err != nil || len(raw) != sessionRawLen {
+		return false
+	}
+	signed := raw[:sessionExpiryLen+sessionNonceLen]
+	mac := raw[sessionExpiryLen+sessionNonceLen:]
+	if subtle.ConstantTimeCompare(mac, a.sessionMAC(signed)) != 1 {
+		return false
+	}
+	expiry := int64(binary.BigEndian.Uint64(signed[:sessionExpiryLen]))
+	return time.Now().Unix() < expiry
+}
+
+// handleLogin authenticates the password path. It is mounted WITHOUT RequireAuth
+// (so the SPA can sign in) but WITH RequireHost + RequireCSRF. On a correct
+// password it sets the signed session cookie and returns 200 {"ok":true}; on a
+// wrong password it waits loginFailDelay then returns 401. If password login is
+// disabled (no UIPassword) the endpoint does not exist (404). The password and
+// the cookie value are NEVER logged.
+func (a *API) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if a.uiPassword == "" {
+		writeErr(w, http.StatusNotFound, "password login is disabled")
+		return
+	}
+	var body struct {
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeErrDetail(w, http.StatusBadRequest, "invalid request body", err.Error(), "")
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(body.Password), []byte(a.uiPassword)) != 1 {
+		time.Sleep(loginFailDelay) // blunt brute force; never log the attempt
+		writeErr(w, http.StatusUnauthorized, "invalid password")
+		return
+	}
+	val, err := a.newSessionValue()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "could not create session")
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    val,
+		Path:     "/",
+		SameSite: http.SameSiteStrictMode,
+		HttpOnly: true,
+		Secure:   false,
+		Expires:  time.Now().Add(sessionTTL),
+		MaxAge:   int(sessionTTL / time.Second),
+	})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleLogout clears the session cookie. Mounted WITHOUT RequireAuth but WITH
+// RequireHost + RequireCSRF (so a cross-origin page can't force a logout).
+func (a *API) handleLogout(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    "",
+		Path:     "/",
+		SameSite: http.SameSiteStrictMode,
+		HttpOnly: true,
+		Secure:   false,
+		MaxAge:   -1, // delete now
+	})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 // RequireCSRF guards every non-GET/HEAD (state-changing) request with, in order

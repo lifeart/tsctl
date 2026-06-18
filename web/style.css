@@ -196,6 +196,26 @@ body {
 .icon-btn:hover { background: var(--fill-strong); color: var(--text); }
 .icon-btn[aria-expanded="true"] { background: var(--accent-tint); color: var(--c-accent); }
 
+/* text button (e.g. Sign out) */
+.text-btn {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  border: none;
+  border-radius: var(--radius-pill);
+  background: var(--fill);
+  color: var(--c-accent);
+  font: inherit;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  padding: 0.3rem 0.7rem;
+  min-height: 30px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background var(--t), color var(--t);
+}
+.text-btn:hover { background: var(--fill-strong); }
+
 /* ------------------------------------------------------------ layout ---- */
 .container {
   max-width: var(--col);
@@ -615,6 +635,72 @@ body {
 }
 
 .hidden { display: none !important; }
+
+/* ----------------------------------------------- login overlay --------- */
+.login-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 55;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  background: var(--bg);
+}
+.login-overlay[hidden] { display: none; }
+.login-card {
+  width: 100%;
+  max-width: 22rem;
+  text-align: center;
+  background: var(--card);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+  padding: 2rem 1.5rem 1.5rem;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+}
+.login-icon { color: var(--accent); align-self: center; }
+.login-card h2 { margin: 0.75rem 0 0.4rem; font-size: 1.25rem; }
+.login-desc {
+  margin: 0 0 1.1rem;
+  color: var(--text-secondary);
+  font-size: 0.9375rem;
+  line-height: 1.45;
+}
+.login-label {
+  text-align: left;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+  margin-bottom: 0.3rem;
+}
+.login-input {
+  font: inherit;
+  font-size: 1rem;
+  color: var(--text);
+  background: var(--fill);
+  border: none;
+  border-radius: 10px;
+  width: 100%;
+  min-height: 44px;
+  padding: 0 0.85rem;
+  -webkit-appearance: none;
+  appearance: none;
+  transition: background var(--t);
+}
+.login-input:hover { background: var(--fill-strong); }
+.login-input:disabled { opacity: 0.6; cursor: not-allowed; }
+.login-error {
+  min-height: 1.1rem;
+  margin: 0.5rem 0 0;
+  text-align: left;
+  color: var(--c-red);
+  font-size: 0.8125rem;
+  line-height: 1.35;
+}
+.login-error:empty { margin: 0; min-height: 0; }
+.login-submit { width: 100%; margin-top: 0.9rem; justify-content: center; display: inline-flex; align-items: center; }
 
 /* ----------------------------------------------- not-authorized view --- */
 .auth-error {

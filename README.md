@@ -98,7 +98,9 @@ env equivalent.
 | Flag | Env | Default | Required | Purpose |
 |---|---|---|---|---|
 | *(token)* | `TS_AUTHKEY` | — | first run | Tailscale enrollment token (see above); or systemd `LoadCredential` `ts_authkey` |
-| `-owner` | `TSCTL_OWNER` | — | **yes** (serve) | tailnet login allowed to control |
+| `-owner` | `TSCTL_OWNER` | — | one of† | tailnet login allowed to control (tailnet auth path) |
+| `-ui-password` | `TSCTL_UI_PASSWORD` | — | one of† | shared password for the host-port/session auth path; **required** when `-http-listen` is set |
+| `-http-listen` | `TSCTL_HTTP_LISTEN` | — (off) | no | ALSO serve the UI+API on this host socket, e.g. `:8080` (separate from `/healthz`); requires `-ui-password` |
 | `-routers` | `TSCTL_ROUTERS` | — | **yes** | comma-separated router `100.x` IPv4s |
 | `-hostname` | `TSCTL_HOSTNAME` | `tsctl` | no | node hostname; the UI URL `http://<hostname>/` |
 | `-state-dir` | `TSCTL_STATE_DIR` | `./tsnet-state` (or systemd `STATE_DIRECTORY`) | no | node key store — **must persist** (treat as a private key) |
@@ -110,6 +112,14 @@ env equivalent.
 | `-poll-interval` | `TSCTL_POLL_INTERVAL` | `30s` | no | refresh cadence while a client is connected |
 | `-ssh-timeout` | `TSCTL_SSH_TIMEOUT` | `15s` | no | per dial/exec SSH deadline |
 | `-debug` | `TSCTL_DEBUG` | off | no | verbose tsnet backend logs |
+
+† **At least one auth method is required.** serve needs `TSCTL_OWNER` (the
+tailnet path: a request is admitted when Tailscale's `WhoIs` identifies the
+caller as this owner) and/or `TSCTL_UI_PASSWORD` (the password path: sign in to
+get a signed-cookie session). With both, either works; the tailnet owner is never
+shown the login form. A failed auth is **401** (the SPA shows a login form);
+**403** is reserved for Host/CSRF (DNS-rebinding) failures. Sessions are signed
+with a random per-process secret, so a restart invalidates them (sign in again).
 
 After first enrollment the node key lives in the state dir and `TS_AUTHKEY` is no
 longer needed — drop it.
@@ -261,18 +271,35 @@ Then, with [`docker-compose.yml`](docker-compose.yml):
 
 ```sh
 export TS_AUTHKEY=tskey-client-XXXX            # see auth options below
-export TSCTL_OWNER=you@example.com             # only this tailnet login may control
+export TSCTL_OWNER=you@example.com             # tailnet login allowed to control
 export TSCTL_ROUTERS=100.64.0.10,100.64.0.11   # your OpenWRT routers' 100.x IPv4s
+# Host-port UI (the shipped compose publishes one — see below):
+export TSCTL_UI_PASSWORD='a-strong-password'   # required to expose the UI on a host port
+export TSCTL_ALLOWED_HOSTS=nas.local,192.168.1.50  # the NAS hostname/IP you browse to (no port)
 docker compose up -d
 docker compose logs -f tsctl                   # watch enrollment
 ```
 
-**Reaching the UI:** there is **no published port** — the UI is served on the
-**tailnet**. From any device on your tailnet, open `http://tsctl/` (the
-`-hostname`, via MagicDNS) or the node's `100.x` IP. `/healthz` stays bound to
-loopback *inside* the container by design (it's a security boundary, not a NAS
-health endpoint); rely on the container restart policy + the Tailscale admin
-console for liveness.
+**Reaching the UI — two ways:**
+
+1. **Over the tailnet (always on).** From any device on your tailnet, open
+   `http://tsctl/` (the `-hostname`, via MagicDNS) or the node's `100.x` IP. On
+   this path you're authenticated by your Tailscale identity (`TSCTL_OWNER`) — no
+   password prompt.
+2. **From your LAN, on a published host port (optional, password-protected).**
+   Set `TSCTL_HTTP_LISTEN` (the shipped compose uses `:8080`) and publish it with
+   `ports: ["8088:8080"]`, then browse to `http://<nas>:8088/`. Because this
+   socket can be reached without a tailnet identity, it **requires a password**
+   (`TSCTL_UI_PASSWORD`) — tsctl refuses to start an unauthenticated host UI — and
+   you get a sign-in form. **You MUST add the hostname/IP you browse to (without
+   the port) to `TSCTL_ALLOWED_HOSTS`** (e.g. `nas.local`, `192.168.1.50`), or the
+   anti-DNS-rebinding Host check blocks the page. The `TSCTL_HTTP_LISTEN` host and
+   the tsnet hostname/MagicDNS/`100.x` are trusted automatically.
+
+`/healthz` stays bound to loopback *inside* the container by design (it's a
+security boundary, not a NAS health endpoint, and is separate from the host-port
+UI); rely on the container restart policy + the Tailscale admin console for
+liveness.
 
 ### Authenticating Tailscale on a headless NAS
 

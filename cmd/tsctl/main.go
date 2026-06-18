@@ -163,10 +163,15 @@ func runServe(args []string, lg *log.Logger) error {
 	if err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
-	// serve requires an owner (RequireOwner fails closed); the spike subcommand
-	// does not. Surface this as a fail-fast config error, not a silent lockout.
-	if cfg.Owner == "" {
-		return errors.New("owner must be set (TSCTL_OWNER or --owner): the tailnet login allowed to control")
+	// serve needs AT LEAST ONE auth method (RequireAuth fails closed otherwise):
+	// the tailnet path (an owner login) and/or the host/password path. Owner is
+	// now optional. Surface this as a fail-fast config error, not a silent lockout.
+	if cfg.Owner == "" && cfg.UIPassword == "" {
+		return errors.New("no authentication configured: set an owner (TSCTL_OWNER / --owner) for the tailnet path and/or a UI password (TSCTL_UI_PASSWORD / --ui-password) for the host-port path")
+	}
+	// Never expose an unauthenticated control UI on a host socket.
+	if cfg.HTTPListen != "" && cfg.UIPassword == "" {
+		return errors.New("a password is required to expose the UI on a host port; set TSCTL_UI_PASSWORD")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -199,6 +204,7 @@ func runServe(args []string, lg *log.Logger) error {
 	pol := poller.New(st, mapper, rc, cfg.Routers, hub, hub.Transitions(), cfg.PollInterval, lg.Printf)
 	apiH := api.New(st, mapper, pol, api.Config{
 		Owner:        cfg.Owner,
+		UIPassword:   cfg.UIPassword,
 		AllowedHosts: allowedHosts(ctx, cfg, lc, lg),
 	})
 
@@ -220,12 +226,10 @@ func runServe(args []string, lg *log.Logger) error {
 		}
 	}()
 
-	// tailnet HTTP surface: SPA + REST + SSE. Go 1.22 mux: the more specific
-	// "/api/events" wins over "/api/".
-	mux := http.NewServeMux()
-	mux.Handle("/api/events", apiH.RequireOwner(apiH.RequireHost(hub))) // SSE: owner-gated AND host-pinned (DESIGN §7)
-	mux.Handle("/api/", apiH.Routes())
-	mux.Handle("/", http.FileServerFS(web.FS))
+	// HTTP surface: SPA + REST + SSE, shared by BOTH listeners (tailnet + the
+	// optional host socket). RequireAuth admits either the tailnet owner or a
+	// password session, so the SAME handler serves both paths.
+	mux := buildMux(apiH, hub)
 
 	ln, err := srv.Listen("tcp", cfg.Listen) // tailnet-only by construction; never Funnel (DESIGN §7)
 	if err != nil {
@@ -245,6 +249,31 @@ func runServe(args []string, lg *log.Logger) error {
 			lg.Printf("tailnet http server: %v", err)
 		}
 	}()
+
+	// --- optional host-socket listener (DESIGN §7: NOT the loopback /healthz) ---
+	// When cfg.HTTPListen is set, serve the SAME handler on a real host socket so
+	// the UI is reachable from a published Docker/NAS port. Auth here is the
+	// password/session path (RequireAuth). Validation above guarantees a password
+	// is set, so this is never an unauthenticated control UI.
+	var hostSrv *http.Server
+	if cfg.HTTPListen != "" {
+		hostLn, err := net.Listen("tcp", cfg.HTTPListen)
+		if err != nil {
+			return fmt.Errorf("http-listen %q: %w", cfg.HTTPListen, err)
+		}
+		hostSrv = &http.Server{
+			Handler:           mux,
+			WriteTimeout:      0, // SSE (same rationale as the tailnet server)
+			ReadHeaderTimeout: 10 * time.Second,
+			BaseContext:       func(net.Listener) context.Context { return appCtx },
+		}
+		go func() {
+			if err := hostSrv.Serve(hostLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				lg.Printf("host http server: %v", err)
+			}
+		}()
+		lg.Printf("ALSO serving SPA + API on host socket http://%s/ (password auth required); the tailnet path still works", cfg.HTTPListen)
+	}
 
 	// --- separate /healthz server, 127.0.0.1 only (DESIGN §4/§7) ---
 	var healthy atomic.Bool
@@ -299,6 +328,11 @@ func runServe(args []string, lg *log.Logger) error {
 	if err := httpSrv.Shutdown(shCtx); err != nil {
 		lg.Printf("tailnet http shutdown: %v", err)
 	}
+	if hostSrv != nil {
+		if err := hostSrv.Shutdown(shCtx); err != nil {
+			lg.Printf("host http shutdown: %v", err)
+		}
+	}
 	if err := healthSrv.Shutdown(shCtx); err != nil {
 		lg.Printf("healthz shutdown: %v", err)
 	}
@@ -307,6 +341,22 @@ func runServe(args []string, lg *log.Logger) error {
 	}
 	lg.Printf("clean shutdown")
 	return nil
+}
+
+// buildMux assembles the full HTTP surface served IDENTICALLY on every listener
+// (the tailnet listener, the optional host socket, and the demo loopback): the
+// SPA static files, the REST API, and the auth-gated SSE stream. Both auth paths
+// (tailnet WhoIs==owner, or a password session) flow through api.RequireAuth, so
+// one handler serves them all. Go 1.22 mux: the more specific "/api/events" wins
+// over "/api/".
+func buildMux(apiH *api.API, hub *sse.Hub) *http.ServeMux {
+	mux := http.NewServeMux()
+	// SSE: auth-gated AND host-pinned (DESIGN §7). RequireAuth admits the tailnet
+	// owner OR a valid session; RequireHost rejects DNS rebinding.
+	mux.Handle("/api/events", apiH.RequireAuth(apiH.RequireHost(hub)))
+	mux.Handle("/api/", apiH.Routes())
+	mux.Handle("/", http.FileServerFS(web.FS))
+	return mux
 }
 
 // allowedHosts builds the Host-header allowlist for DNS-rebinding defense: the
@@ -442,10 +492,15 @@ func runDemo(lg *log.Logger) error {
 	// Short poll interval so live SSE updates (ticking stats, the flipping node)
 	// are visibly streamed to the browser.
 	pol := poller.New(st, world, world, world.RouterIPs(), hub, hub.Transitions(), demo.TickInterval, lg.Printf)
-	apiH := api.New(st, world, pol, api.Config{
-		Owner:        demo.Owner,
-		AllowedHosts: world.AllowedHosts(),
-	})
+	demoCfg := api.Config{Owner: demo.Owner, AllowedHosts: world.AllowedHosts()}
+	// Optional password-preview: with TSCTL_UI_PASSWORD set, disable the auto-owner
+	// path so the login overlay (the host-port/session UI) is exercised offline.
+	if pw := os.Getenv("TSCTL_UI_PASSWORD"); pw != "" {
+		demoCfg.Owner = ""
+		demoCfg.UIPassword = pw
+		lg.Printf("demo: password mode -- sign in with TSCTL_UI_PASSWORD")
+	}
+	apiH := api.New(st, world, pol, demoCfg)
 
 	// Long-lived workers run off appCtx so shutdown stops them in order; SSE
 	// request contexts derive from appCtx (BaseContext) so cancelling it releases
@@ -468,11 +523,8 @@ func runDemo(lg *log.Logger) error {
 	}()
 	go func() { defer wg.Done(); world.Run(appCtx) }() // time-variation goroutine
 
-	// EXACTLY the mux runServe builds: SSE (owner+host gated), REST API, SPA.
-	mux := http.NewServeMux()
-	mux.Handle("/api/events", apiH.RequireOwner(apiH.RequireHost(hub)))
-	mux.Handle("/api/", apiH.Routes())
-	mux.Handle("/", http.FileServerFS(web.FS))
+	// EXACTLY the mux runServe builds: SSE (auth+host gated), REST API, SPA.
+	mux := buildMux(apiH, hub)
 
 	ln, err := net.Listen("tcp", demoListen) // PLAIN loopback -- no tsnet
 	if err != nil {

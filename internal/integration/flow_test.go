@@ -83,6 +83,7 @@ type tToken struct {
 const (
 	owner       = "owner@example.com"
 	allowedHost = "tsctl.test"
+	uiPassword  = "s3cr3t-host-pw"
 
 	routerID = "nROUTER01"
 	routerIP = "100.64.0.10"
@@ -183,13 +184,31 @@ type stack struct {
 	rc     *fakeRouterClient
 }
 
+// stackOpts tunes the wired stack for a scenario. The defaults (zero value via
+// newStack) reproduce the original owner-on-tailnet setup.
+type stackOpts struct {
+	whoLogin   string // WhoIs login the fake reports (default: owner)
+	uiPassword string // api UIPassword; non-empty enables the password/session path
+}
+
 // newStack wires the REAL store/sse/poller/api exactly as cmd/tsctl/main.go,
 // faking only the two external edges, and serves the same mux through httptest.
+// It uses the tailnet-owner defaults.
 func newStack(t *testing.T) *stack {
 	t.Helper()
+	return newStackWith(t, stackOpts{whoLogin: owner})
+}
+
+// newStackWith is newStack with explicit knobs (WhoIs identity + UIPassword) so a
+// test can close the tailnet path and exercise the host/password path.
+func newStackWith(t *testing.T, opts stackOpts) *stack {
+	t.Helper()
+	if opts.whoLogin == "" {
+		opts.whoLogin = owner
+	}
 
 	mapper := &fakeMapper{
-		login: owner, // default: the authorized owner
+		login: opts.whoLogin,
 		nodes: []store.NodeView{
 			{
 				StableID:     routerID,
@@ -223,11 +242,11 @@ func newStack(t *testing.T) *stack {
 	// Long poll interval: only the first-viewer refresh and the SetExitNode
 	// broadcasts drive frames during the test (no surprise ticker refresh).
 	pol := poller.New(st, mapper, rc, []string{routerIP}, hub, hub.Transitions(), time.Hour, t.Logf)
-	apiH := api.New(st, mapper, pol, api.Config{Owner: owner, AllowedHosts: []string{allowedHost}})
+	apiH := api.New(st, mapper, pol, api.Config{Owner: owner, UIPassword: opts.uiPassword, AllowedHosts: []string{allowedHost}})
 
 	// EXACTLY the mux main.go builds (minus the irrelevant static file server).
 	mux := http.NewServeMux()
-	mux.Handle("/api/events", apiH.RequireOwner(apiH.RequireHost(hub)))
+	mux.Handle("/api/events", apiH.RequireAuth(apiH.RequireHost(hub)))
 	mux.Handle("/api/", apiH.Routes())
 
 	appCtx, appCancel := context.WithCancel(context.Background())
@@ -254,15 +273,19 @@ type sseConn struct {
 	stop   chan struct{}
 }
 
-// connectSSE opens GET /api/events as the owner from an allowed Host and parses
-// each `data:` frame into a tSnapshot, pushing it onto frames.
-func connectSSE(t *testing.T, base, host string) *sseConn {
+// connectSSE opens GET /api/events from an allowed Host and parses each `data:`
+// frame into a tSnapshot, pushing it onto frames. Any cookies passed (e.g. a
+// session cookie) are attached so the password path can be exercised.
+func connectSSE(t *testing.T, base, host string, cookies ...*http.Cookie) *sseConn {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodGet, base+"/api/events", nil)
 	if err != nil {
 		t.Fatalf("new sse request: %v", err)
 	}
 	req.Host = host
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("sse connect: %v", err)
@@ -546,11 +569,13 @@ func TestFullStackFlow(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	// (d3) WhoIs login != owner -> 403 (RequireOwner) on a plain GET.
+	// (d3) WhoIs login != owner -> 401 (RequireAuth) on a plain GET. This was 403
+	// under the old RequireOwner; RequireAuth now returns 401 ("authenticate"),
+	// reserving 403 for Host/CSRF failures (see d1/d2/d4).
 	s.mapper.setIdentity("intruder@example.com", false, nil)
 	resp = req(t, http.MethodGet, base+"/api/nodes", allowedHost, "", nil)
-	if resp.StatusCode != http.StatusForbidden {
-		t.Errorf("(d3) non-owner GET /api/nodes status = %d, want 403", resp.StatusCode)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("(d3) non-owner GET /api/nodes status = %d, want 401", resp.StatusCode)
 	}
 	resp.Body.Close()
 	s.mapper.setIdentity(owner, false, nil) // restore
@@ -559,6 +584,145 @@ func TestFullStackFlow(t *testing.T) {
 	resp = req(t, http.MethodGet, base+"/api/events", "evil.example", "", nil)
 	if resp.StatusCode != http.StatusForbidden {
 		t.Errorf("(d4) bad-Host GET /api/events status = %d, want 403", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+// TestPasswordPathFlow exercises the host/password auth path end to end on a
+// stack whose WhoIs returns a NON-owner (so the tailnet path is closed): an
+// unauthenticated request is 401, login establishes a session, the session
+// authorizes reads + a CSRF'd mutation, Host pinning still applies, and logout
+// returns the caller to the unauthenticated (401) state. The data wire contract,
+// CSRF and Host pinning are unchanged -- only auth is additive.
+func TestPasswordPathFlow(t *testing.T) {
+	s := newStackWith(t, stackOpts{whoLogin: "intruder@example.com", uiPassword: uiPassword})
+	base := s.srv.URL
+
+	sessionName := "tsctl_session"
+
+	// (a) No auth (tailnet path closed, no session) -> 401.
+	resp := req(t, http.MethodGet, base+"/api/nodes", allowedHost, "", nil)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("(a) unauth GET /api/nodes = %d, want 401", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// (b) Bootstrap: /api/csrf is reachable WITHOUT a session.
+	token, csrf := fetchCSRF(t, base, allowedHost)
+	csrfHdr := "tsctl_csrf=" + csrf
+
+	// (c) Wrong password -> 401, and no session cookie issued.
+	resp = req(t, http.MethodPost, base+"/api/login", allowedHost, `{"password":"WRONG"}`, map[string]string{
+		"Content-Type": "application/json",
+		"X-Tsctl-CSRF": token,
+		"Cookie":       csrfHdr,
+	})
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("(c) wrong login = %d, want 401", resp.StatusCode)
+	}
+	for _, c := range resp.Cookies() {
+		if c.Name == sessionName && c.Value != "" {
+			t.Error("(c) wrong login must not set a session cookie")
+		}
+	}
+	resp.Body.Close()
+
+	// (d) Correct password -> 200 + session cookie.
+	resp = req(t, http.MethodPost, base+"/api/login", allowedHost, `{"password":"`+uiPassword+`"}`, map[string]string{
+		"Content-Type": "application/json",
+		"X-Tsctl-CSRF": token,
+		"Cookie":       csrfHdr,
+	})
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("(d) correct login = %d body=%q, want 200", resp.StatusCode, b)
+	}
+	var session *http.Cookie
+	for _, c := range resp.Cookies() {
+		if c.Name == sessionName {
+			session = c
+		}
+	}
+	resp.Body.Close()
+	if session == nil || session.Value == "" {
+		t.Fatal("(d) correct login set no tsctl_session cookie")
+	}
+	if !session.HttpOnly {
+		t.Error("(d) session cookie must be HttpOnly")
+	}
+	authCookies := csrfHdr + "; " + sessionName + "=" + session.Value
+
+	// (e) With the session, GET /api/nodes -> 200.
+	resp = req(t, http.MethodGet, base+"/api/nodes", allowedHost, "", map[string]string{"Cookie": authCookies})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("(e) session GET /api/nodes = %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// Connect an SSE client WITH the session so the poller's first-viewer refresh
+	// populates the snapshot the exit-node POST resolves the router from.
+	sc := connectSSE(t, base, allowedHost, session)
+	sc.waitForSnapshot(t, 5*time.Second, "session SSE inventory frame with router present",
+		func(s tSnapshot) bool { return findRouter(s, routerID) != nil })
+
+	// (f) A CSRF'd POST /exit-node works with the session.
+	s.rc.configureSet(store.RouterRuntime{
+		Online:  true,
+		Current: &store.ExitNodeRef{StableID: exitID, Name: exitName, IP: exitIP},
+		Stats:   store.RouterStats{RxBytes: 1024, TxBytes: 512, LastHandshake: time.Now()},
+	}, nil)
+	resp = req(t, http.MethodPost, base+"/api/routers/"+routerID+"/exit-node", allowedHost,
+		`{"exitNode":"`+exitID+`"}`, map[string]string{
+			"Content-Type": "application/json",
+			"X-Tsctl-CSRF": token,
+			"Cookie":       authCookies,
+		})
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("(f) session POST exit-node = %d body=%q, want 200", resp.StatusCode, b)
+	}
+	got := decode[tRouterView](t, resp)
+	if got.CurrentExitNode == nil || got.CurrentExitNode.IP != exitIP {
+		t.Errorf("(f) currentExitNode = %+v, want IP %s", got.CurrentExitNode, exitIP)
+	}
+
+	// (g) bad Host -> 403 even with a valid session + CSRF (RequireHost intact).
+	resp = req(t, http.MethodPost, base+"/api/routers/"+routerID+"/exit-node", "evil.example",
+		`{"exitNode":""}`, map[string]string{
+			"Content-Type": "application/json",
+			"X-Tsctl-CSRF": token,
+			"Cookie":       authCookies,
+		})
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("(g) bad-Host session POST = %d, want 403", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// (h) logout -> the cookie is cleared; the browser then sends no session, so a
+	// subsequent request is back to 401. (Sessions are stateless signed tokens; a
+	// real browser drops the cleared cookie -- modelled here by omitting it.)
+	resp = req(t, http.MethodPost, base+"/api/logout", allowedHost, "", map[string]string{
+		"X-Tsctl-CSRF": token,
+		"Cookie":       authCookies,
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("(h) logout = %d, want 200", resp.StatusCode)
+	}
+	cleared := false
+	for _, c := range resp.Cookies() {
+		if c.Name == sessionName && c.MaxAge < 0 {
+			cleared = true
+		}
+	}
+	resp.Body.Close()
+	if !cleared {
+		t.Error("(h) logout must clear the session cookie (MaxAge<0)")
+	}
+	resp = req(t, http.MethodGet, base+"/api/nodes", allowedHost, "", nil) // no session cookie
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("(h) post-logout GET /api/nodes = %d, want 401", resp.StatusCode)
 	}
 	resp.Body.Close()
 }
