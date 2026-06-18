@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#f2f2f7" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)" />
+    <title>tsctl — exit-node manager (live demo)</title>
+    <link rel="stylesheet" href="style.css" />
+    <!-- Demo-only banner styles. Kept here (NOT in style.css, which is the real
+         SPA stylesheet and is copied verbatim). Sits BELOW every SPA overlay
+         (login 55 / auth 50 / modal 60 / toasts 70 / zone-menu 65) so it is
+         never on top of a dialog, and clears of the bottom-center toasts. -->
+    <style>
+      .demo-banner {
+        position: fixed;
+        left: max(0.75rem, env(safe-area-inset-left));
+        bottom: max(0.75rem, env(safe-area-inset-bottom));
+        z-index: 40;
+        max-width: min(22rem, calc(100vw - 1.5rem));
+        display: inline-flex;
+        align-items: center;
+        gap: 0.45rem;
+        padding: 0.4rem 0.7rem;
+        font: 500 0.78rem/1.2 -apple-system, BlinkMacSystemFont, "SF Pro Text",
+          "Helvetica Neue", system-ui, sans-serif;
+        color: #fff;
+        background: rgba(20, 20, 22, 0.82);
+        -webkit-backdrop-filter: saturate(180%) blur(12px);
+        backdrop-filter: saturate(180%) blur(12px);
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 999px;
+        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.28);
+        text-decoration: none;
+      }
+      .demo-banner:hover { background: rgba(20, 20, 22, 0.92); }
+      .demo-banner:focus-visible { outline: 2px solid #0a84ff; outline-offset: 2px; }
+      .demo-banner .demo-dot {
+        flex: none; width: 8px; height: 8px; border-radius: 50%;
+        background: #30d158; box-shadow: 0 0 0 3px rgba(48, 209, 88, 0.25);
+      }
+      .demo-banner .demo-link { color: #6cb4ff; text-decoration: none; white-space: nowrap; }
+      .demo-banner .demo-link:hover { text-decoration: underline; }
+      @media (prefers-reduced-motion: no-preference) {
+        .demo-banner .demo-dot { animation: demo-pulse 2.4s ease-in-out infinite; }
+        @keyframes demo-pulse {
+          0%, 100% { box-shadow: 0 0 0 3px rgba(48, 209, 88, 0.25); }
+          50% { box-shadow: 0 0 0 5px rgba(48, 209, 88, 0.1); }
+        }
+      }
+    </style>
+    <!-- The mock MUST load BEFORE app.js: it replaces window.fetch +
+         window.EventSource so the UNMODIFIED SPA (app.js/style.css copied
+         verbatim) runs fully client-side with no backend. -->
+    <script src="mock.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar-inner">
+        <div class="brand">
+          <h1 class="topbar-title">tsctl</h1>
+          <p class="topbar-subtitle">Choose each router’s exit node, live.</p>
+        </div>
+        <div class="topbar-right">
+          <span id="updated" class="updated" aria-live="off"></span>
+          <div id="conn-status" class="conn conn-wait" role="status" aria-live="polite">
+            connecting…
+          </div>
+          <button
+            id="signout-btn"
+            class="text-btn hidden"
+            type="button"
+            hidden
+          >Sign out</button>
+          <button
+            id="help-btn"
+            class="icon-btn"
+            type="button"
+            aria-expanded="false"
+            aria-controls="legend"
+            aria-label="What do these mean?"
+            title="What do these mean?"
+          >?</button>
+        </div>
+      </div>
+    </header>
+
+    <main class="container">
+      <!-- Collapsible help legend (toggled by the ? button; keyboard operable). -->
+      <section id="legend" class="legend hidden" aria-label="Legend" hidden>
+        <h2 class="legend-title">Quick guide</h2>
+        <ul class="legend-list">
+          <li>
+            <span class="legend-icon"><span class="dot dot-on legend-dot"></span></span>
+            <span><strong>Green dot</strong> — the device is online right now. A grey
+            dot means it’s offline (you’ll see when it was last seen).</span>
+          </li>
+          <li>
+            <span class="legend-icon"><span class="badge badge-exit-node">exit node</span></span>
+            <span>An <strong>exit node</strong> routes a router’s internet traffic
+            through it. Only <em>approved</em> exit nodes can be selected.</span>
+          </li>
+          <li>
+            <span class="legend-icon"><span class="badge badge-router">router</span></span>
+            <span>A <strong>router</strong> you control. Pick where its internet
+            goes with “Route internet through”.</span>
+          </li>
+          <li>
+            <span class="legend-icon">↑↓</span>
+            <span><strong>Stats</strong> show traffic carried through the current exit
+            node, and when it last completed a handshake.</span>
+          </li>
+        </ul>
+      </section>
+
+      <!-- No aria-live on this wrapper: each banner is its own live region
+           (role="alert" / role="status"); a live-region wrapper around them
+           would double-announce every message. -->
+      <div id="banners">
+        <div id="global-error" class="banner banner-error hidden" role="alert"></div>
+        <div id="fallback-banner" class="banner banner-warn hidden" role="status"></div>
+        <div id="netmap-err" class="banner banner-warn hidden" role="status"></div>
+        <div id="stale-banner" class="banner banner-warn hidden" role="status"></div>
+      </div>
+
+      <!-- Skeleton, shown until the first data (snapshot or /api/nodes) arrives. -->
+      <div id="loading" class="loading" aria-hidden="true">
+        <div class="skeleton skeleton-section"></div>
+        <div class="skeleton skeleton-card"></div>
+        <div class="skeleton skeleton-card"></div>
+      </div>
+
+      <!-- View switch: the zone graph is the default view; the card list (routers
+           + devices) is the secondary "Devices" view. Two-tab segmented control. -->
+      <div id="viewbar" class="viewbar hidden" hidden>
+        <div class="segmented" role="tablist" aria-label="Choose a view">
+          <button id="tab-zones" class="seg is-selected" type="button" role="tab"
+            aria-selected="true" aria-controls="graph-section" tabindex="0">Zones</button>
+          <button id="tab-devices" class="seg" type="button" role="tab"
+            aria-selected="false" aria-controls="routers-section" tabindex="-1">Devices</button>
+        </div>
+      </div>
+
+      <!-- Zone graph (DEFAULT view): bipartite consumers ⟷ exit nodes with SVG
+           wires. Group selector (tabs) scopes the columns; "Ungrouped" catches the
+           rest. Rewire by drag OR by an accessible per-consumer menu. -->
+      <section class="section graph-section" id="graph-section" role="tabpanel"
+        aria-labelledby="tab-zones" hidden>
+        <div class="zone-bar">
+          <div id="zone-tabs" class="zone-tabs" role="tablist" aria-label="Zones"></div>
+          <div class="zone-actions">
+            <button id="zone-new" class="text-btn" type="button">New zone</button>
+            <button id="zone-edit" class="text-btn hidden" type="button" hidden>Edit</button>
+            <button id="zone-delete" class="text-btn zone-delete hidden" type="button" hidden>Delete</button>
+          </div>
+        </div>
+        <p id="graph-empty" class="empty hidden"></p>
+        <div id="graph-grid" class="graph-grid">
+          <div class="gcol gcol-consumers">
+            <div class="gcol-title">Consumers</div>
+            <div id="gcol-consumers" class="gcol-body"></div>
+            <p id="consumers-empty" class="gcol-empty hidden"></p>
+          </div>
+          <!-- Wires are drawn here, overlaying the gap. Each path carries an
+               aria-label; the SVG is a labelled group, not aria-hidden. -->
+          <svg id="wires" class="wires" role="group" aria-label="Exit-node connections"></svg>
+          <div class="gcol gcol-exits">
+            <div class="gcol-title">Exit nodes</div>
+            <div id="gcol-exits" class="gcol-body"></div>
+            <p id="exits-empty" class="gcol-empty hidden"></p>
+          </div>
+        </div>
+        <p id="graph-hint" class="graph-hint">
+          Drag a consumer onto an exit node, or select it and press Enter to choose.
+          “Direct” clears the exit node.
+        </p>
+      </section>
+
+      <section class="section" id="routers-section" hidden>
+        <h2 class="section-title">Routers</h2>
+        <div id="routers" class="router-list"></div>
+        <p id="routers-empty" class="empty hidden"></p>
+      </section>
+
+      <section class="section" id="nodes-section" hidden>
+        <div class="section-head">
+          <h2 class="section-title">Devices</h2>
+          <span id="nodes-count" class="section-count" aria-live="off"></span>
+        </div>
+        <div id="nodes-tools" class="tools hidden">
+          <div class="search-wrap">
+            <svg class="search-icon" viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
+              <circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.6" />
+              <path d="M10.5 10.5 14 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+            </svg>
+            <input
+              id="node-search"
+              class="search-input"
+              type="search"
+              placeholder="Filter devices…"
+              aria-label="Filter devices by name, host, IP, or type"
+              autocomplete="off"
+              spellcheck="false"
+            />
+          </div>
+          <div id="filter-chips" class="chips" role="group" aria-label="Filter devices by type"></div>
+        </div>
+        <div id="nodes" class="list-group"></div>
+        <p id="nodes-empty" class="empty hidden"></p>
+      </section>
+    </main>
+
+    <!-- Login overlay: shown on a 401 (authenticate). The SPA fetches a CSRF
+         token, then POSTs the password to /api/login; on success it resumes. -->
+    <div
+      id="login-overlay"
+      class="login-overlay hidden"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="login-title"
+      aria-describedby="login-desc"
+      hidden
+    >
+      <form id="login-form" class="login-card" novalidate>
+        <svg viewBox="0 0 24 24" width="38" height="38" aria-hidden="true" class="login-icon">
+          <rect x="4" y="10.5" width="16" height="10" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.6" />
+          <path d="M8 10.5V8a4 4 0 0 1 8 0v2.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+        </svg>
+        <h2 id="login-title">Sign in</h2>
+        <p id="login-desc" class="login-desc">Enter the tsctl password to continue.</p>
+        <label class="login-label" for="login-password">Password</label>
+        <input
+          id="login-password"
+          class="login-input"
+          type="password"
+          name="password"
+          autocomplete="current-password"
+          autocapitalize="off"
+          spellcheck="false"
+          aria-describedby="login-desc login-error"
+        />
+        <div id="login-error" class="login-error" role="alert" aria-live="assertive"></div>
+        <button id="login-submit" class="btn btn-primary login-submit" type="submit">Sign in</button>
+      </form>
+    </div>
+
+    <!-- Full-view message when a request is BLOCKED by Host/CSRF protection
+         (DNS-rebinding defense) — distinct from a 401 (authenticate). -->
+    <div id="auth-error" class="auth-error hidden" role="alert" hidden>
+      <div class="auth-error-card">
+        <svg viewBox="0 0 24 24" width="40" height="40" aria-hidden="true" class="auth-error-icon">
+          <path d="M12 2 3 6v6c0 5 3.8 8.4 9 10 5.2-1.6 9-5 9-10V6l-9-4Z"
+            fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" />
+          <path d="M12 8v5M12 16v.01" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+        </svg>
+        <h2>Request blocked</h2>
+        <p id="auth-error-detail">
+          This request was rejected by tsctl’s anti-DNS-rebinding protection
+          (the page’s host isn’t on the allowlist). Open the UI at the tsctl
+          node’s MagicDNS name, its <code>100.x</code> address, or a host you’ve
+          added to <code>TSCTL_ALLOWED_HOSTS</code>.
+        </p>
+      </div>
+    </div>
+
+    <!-- Toasts: stacked, auto-dismissing, polite announcements. -->
+    <div id="toasts" class="toasts" aria-live="polite" aria-relevant="additions"></div>
+
+    <!-- Live-demo banner (demo-only; the real SPA index.html has no such element). -->
+    <a class="demo-banner" href="https://github.com/lifeart/tsctl" target="_blank" rel="noopener noreferrer">
+      <span class="demo-dot" aria-hidden="true"></span>
+      <span>Live demo — mock data, no backend.&nbsp;<span class="demo-link">github.com/lifeart/tsctl</span></span>
+    </a>
+
+    <script src="app.js"></script>
+  </body>
+</html>

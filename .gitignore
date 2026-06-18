@@ -22,3 +22,6 @@ web/dist/
 .DS_Store
 .idea/
 .vscode/
+
+# Pages demo build artifact
+/_site/

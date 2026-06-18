@@ -1,0 +1,69 @@
+name: Deploy live demo to GitHub Pages
+
+# Publishes the client-side, no-backend demo of the tsctl web UI:
+#   web/app.js + web/style.css (the UNMODIFIED SPA)
+#   demo/index.html -> index.html (loads mock.js before app.js, adds the banner)
+#   demo/mock.js     (monkeypatches fetch + EventSource with the demo fixtures)
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+# Least-privilege token for Pages deploy (OIDC) + reading the repo.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One in-flight Pages deploy at a time; don't cancel a running one.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Assemble the publish directory (_site)
+        run: |
+          set -euo pipefail
+          mkdir -p _site
+          # The SPA itself, copied verbatim (never modified for the demo).
+          cp web/app.js _site/app.js
+          cp web/style.css _site/style.css
+          # The demo entry point + the client-side mock backend.
+          cp demo/index.html _site/index.html
+          cp demo/mock.js _site/mock.js
+          echo "Assembled _site:"
+          ls -la _site
+          # Fail loudly if mock.js is not loaded BEFORE app.js (mock-first is the
+          # whole point: it must replace fetch/EventSource before the SPA runs).
+          grep -q 'src="mock.js"' _site/index.html
+          grep -q 'src="app.js"' _site/index.html
+          mock_line=$(grep -n 'src="mock.js"' _site/index.html | head -1 | cut -d: -f1)
+          app_line=$(grep -n 'src="app.js"' _site/index.html | head -1 | cut -d: -f1)
+          echo "mock.js at line $mock_line, app.js at line $app_line"
+          test "$mock_line" -lt "$app_line"
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
