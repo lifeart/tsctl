@@ -1,15 +1,17 @@
 # tsctl on Synology — DSM 7.2+ Container Manager "Project". UI on host port 8087.
 #
-# SETUP
-#   1. Make the image pullable. This repo is PRIVATE, so its GHCR image is private
-#      too — pick one:
-#        a) Make the package public (it holds no secrets): GitHub → your profile →
-#           Packages → tsctl → Package settings → Change visibility → Public.
-#        b) Log in on the NAS once (SSH): `sudo docker login ghcr.io -u <github-user>`
-#           and paste a Personal Access Token with the `read:packages` scope.
-#   2. Container Manager → Project → Create → upload this file (or paste it), fill
-#      in the environment values below, then Build → Run.
-#   3. Open  http://<synology-ip>:8087/  and sign in with TSCTL_UI_PASSWORD.
+# SETUP — uses a LOCAL image (no registry, nothing is ever downloaded)
+#   1. Copy the image tarball for your NAS's CPU onto the Synology (File Station or
+#      scp): tsctl-v0.1.0-linux-amd64-image.tar.gz (Intel NAS — most models) or
+#      tsctl-v0.1.0-linux-arm64-image.tar.gz (ARM models). Build them locally with
+#      `scripts/release.sh` (they end up in ./dist).
+#   2. Load it as the local image `tsctl:v0.1.0` — either:
+#        a) SSH:  sudo docker load -i tsctl-v0.1.0-linux-amd64-image.tar.gz   or
+#        b) Container Manager → Image → Add → Add From File → pick the .tar.gz.
+#   3. Container Manager → Project → Create → upload this file, fill in the env
+#      below, then Build → Run. The bare `tsctl:v0.1.0` name + `pull_policy: never`
+#      mean it uses the loaded image and never contacts a registry.
+#   4. Open  http://<synology-ip>:8087/  and sign in with TSCTL_UI_PASSWORD.
 #
 # tsctl still joins your tailnet (userspace — no special NAS networking) to reach
 # the routers; only the *web UI* is published on :8087. The tailnet path keeps
@@ -17,7 +19,8 @@
 
 services:
   tsctl:
-    image: ghcr.io/lifeart/tsctl:latest      # pin e.g. :v0.1.0 for reproducibility
+    image: tsctl:v0.1.0       # the LOCAL image loaded from the tarball (no registry URL)
+    pull_policy: never        # never reach out to a registry — use the loaded image only
     container_name: tsctl
     restart: unless-stopped
     environment:
