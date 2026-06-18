@@ -1,19 +1,64 @@
 # tsctl — Tailscale exit-node manager
 
 Single Go binary. Joins the tailnet as its own `tsnet` node (`tag:tsctl`,
-persistent, non-ephemeral), serves a small web UI **over the tailnet only**,
-lists Tailscale nodes, and lets you set which exit node each OpenWRT router uses
-— in real time. Nothing runs on the routers but the Tailscale they already have.
+persistent, non-ephemeral), serves a small web UI **over the tailnet** (and,
+optionally, a password-protected host port), lists Tailscale nodes, and lets you
+set which exit node each OpenWRT router uses — in real time, in a drag-to-rewire
+**zone graph**. Nothing runs on the routers but the Tailscale they already have.
+
+**▶ Live demo (no install, no backend):** <https://lifeart.github.io/tsctl/> —
+the real web UI driven entirely by mock data in your browser. *(Deploys from
+[`.github/workflows/pages.yml`](.github/workflows/pages.yml) once GitHub Pages is
+enabled for the repo: Settings → Pages → Source: GitHub Actions. You can also run
+it locally with `tsctl demo`.)*
 
 See [DESIGN.md](DESIGN.md) — the locked single source of truth.
 
-> **Status: feature-complete (v1), verified in-repo.** All packages (netmap,
-> router, poller, sse, api, the SPA) are implemented; `go build ./...`,
-> `go vet ./...`, and `go test -race ./...` pass, including a full-stack
-> integration test (`internal/integration`) that drives api→poller→router→
-> store→SSE end to end. The **live** UI→router→UI flow still needs a real
-> tailnet — see [End-to-end verification](#end-to-end-verification). Known v1
-> limitations are listed at the bottom.
+> **Status: feature-complete (v1), verified in-repo.** Implemented: tailnet
+> inventory (netmap) + per-router exit-node control over SSH with a dead-man's
+> switch (poller/router); a live SPA with a **zone graph** as the default view;
+> **server-side zones** (groups) with enforced allowed-exit-nodes; auth on **two
+> paths** (tailnet `WhoIs` owner *and* an optional password-protected host port);
+> two router transports (**Tailscale SSH** default, opt-in **ip-password**);
+> router auto-discovery. `go build ./...`, `go vet ./...`, and `go test -race ./...`
+> pass, including a full-stack integration test (`internal/integration`). The
+> **live** UI→router→UI flow needs a real tailnet — see
+> [End-to-end verification](#end-to-end-verification); v1 limitations are at the
+> bottom.
+
+## Web UI — the zone graph
+
+The default view is a **bipartite graph**: the routers you control on the left
+(*consumers*), the exit nodes on the right, and a wire from each router to the
+exit node it's currently using. Drag a router's wire onto another exit node (or
+focus it and press Enter for a keyboard menu) and confirm — the change runs the
+dead-man's-switch on the router and the wire only moves once the device confirms
+(never optimistic). A wire is colored by the device's real state (ok / applying /
+unconfirmed / control-error / offline).
+
+```
+   ZONE: Work ▾     [ New zone ] [ Edit ] [ Delete ]
+   CONSUMERS                          EXIT NODES
+   ┌────────────────────┐            ┌──────────────────────┐
+   │ office-router    ● ●───────────▶● exit-tokyo      online│
+   │   → exit-tokyo       │       ┌──▶● exit-frankfurt  online│
+   │ warehouse-router ● ●─┘ (out of zone, dashed)
+   │   → exit-london      │          ● exit-london   offline │  ← out of zone
+   └────────────────────┘            ┌──────────────────────┐
+                                      │ Direct — no exit node│
+                                      └──────────────────────┘
+   drag a consumer onto an exit node, or press Enter for the menu
+```
+
+**Zones** (groups) scope and **enforce** the graph: a zone is a named set of
+consumers + the exit nodes they're *allowed* to use. The backend rejects an
+out-of-zone target (the union of a consumer's zones), so the policy holds no
+matter how the change is issued. Zones are server-side (`$STATE_DIR/groups.json`)
+and edited in the UI; a "Devices" tab shows the classic per-router cards.
+
+Try all of it — drag, zones, the offline/unconfirmed/control-error states, the
+enforcement rejection — in the [live demo](https://lifeart.github.io/tsctl/) or
+locally via `tsctl demo`.
 
 ## Building
 
