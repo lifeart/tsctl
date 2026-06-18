@@ -23,6 +23,15 @@ services:
     pull_policy: never        # never reach out to a registry — use the loaded image only
     container_name: tsctl
     restart: unless-stopped
+    # Run as root INSIDE the container so it can always write the state volume.
+    # The image runs as nonroot (uid 65532), but DSM usually creates the volume /
+    # bind dir root-owned, which 65532 can't write -> tsnet fails with "permission
+    # denied" on /var/lib/tsctl/tailscaled.log.conf. The container is the security
+    # boundary, so running as root here is the normal NAS pattern.
+    # Prefer to keep nonroot? Drop this line and make the state dir writable by
+    # uid 65532 instead — bind mount: `chown -R 65532:65532 <hostdir>`; named
+    # volume: `sudo docker run --rm -v tsctl-state:/s busybox chown -R 65532:65532 /s`.
+    user: "0:0"
     environment:
       # --- one-time tailnet enrollment (REQUIRED for the first run) -------------
       # A tag:tsctl auth key, or (recommended, never expires) an OAuth client
