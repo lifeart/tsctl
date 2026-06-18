@@ -55,6 +55,7 @@
     filter: { text: "", type: "all" },
     view: "graph",        // "graph" (zone graph, default) | "cards" (router/device list)
     selectedZone: null,   // selected zone id, or UNGROUPED, or null (= default)
+    pendingZoneId: null,  // a just-created zone id awaiting its first snapshot (don't reset)
     graphDrag: null,      // active drag descriptor while rewiring by drag
   };
 
@@ -545,6 +546,10 @@
     var sid = node.stableID;
     var online = node.online === true;
     var reachable = rv.reachable !== false && online;
+    // Online in the netmap but tsctl can't control it (reachable === false): a
+    // DISTINCT control error (wrong ip-password / host-key mismatch / no addr
+    // mapping), NOT "offline". The genuine-offline path (!online) is kept separate.
+    var controlError = online && rv.reachable === false;
     var st = rv.state || (online ? "ok" : "unreachable");
     var localBusy = !!state.busyRouters[sid];
 
@@ -554,7 +559,12 @@
     var pickerLabel = "Route " + routerName + "’s internet through";
     if (rec.select.getAttribute("aria-label") !== pickerLabel) rec.select.setAttribute("aria-label", pickerLabel);
     setDot(rec.dot, online);
-    applyStateBadge(rec.stateBadge, st);
+    if (controlError) {
+      setText(rec.stateBadge, "control error");
+      rec.stateBadge.className = "state state-control-error";
+    } else {
+      applyStateBadge(rec.stateBadge, st);
+    }
 
     var ips = Array.isArray(node.tailscaleIPs) ? node.tailscaleIPs : [];
     var ipText = ips.length ? ips.join(", ") : "no IPs";
@@ -570,8 +580,13 @@
       rec.currentLine.classList.remove("is-stale");
     }
 
-    // offline note (control disabled)
-    if (!reachable) {
+    // offline note (control disabled) — control-error vs genuine-offline wording.
+    if (controlError) {
+      // Device is online; the CONTROL path failed. The raw rv.lastError is shown in
+      // the error box below (don't duplicate it here).
+      setText(rec.offlineNote, "Control error — the device is online, but tsctl can’t control it (e.g. wrong ip-password, host-key mismatch, or no address mapping). See the error below.");
+      show(rec.offlineNote, true);
+    } else if (!reachable) {
       var lastSeen = node.lastSeen ? relTime(node.lastSeen) : "unknown";
       setText(rec.offlineNote, "Offline — last seen " + lastSeen + ". Control disabled until it’s back online.");
       show(rec.offlineNote, true);
@@ -812,6 +827,24 @@
   function snapNodes() { var s = state.snapshot; return s && Array.isArray(s.nodes) ? s.nodes : []; }
   function isExitCapable(n) { return !!n && (n.exitNodeOption === true || n.type === "exit-node"); }
 
+  // Client-side mirror of poller.allowedExitNodeSet: the UNION of allowedExitNodes
+  // (by StableID) across EVERY zone whose consumers include this consumer. order
+  // preserves first-seen across zones for a stable menu; inAnyZone=false means the
+  // consumer is in no zone (unrestricted). The backend is the source of truth — this
+  // keeps the menu/out-of-zone flag union-correct when a consumer is in >1 zone.
+  function allowedUnionFor(consumerSid) {
+    var set = {}, order = [], inAnyZone = false;
+    snapGroups().forEach(function (g) {
+      var member = (g.consumers || []).some(function (m) { return m && m.stableID === consumerSid; });
+      if (!member) return;
+      inAnyZone = true;
+      (g.allowedExitNodes || []).forEach(function (m) {
+        if (m && m.stableID && !set[m.stableID]) { set[m.stableID] = true; order.push(m.stableID); }
+      });
+    });
+    return { set: set, order: order, inAnyZone: inAnyZone };
+  }
+
   // Routers not present in ANY group's consumers (the implicit "Ungrouped" set).
   function ungroupedRouters() {
     var inGroup = {};
@@ -834,10 +867,22 @@
   function resolveSelectedZone() {
     var zones = zoneList();
     if (!zones.length) return null;
-    for (var i = 0; i < zones.length; i++) if (zones[i].id === state.selectedZone) return zones[i];
-    // A stored selection that isn't present yet (e.g. a just-created zone awaiting
-    // the next snapshot): show the default but DON'T clobber it, so it auto-selects
-    // once it arrives. Only fall back to the default when nothing is stored.
+    for (var i = 0; i < zones.length; i++) {
+      if (zones[i].id === state.selectedZone) {
+        // The just-created zone has now arrived in the snapshot — stop treating it
+        // as pending.
+        if (state.pendingZoneId === state.selectedZone) state.pendingZoneId = null;
+        return zones[i];
+      }
+    }
+    // The stored selection isn't present:
+    //  - the just-created zone awaiting its first snapshot (pendingZoneId): show the
+    //    default but DON'T clobber it, so it auto-selects once it arrives;
+    //  - otherwise it's gone (e.g. deleted on another device / remotely): reset to
+    //    the default so a tab is always highlighted (roving tabindex stays correct).
+    if (state.selectedZone != null && state.selectedZone !== state.pendingZoneId) {
+      state.selectedZone = null;
+    }
     if (state.selectedZone == null) state.selectedZone = zones[0].id; // first group, else Ungrouped
     for (var j = 0; j < zones.length; j++) if (zones[j].id === state.selectedZone) return zones[j];
     return zones[0];
@@ -885,12 +930,24 @@
   // Derive the wire/visual state from the device's ACTUAL RouterView state (the
   // same never-optimistic machine the cards use), plus whether its current exit
   // node is out of the zone's allowed set.
-  function consumerStatus(c, allowed) {
+  function consumerStatus(c) {
     var rv = c.rv;
-    if (!c.present || !rv) return { missing: true, wire: "off" };
+    if (!c.present || !rv) {
+      // Distinguish "exists in the netmap but isn't a controllable router" (soft
+      // membership is intentional — never rejected on the backend) from a member
+      // that's genuinely absent from the netmap. notRouter => the member resolved
+      // present in the snapshot but there's no RouterView (not tag:router / not
+      // SSH-controllable).
+      var notRouter = !!(c.member && c.member.present === true) && !rv;
+      return { missing: true, notRouter: notRouter, wire: "off" };
+    }
     var node = rv.node || {};
     var online = node.online === true;
     var reachable = rv.reachable !== false && online;
+    // Online in the netmap but tsctl can't control it (reachable === false): a
+    // distinct CONTROL error (wrong ip-password / host-key mismatch / no addr
+    // mapping), NOT "offline". Keep the genuine-offline path (!online) separate.
+    var controlError = online && rv.reachable === false;
     var st = rv.state || (online ? "ok" : "unreachable");
     var localBusy = !!state.busyRouters[c.sid];
     var cur = rv.currentExitNode;
@@ -899,8 +956,15 @@
     else if (st === "unconfirmed") wire = "unconfirmed";
     else if (!reachable || st === "unreachable") wire = "off";
     else wire = "ok";
-    var outOfZone = !!(cur && cur.stableID && allowed && !allowed[cur.stableID]);
-    return { online: online, reachable: reachable, st: st, localBusy: localBusy, cur: cur, wire: wire, outOfZone: outOfZone };
+    // Union-correct (fix): a current exit node is only "out of zone" if NONE of the
+    // consumer's zones allow it. An unrestricted (ungrouped) consumer is never out
+    // of zone. Mirrors the backend's union enforcement.
+    var outOfZone = false;
+    if (cur && cur.stableID) {
+      var union = allowedUnionFor(c.sid);
+      outOfZone = union.inAnyZone && !union.set[cur.stableID];
+    }
+    return { online: online, reachable: reachable, controlError: controlError, st: st, localBusy: localBusy, cur: cur, wire: wire, outOfZone: outOfZone };
   }
 
   function createConsumerNode(item) {
@@ -934,8 +998,8 @@
     return rec;
   }
 
-  function updateConsumerNode(rec, item, allowed) {
-    var s = consumerStatus(item, allowed);
+  function updateConsumerNode(rec, item) {
+    var s = consumerStatus(item);
     var rv = item.rv;
     var node = (rv && rv.node) || {};
     var nm = node.name || node.hostname || (item.member && item.member.name) || item.sid || "(router)";
@@ -943,42 +1007,53 @@
     rec.root.title = nm;
 
     if (s.missing) {
+      // Soft membership: a member that's in the netmap but isn't a controllable
+      // router (s.notRouter) is labelled distinctly from one that's truly absent.
+      var missLabel = s.notRouter ? "Not a router / not controllable" : "Not currently in the netmap";
+      var missBadge = s.notRouter ? "not a router" : "missing";
       rec.root.className = "gnode gnode-consumer is-missing";
       rec.dot.setAttribute("class", "dot dot-off");
       rec.dot.setAttribute("role", "img");
-      rec.dot.setAttribute("aria-label", "missing");
-      setText(rec.sub, "Not currently in the netmap");
-      setText(rec.state, "missing");
+      rec.dot.setAttribute("aria-label", missBadge);
+      setText(rec.sub, missLabel);
+      setText(rec.state, missBadge);
       rec.state.className = "gnode-state state-unknown";
       rec.interactive = false;
       rec.root.removeAttribute("tabindex");
       rec.root.removeAttribute("role");
       rec.root.removeAttribute("aria-haspopup");
-      rec.root.setAttribute("aria-label", nm + ": not currently in the netmap");
+      rec.root.setAttribute("aria-label", nm + ": " + missLabel.toLowerCase());
       return;
     }
 
     setDot(rec.dot, s.online);
     var stMap = { ok: "connected", pending: "applying", unconfirmed: "unconfirmed", unreachable: "offline" };
-    setText(rec.state, stMap[s.st] || s.st);
-    rec.state.className = "gnode-state state-" + (stMap[s.st] ? s.st : "unknown");
+    if (s.controlError) {
+      setText(rec.state, "control error");
+      rec.state.className = "gnode-state state-control-error";
+    } else {
+      setText(rec.state, stMap[s.st] || s.st);
+      rec.state.className = "gnode-state state-" + (stMap[s.st] ? s.st : "unknown");
+    }
 
     var subText, ariaConn;
     if (s.localBusy) { subText = "Applying…" + countdownSuffix(item.sid); ariaConn = "applying a change"; }
     else if (s.st === "pending") { subText = "Applying " + shortLabel(rv.desired) + countdownSuffix(item.sid); ariaConn = "applying " + shortLabel(rv.desired); }
     else if (s.st === "unconfirmed") { subText = "Sent to " + shortLabel(rv.desired) + " — not confirmed"; ariaConn = "sent to " + shortLabel(rv.desired) + ", not confirmed"; }
+    else if (s.controlError) { subText = "Control error — can’t control"; ariaConn = "control error, tsctl can’t control this router"; }
     else if (!s.reachable) { subText = "Offline — control disabled"; ariaConn = "offline, control disabled"; }
     else if (s.cur) { subText = "→ " + shortLabel(s.cur) + (s.outOfZone ? " (out of zone)" : ""); ariaConn = "routing through " + shortLabel(s.cur) + (s.outOfZone ? ", out of zone" : ""); }
     else { subText = "Direct — no exit node"; ariaConn = "direct, no exit node"; }
     setText(rec.sub, subText);
 
-    // Disabled while settling (busy/pending/unconfirmed) or offline — mirrors the
-    // card picker; the never-optimistic machine owns the transition.
+    // Disabled while settling (busy/pending/unconfirmed) or offline/control-error —
+    // mirrors the card picker; the never-optimistic machine owns the transition.
     var settling = s.localBusy || s.st === "pending" || s.st === "unconfirmed";
     var interactive = s.reachable && !settling;
     rec.interactive = interactive;
     rec.root.className = "gnode gnode-consumer"
       + (settling ? " is-busy" : "")
+      + (s.controlError ? " is-control-error" : "")
       + (s.reachable ? "" : " is-off")
       + (interactive ? " is-actionable" : "");
     if (interactive) {
@@ -1075,11 +1150,21 @@
       createExitNode, updateExitNode, exitEls, true);
 
     reconcile($("#gcol-consumers"), cols.consumers, function (it) { return it.key; },
-      createConsumerNode, function (rec, it) { updateConsumerNode(rec, it, cols.allowed); }, consumerEls, true);
+      createConsumerNode, function (rec, it) { updateConsumerNode(rec, it); }, consumerEls, true);
 
     var cEmpty = $("#consumers-empty");
     if (!cols.consumers.length) {
-      setText(cEmpty, cols.ungrouped ? "No ungrouped routers — every router is in a zone." : "No consumers in this zone yet. Use Edit to add some.");
+      var cMsg;
+      if (cols.ungrouped) {
+        // Distinguish "there are no routers to manage at all" from "every router is
+        // already in a zone" — the latter is only true when routers actually exist.
+        cMsg = snapRouters().length === 0
+          ? "No routers to manage yet — none are configured or discovered (tag:router)."
+          : "No ungrouped routers — every router is in a zone.";
+      } else {
+        cMsg = "No consumers in this zone yet. Use Edit to add some.";
+      }
+      setText(cEmpty, cMsg);
       show(cEmpty, true);
     } else show(cEmpty, false);
     var xEmpty = $("#exits-empty");
@@ -1107,7 +1192,7 @@
     while (svg.firstChild) svg.removeChild(svg.firstChild);
     var gridRect = grid.getBoundingClientRect();
     cols.consumers.forEach(function (c) {
-      var s = consumerStatus(c, cols.allowed);
+      var s = consumerStatus(c);
       if (s.missing || !s.cur || !s.cur.stableID) return; // no current exit node => Direct => no wire
       var consRec = consumerEls[c.key], exitRec = exitEls[s.cur.stableID];
       if (!consRec || !exitRec) return;
@@ -1202,8 +1287,12 @@
       return;
     }
     if (e.type === "pointercancel" || !target) { drawWiresForCurrent(); return; }
-    // The right column IS the allowed set (UI guard) — any in-column drop is fine.
-    confirmExitNodeChange(sid, target.getAttribute("data-drop"), target);
+    // The right column IS the allowed set (UI guard) — any in-column drop is fine,
+    // EXCEPT a router that is also an exit node being dropped on itself: the backend
+    // rejects "cannot route router through itself", so reject the dead drop here too.
+    var drop = target.getAttribute("data-drop");
+    if (drop === sid) { drawWiresForCurrent(); return; }
+    confirmExitNodeChange(sid, drop, target);
     drawWiresForCurrent();
   }
 
@@ -1236,18 +1325,32 @@
 
   // --- keyboard/click rewire menu (drag is NOT the only path — a11y) -------
   function zoneMenuOptions(sid) {
-    var cols = columnsFor(resolveSelectedZone());
     var rv = findRouterView(sid);
     var curSid = rv && rv.currentExitNode ? rv.currentExitNode.stableID : "";
     var opts = [{ value: "", label: "Direct (no exit node)", current: curSid === "", disabled: false }];
-    cols.exits.forEach(function (e) {
-      if (!e.allowed) return; // never offer a disallowed (out-of-zone) target — enforcement guard
-      var node = e.node;
-      var nm = (node && (node.name || node.hostname)) || (e.member && e.member.name) || e.sid;
+
+    // Offer the UNION of allowed exit nodes across ALL zones containing this
+    // consumer (not just the viewed zone) — the same set the backend enforces. A
+    // consumer in no zone (ungrouped) is unrestricted: offer every approved exit
+    // node. The per-zone columns stay scoped to the viewed zone for layout; this is
+    // the accessible menu path, so it must match the backend's union enforcement.
+    var union = allowedUnionFor(sid);
+    var exitSids;
+    if (union.inAnyZone) {
+      exitSids = union.order;
+    } else {
+      exitSids = snapNodes().filter(isExitCapable).map(function (n) { return n.stableID; });
+    }
+    exitSids.forEach(function (esid) {
+      // A node that is both tag:router and an exit node must not be offered as its
+      // own exit node — the backend rejects "cannot route router through itself".
+      if (esid === sid) return;
+      var node = findNodeById(state.snapshot, esid);
+      var nm = (node && (node.name || node.hostname)) || esid;
       var disabled = false, suffix = "";
-      if (!e.present) { disabled = true; suffix = " (missing)"; }
-      else if (!(node && node.online === true)) { suffix = " (offline)"; }
-      opts.push({ value: e.sid, label: nm + suffix, current: curSid === e.sid, disabled: disabled });
+      if (!node) { disabled = true; suffix = " (missing)"; }
+      else if (node.online !== true) { suffix = " (offline)"; }
+      opts.push({ value: esid, label: nm + suffix, current: curSid === esid, disabled: disabled });
     });
     return opts;
   }
@@ -1590,7 +1693,12 @@
       apiWrite(method, url, payload).then(function (res) {
         if (!res) return; // login overlay took over
         if (res.ok) {
-          if (res.data && res.data.id) state.selectedZone = res.data.id; // auto-select on the next snapshot
+          if (res.data && res.data.id) {
+            state.selectedZone = res.data.id; // auto-select on the next snapshot
+            // Mark a NEW zone as pending so resolveSelectedZone doesn't reset the
+            // selection before its first snapshot arrives (it isn't a stale id).
+            if (isNew) state.pendingZoneId = res.data.id;
+          }
           toast("ok", isNew ? "Zone created" : "Zone saved", (res.data && res.data.name) || "");
           done();
           render();
@@ -1814,6 +1922,20 @@
     } else { ae.hidden = true; show(ae, false); }
   }
 
+  // While the login overlay owns the screen the background (topbar + main) must be
+  // inert: not focusable, not operable, not announced — so Tab can't escape behind
+  // the modal to #help-btn, the graph, etc. `inert` covers focus + interaction +
+  // AT in modern browsers; aria-hidden is added as a belt-and-suspenders for AT.
+  // Restored when the overlay closes.
+  function setBackgroundInert(on) {
+    ["header.topbar", "main.container"].forEach(function (sel) {
+      var node = $(sel);
+      if (!node) return;
+      if (on) { node.setAttribute("inert", ""); node.setAttribute("aria-hidden", "true"); }
+      else { node.removeAttribute("inert"); node.removeAttribute("aria-hidden"); }
+    });
+  }
+
   // 401 overlay: prompt for the UI password (or explain that password sign-in is
   // disabled on a tailnet-only server).
   function renderLogin() {
@@ -1822,10 +1944,12 @@
     if (!state.needsLogin) {
       ov.hidden = true; show(ov, false);
       ov._shown = false;
+      setBackgroundInert(false); // restore normal interaction once signed in
       var clear = $("#login-password");
       if (clear) clear.value = "";
       return;
     }
+    setBackgroundInert(true); // make the background inert BEFORE moving focus in
     ov.hidden = false; show(ov, true);
     var desc = $("#login-desc");
     var input = $("#login-password");
@@ -2170,6 +2294,16 @@
         if (state.loginBusy || state.loginDisabled) return;
         var input = $("#login-password");
         submitLogin(input ? input.value : "");
+      });
+      // Tab-cycle focus trap (matches the modal/editor helpers): Tab cycles between
+      // the password field and Sign-in; the inert background can't be reached.
+      loginForm.addEventListener("keydown", function (e) {
+        if (e.key !== "Tab") return;
+        var f = loginForm.querySelectorAll('button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])');
+        if (!f.length) return;
+        var first = f[0], last = f[f.length - 1];
+        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
       });
     }
     // "Sign out" (only shown when a password session is in use).

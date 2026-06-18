@@ -531,6 +531,9 @@ body {
 .state-unconfirmed { background: var(--amber-tint); color: var(--c-amber); }
 .state-unreachable { background: var(--red-tint); color: var(--c-red); }
 .state-unknown { background: var(--fill); color: var(--text-secondary); }
+/* Online in the netmap but tsctl can't control it: amber (a problem that needs
+   attention), distinct from red genuine-offline/unreachable. */
+.state-control-error { background: var(--amber-tint); color: var(--c-amber); }
 
 /* ----------------------------------------------- picker / select ------- */
 .picker { margin-top: 0.85rem; }
@@ -960,6 +963,10 @@ body {
 .gnode.is-dragging { cursor: grabbing; box-shadow: var(--shadow-pop); opacity: 0.92; }
 .gnode.is-missing { opacity: 0.55; }
 .gnode.is-off .gnode-name { color: var(--text-secondary); }
+/* Control error: device online but uncontrollable — amber edge, NOT greyed-out
+   like genuine-offline (the device is up; the control path is the problem). */
+.gnode.is-control-error { border: 1px solid var(--amber); }
+.gnode.is-control-error .gnode-name { color: var(--text); }
 .gnode.is-drop-hover { outline: 2px solid var(--accent); outline-offset: 2px; background: var(--accent-tint); }
 .gnode-head { display: flex; align-items: center; gap: 0.45rem; min-width: 0; }
 .gnode-name {

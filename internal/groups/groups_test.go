@@ -2,6 +2,7 @@ package groups
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -97,6 +98,36 @@ func TestCreate_ValidationAndNormalization(t *testing.T) {
 	}
 }
 
+func TestNameUniqueness(t *testing.T) {
+	s, _ := tempStore(t)
+
+	if _, err := s.Create(store.Group{Name: "Work"}); err != nil {
+		t.Fatalf("Create Work: %v", err)
+	}
+
+	// A case-insensitive (and whitespace-insensitive) duplicate on Create -> 422.
+	if _, err := s.Create(store.Group{Name: "  work  "}); httpStatus(err) != statusUnprocessable {
+		t.Errorf("dup name create: status = %d, want 422 (err=%v)", httpStatus(err), err)
+	}
+
+	// A distinct name is fine.
+	home, err := s.Create(store.Group{Name: "Home"})
+	if err != nil {
+		t.Fatalf("Create Home: %v", err)
+	}
+
+	// Updating Home to collide with the existing "Work" (case-insensitively) -> 422.
+	if _, err := s.Update(home.ID, store.Group{Name: "WORK"}); httpStatus(err) != statusUnprocessable {
+		t.Errorf("dup name update: status = %d, want 422 (err=%v)", httpStatus(err), err)
+	}
+
+	// Updating a group with its OWN name (same id) is allowed — the uniqueness
+	// check excludes the group being updated (e.g. a pure membership edit).
+	if _, err := s.Update(home.ID, store.Group{Name: "Home", Consumers: []string{"n-a"}}); err != nil {
+		t.Errorf("self-name update should be allowed: %v", err)
+	}
+}
+
 func TestUpdate_DeleteGet(t *testing.T) {
 	s, path := tempStore(t)
 	g, err := s.Create(store.Group{Name: "z1", Consumers: []string{"n-a"}})
@@ -172,7 +203,9 @@ func TestAtomicWrite_LeavesNoGarbage(t *testing.T) {
 	s, _ := tempStore(t)
 	dir := filepath.Dir(s.path)
 	for i := 0; i < 5; i++ {
-		if _, err := s.Create(store.Group{Name: "z"}); err != nil {
+		// Distinct names: zone names are unique (case-insensitive); this test
+		// exercises the atomic write, not the uniqueness rule.
+		if _, err := s.Create(store.Group{Name: fmt.Sprintf("z%d", i)}); err != nil {
 			t.Fatalf("Create: %v", err)
 		}
 	}

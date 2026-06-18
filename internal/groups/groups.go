@@ -159,6 +159,10 @@ func (s *Store) Create(g store.Group) (store.Group, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.nameTakenLocked(norm.Name, "") {
+		return store.Group{}, validationErr(fmt.Sprintf("a zone named %q already exists", norm.Name))
+	}
+
 	id, err := s.freshIDLocked()
 	if err != nil {
 		return store.Group{}, err
@@ -187,6 +191,9 @@ func (s *Store) Update(id string, g store.Group) (store.Group, error) {
 	idx := s.indexOfLocked(id)
 	if idx < 0 {
 		return store.Group{}, notFoundErr(id)
+	}
+	if s.nameTakenLocked(norm.Name, id) {
+		return store.Group{}, validationErr(fmt.Sprintf("a zone named %q already exists", norm.Name))
 	}
 	norm.ID = id
 	old := s.items[idx]
@@ -228,6 +235,22 @@ func (s *Store) indexOfLocked(id string) int {
 		}
 	}
 	return -1
+}
+
+// nameTakenLocked reports whether another group already uses name
+// (case-insensitively), excluding the group with id excludeID (pass "" on
+// Create). Names are compared on their normalized (trimmed) form. Caller holds
+// s.mu.
+func (s *Store) nameTakenLocked(name, excludeID string) bool {
+	for i := range s.items {
+		if s.items[i].ID == excludeID {
+			continue
+		}
+		if strings.EqualFold(s.items[i].Name, name) {
+			return true
+		}
+	}
+	return false
 }
 
 // freshIDLocked mints a random hex ID guaranteed unique within the current set.
