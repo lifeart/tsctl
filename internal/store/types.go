@@ -91,12 +91,51 @@ type RouterView struct {
 	LastConfirmedAt time.Time
 }
 
+// Group is the RAW, persisted/CRUD shape of a zone (DESIGN docs/design/zones.md):
+// a named set of consumer routers plus the exit nodes they are allowed to use.
+// Members are node StableIDs (soft membership -- a member may be absent from the
+// current netmap; the resolved GroupView flags that, it is never rejected). ID is
+// server-assigned (random hex) and is the key; Name need not be globally unique.
+//
+// This is a leaf data type (no JSON tags -- the api package owns the wire DTOs and
+// the groups package owns the on-disk format), matching the rest of store.
+type Group struct {
+	ID               string   // stable id, server-assigned (random hex)
+	Name             string   // user label (non-empty; not required to be unique)
+	Consumers        []string // node StableIDs of the controllable routers in the zone
+	AllowedExitNodes []string // node StableIDs of the exit nodes the consumers may use
+}
+
+// GroupMember is one resolved member of a group, ready for rendering. The poller
+// resolves each StableID against the current snapshot nodes: a member present in
+// the netmap carries its display Name/IP/Online; an absent one has Present=false
+// (and empty Name/IP) so the UI can flag it "missing" without hiding it.
+type GroupMember struct {
+	StableID string
+	Name     string // node display name when Present; "" when absent
+	IP       string // 100.x IPv4 when Present; "" when absent
+	Online   bool   // node online state when Present; false when absent
+	Present  bool   // true iff the StableID currently exists in the netmap
+}
+
+// GroupView is the RESOLVED shape of a Group carried in the Snapshot: the group's
+// ID/Name plus its members resolved to GroupMembers for rendering the graph.
+type GroupView struct {
+	ID               string
+	Name             string
+	Consumers        []GroupMember
+	AllowedExitNodes []GroupMember
+}
+
 // Snapshot is an immutable, fully-built view of the world. The poller builds a
 // fresh one and atomically swaps it in; readers Load() lock-free and must treat
 // it (and everything it points to) as read-only.
 type Snapshot struct {
-	Nodes     []NodeView
-	Routers   []RouterView
+	Nodes   []NodeView
+	Routers []RouterView
+	// Groups are the resolved zone views (ADDITIVE field). Always non-nil (an
+	// empty, made slice when there are no groups) so consumers never nil-check.
+	Groups    []GroupView
 	NetmapAt  time.Time
 	NetmapErr string // "" = healthy
 	BuiltAt   time.Time

@@ -8,12 +8,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/lifeart/tsctl/internal/api"
+	"github.com/lifeart/tsctl/internal/groups"
 	"github.com/lifeart/tsctl/internal/poller"
 	"github.com/lifeart/tsctl/internal/router"
 	"github.com/lifeart/tsctl/internal/sse"
@@ -60,9 +62,25 @@ type tRouterView struct {
 	LastConfirmedAt string    `json:"lastConfirmedAt"`
 }
 
+type tGroupMember struct {
+	StableID string `json:"stableID"`
+	Name     string `json:"name"`
+	IP       string `json:"ip"`
+	Online   bool   `json:"online"`
+	Present  bool   `json:"present"`
+}
+
+type tGroupView struct {
+	ID               string         `json:"id"`
+	Name             string         `json:"name"`
+	Consumers        []tGroupMember `json:"consumers"`
+	AllowedExitNodes []tGroupMember `json:"allowedExitNodes"`
+}
+
 type tSnapshot struct {
 	Nodes     []tNode       `json:"nodes"`
 	Routers   []tRouterView `json:"routers"`
+	Groups    []tGroupView  `json:"groups"`
 	NetmapAt  string        `json:"netmapAt"`
 	NetmapErr string        `json:"netmapErr"`
 	BuiltAt   string        `json:"builtAt"`
@@ -91,6 +109,10 @@ const (
 	exitID   = "nEXIT0001"
 	exitName = "exit1.example.ts.net"
 	exitIP   = "100.64.0.20"
+
+	// A seeded zone wiring the router (consumer) to the exit node (allowed). The
+	// router→exit change in the flow is therefore in-zone (enforcement permits it).
+	groupName = "zone-a"
 )
 
 // --- fake Mapper: satisfies BOTH poller.Netmapper and api.WhoIser -------------
@@ -237,12 +259,23 @@ func newStackWith(t *testing.T, opts stackOpts) *stack {
 		status: store.RouterRuntime{Online: true},
 	}
 
+	// Real (temp-file) groups.Store seeded with one zone: the router is a
+	// consumer and the exit node is allowed, so the flow's router→exit change is
+	// in-zone (enforcement permits it) and the snapshot carries a resolved group.
+	grp, err := groups.New(filepath.Join(t.TempDir(), "groups.json"))
+	if err != nil {
+		t.Fatalf("groups.New: %v", err)
+	}
+	if _, err := grp.Create(store.Group{Name: groupName, Consumers: []string{routerID}, AllowedExitNodes: []string{exitID}}); err != nil {
+		t.Fatalf("seed group: %v", err)
+	}
+
 	st := store.New()
 	hub := sse.New(st, api.EncodeSnapshot)
 	// Long poll interval: only the first-viewer refresh and the SetExitNode
 	// broadcasts drive frames during the test (no surprise ticker refresh).
-	pol := poller.New(st, mapper, rc, []string{routerIP}, hub, hub.Transitions(), time.Hour, t.Logf)
-	apiH := api.New(st, mapper, pol, api.Config{Owner: owner, UIPassword: opts.uiPassword, AllowedHosts: []string{allowedHost}})
+	pol := poller.New(st, mapper, rc, grp, []string{routerIP}, hub, hub.Transitions(), time.Hour, t.Logf)
+	apiH := api.New(st, mapper, pol, api.Config{Owner: owner, UIPassword: opts.uiPassword, AllowedHosts: []string{allowedHost}, Groups: grp})
 
 	// EXACTLY the mux main.go builds (minus the irrelevant static file server).
 	mux := http.NewServeMux()
@@ -476,6 +509,22 @@ func TestFullStackFlow(t *testing.T) {
 	}
 	if en.Name == "" || en.StableID == "" {
 		t.Errorf("(a) camelCase name/stableID drift: name=%q stableID=%q", en.Name, en.StableID)
+	}
+
+	// (a') GROUPS: the snapshot carries the resolved zone with member info wired
+	// through api -> poller -> store -> sse -> client.
+	if len(snap.Groups) != 1 {
+		t.Fatalf("(a') snapshot groups = %d, want 1", len(snap.Groups))
+	}
+	g := snap.Groups[0]
+	if g.Name != groupName || g.ID == "" {
+		t.Errorf("(a') group = {id:%q name:%q}, want name %q + non-empty id", g.ID, g.Name, groupName)
+	}
+	if len(g.Consumers) != 1 || g.Consumers[0].StableID != routerID || !g.Consumers[0].Present || !g.Consumers[0].Online {
+		t.Errorf("(a') consumer member not resolved: %+v", g.Consumers)
+	}
+	if len(g.AllowedExitNodes) != 1 || g.AllowedExitNodes[0].StableID != exitID || !g.AllowedExitNodes[0].Present {
+		t.Errorf("(a') allowed-exit member not resolved: %+v", g.AllowedExitNodes)
 	}
 
 	// (b) SET EXIT NODE: CSRF, then POST. The fake confirms the change.

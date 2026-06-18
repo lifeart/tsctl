@@ -57,16 +57,31 @@ type Controller interface {
 	SetExitNode(ctx context.Context, routerID, targetStableID string) (store.RouterView, error)
 }
 
+// GroupStore is the CRUD seam for zone/group definitions (DESIGN
+// docs/design/zones.md). Implemented by *groups.Store. Declared here (consumer
+// side) so the api never imports the groups package; a validation/not-found
+// error is surfaced via the same structural HTTPStatus()/Detail() interfaces the
+// Controller uses, so the api stays decoupled from the concrete error type.
+type GroupStore interface {
+	List() []store.Group
+	Get(id string) (store.Group, bool)
+	Create(g store.Group) (store.Group, error)
+	Update(id string, g store.Group) (store.Group, error)
+	Delete(id string) error
+}
+
 // Config carries the security configuration the middleware needs (wired from
 // cmd/tsctl). Owner is the tailnet login allowed to control (may be "" when only
 // the password path is used); UIPassword is the shared secret for the
 // host-socket/session path ("" disables password login). AllowedHosts is the
 // Host-header allowlist (tsnet hostname / MagicDNS FQDN / 100.x / listen host)
-// used for DNS-rebinding defense.
+// used for DNS-rebinding defense. Groups is the zone CRUD store (may be nil when
+// no group routes are exercised, e.g. in narrow unit tests).
 type Config struct {
 	Owner        string
 	UIPassword   string
 	AllowedHosts []string
+	Groups       GroupStore
 }
 
 // API holds the handler dependencies.
@@ -74,6 +89,7 @@ type API struct {
 	store         *store.Store
 	whois         WhoIser
 	ctrl          Controller
+	groups        GroupStore
 	owner         string
 	uiPassword    string
 	sessionSecret []byte              // HMAC key for signed session cookies (per-process)
@@ -104,6 +120,7 @@ func New(st *store.Store, who WhoIser, ctrl Controller, cfg Config) *API {
 		store:         st,
 		whois:         who,
 		ctrl:          ctrl,
+		groups:        cfg.Groups,
 		owner:         cfg.Owner,
 		uiPassword:    cfg.UIPassword,
 		sessionSecret: secret,
@@ -127,6 +144,13 @@ func (a *API) Routes() http.Handler {
 	data.HandleFunc("GET /api/nodes", a.handleNodes)
 	data.HandleFunc("GET /api/routers/{id}", a.handleRouter)
 	data.HandleFunc("POST /api/routers/{id}/exit-node", a.handleSetExitNode)
+	// Zone/group CRUD (DESIGN docs/design/zones.md). Same middleware as the data
+	// routes: RequireAuth (here) + RequireHost + RequireCSRF (outer). The writes
+	// thus require auth + a valid CSRF token + an allowed Host, like exit-node.
+	data.HandleFunc("GET /api/groups", a.handleListGroups)
+	data.HandleFunc("POST /api/groups", a.handleCreateGroup)
+	data.HandleFunc("PUT /api/groups/{id}", a.handleUpdateGroup)
+	data.HandleFunc("DELETE /api/groups/{id}", a.handleDeleteGroup)
 
 	mux := http.NewServeMux()
 	// Bootstrap endpoints (no session required; still Host-pinned + CSRF-checked):
@@ -418,6 +442,109 @@ func (a *API) handleSetExitNode(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, routerViewDTO(rv))
 }
 
+// --- group (zone) CRUD handlers (DESIGN docs/design/zones.md) ------------------
+
+// groupReqLimit caps a group request body (defense-in-depth; member lists are
+// small StableID arrays).
+const groupReqLimit = 1 << 16 // 64 KiB
+
+// groupRequest is the POST/PUT body for a group write.
+type groupRequest struct {
+	Name             string   `json:"name"`
+	Consumers        []string `json:"consumers"`
+	AllowedExitNodes []string `json:"allowedExitNodes"`
+}
+
+// handleListGroups returns every RAW group as a JSON array (never null).
+func (a *API) handleListGroups(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, groupDTOs(a.groups.List()))
+}
+
+// handleCreateGroup creates a group from {name,consumers,allowedExitNodes} and
+// returns the created RAW group (201). Validation errors → 422 {error,detail}.
+func (a *API) handleCreateGroup(w http.ResponseWriter, r *http.Request) {
+	body, ok := decodeGroupBody(w, r)
+	if !ok {
+		return
+	}
+	g, err := a.groups.Create(store.Group{
+		Name:             body.Name,
+		Consumers:        body.Consumers,
+		AllowedExitNodes: body.AllowedExitNodes,
+	})
+	if err != nil {
+		writeGroupErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, groupDTO(g))
+}
+
+// handleUpdateGroup replaces the group at {id} and returns it (200). 404 if
+// missing; validation errors → 422.
+func (a *API) handleUpdateGroup(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	body, ok := decodeGroupBody(w, r)
+	if !ok {
+		return
+	}
+	g, err := a.groups.Update(id, store.Group{
+		Name:             body.Name,
+		Consumers:        body.Consumers,
+		AllowedExitNodes: body.AllowedExitNodes,
+	})
+	if err != nil {
+		writeGroupErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, groupDTO(g))
+}
+
+// handleDeleteGroup deletes the group at {id} (204). 404 if missing.
+func (a *API) handleDeleteGroup(w http.ResponseWriter, r *http.Request) {
+	if err := a.groups.Delete(r.PathValue("id")); err != nil {
+		writeGroupErr(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// decodeGroupBody reads a JSON group request via a LimitReader. On a malformed
+// body it writes a 400 {error,detail} and reports ok=false (a missing/empty body
+// is allowed -- it decodes to the zero request, which validation then rejects).
+func decodeGroupBody(w http.ResponseWriter, r *http.Request) (groupRequest, bool) {
+	var body groupRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, groupReqLimit)).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeErrDetail(w, http.StatusBadRequest, "invalid request body", err.Error(), "")
+		return groupRequest{}, false
+	}
+	return body, true
+}
+
+// writeGroupErr maps a GroupStore error to its response. The status/detail are
+// read structurally (HTTPStatus()/Detail()) so the api never imports the groups
+// package -- 404 for a missing group, 422 for a validation failure; default 422.
+func writeGroupErr(w http.ResponseWriter, err error) {
+	status := http.StatusUnprocessableEntity
+	if hs, ok := asHTTPStatus(err); ok {
+		status = hs
+	}
+	detail := ""
+	var de interface{ Detail() string }
+	if errors.As(err, &de) {
+		detail = de.Detail()
+	}
+	writeErrDetail(w, status, err.Error(), detail, "")
+}
+
+// asHTTPStatus extracts a structural HTTP status from an error chain.
+func asHTTPStatus(err error) (int, bool) {
+	var hs interface{ HTTPStatus() int }
+	if errors.As(err, &hs) {
+		return hs.HTTPStatus(), true
+	}
+	return 0, false
+}
+
 // --- DTOs (PHASE_B §3, camelCase) ---------------------------------------------
 
 // NodeDTO is the wire shape of a store.NodeView.
@@ -460,10 +587,37 @@ type RouterViewDTO struct {
 	LastConfirmedAt string          `json:"lastConfirmedAt"`
 }
 
+// GroupDTO is the RAW wire shape of a store.Group (the /api/groups CRUD body).
+type GroupDTO struct {
+	ID               string   `json:"id"`
+	Name             string   `json:"name"`
+	Consumers        []string `json:"consumers"`
+	AllowedExitNodes []string `json:"allowedExitNodes"`
+}
+
+// GroupMemberDTO is the wire shape of a store.GroupMember (resolved member).
+type GroupMemberDTO struct {
+	StableID string `json:"stableID"`
+	Name     string `json:"name"`
+	IP       string `json:"ip"`
+	Online   bool   `json:"online"`
+	Present  bool   `json:"present"`
+}
+
+// GroupViewDTO is the wire shape of a store.GroupView (resolved zone in the
+// snapshot): the group plus its members resolved for rendering.
+type GroupViewDTO struct {
+	ID               string           `json:"id"`
+	Name             string           `json:"name"`
+	Consumers        []GroupMemberDTO `json:"consumers"`
+	AllowedExitNodes []GroupMemberDTO `json:"allowedExitNodes"`
+}
+
 // SnapshotDTO is the wire shape of a *store.Snapshot (SSE frames + seam test).
 type SnapshotDTO struct {
 	Nodes     []NodeDTO       `json:"nodes"`
 	Routers   []RouterViewDTO `json:"routers"`
+	Groups    []GroupViewDTO  `json:"groups"`
 	NetmapAt  string          `json:"netmapAt"`
 	NetmapErr string          `json:"netmapErr"`
 	BuiltAt   string          `json:"builtAt"`
@@ -531,6 +685,59 @@ func routerViewDTO(rv store.RouterView) RouterViewDTO {
 	}
 }
 
+// groupDTO is the RAW wire shape of one store.Group (slices never null).
+func groupDTO(g store.Group) GroupDTO {
+	consumers := g.Consumers
+	if consumers == nil {
+		consumers = []string{}
+	}
+	allowed := g.AllowedExitNodes
+	if allowed == nil {
+		allowed = []string{}
+	}
+	return GroupDTO{
+		ID:               g.ID,
+		Name:             g.Name,
+		Consumers:        consumers,
+		AllowedExitNodes: allowed,
+	}
+}
+
+func groupDTOs(gs []store.Group) []GroupDTO {
+	out := make([]GroupDTO, 0, len(gs))
+	for _, g := range gs {
+		out = append(out, groupDTO(g))
+	}
+	return out
+}
+
+func groupMemberDTOs(ms []store.GroupMember) []GroupMemberDTO {
+	out := make([]GroupMemberDTO, 0, len(ms))
+	for _, m := range ms {
+		out = append(out, GroupMemberDTO{
+			StableID: m.StableID,
+			Name:     m.Name,
+			IP:       m.IP,
+			Online:   m.Online,
+			Present:  m.Present,
+		})
+	}
+	return out
+}
+
+func groupViewDTOs(gvs []store.GroupView) []GroupViewDTO {
+	out := make([]GroupViewDTO, 0, len(gvs))
+	for _, gv := range gvs {
+		out = append(out, GroupViewDTO{
+			ID:               gv.ID,
+			Name:             gv.Name,
+			Consumers:        groupMemberDTOs(gv.Consumers),
+			AllowedExitNodes: groupMemberDTOs(gv.AllowedExitNodes),
+		})
+	}
+	return out
+}
+
 func snapshotDTO(s *store.Snapshot) SnapshotDTO {
 	routers := make([]RouterViewDTO, 0, len(s.Routers))
 	for _, rv := range s.Routers {
@@ -539,6 +746,7 @@ func snapshotDTO(s *store.Snapshot) SnapshotDTO {
 	return SnapshotDTO{
 		Nodes:     nodeDTOs(s.Nodes),
 		Routers:   routers,
+		Groups:    groupViewDTOs(s.Groups),
 		NetmapAt:  rfc3339(s.NetmapAt),
 		NetmapErr: s.NetmapErr,
 		BuiltAt:   rfc3339(s.BuiltAt),

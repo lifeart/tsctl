@@ -8,10 +8,12 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/lifeart/tsctl/internal/groups"
 	"github.com/lifeart/tsctl/internal/store"
 )
 
@@ -565,6 +567,240 @@ func TestHandleSetExitNode_GenericErrorIs502(t *testing.T) {
 	a.handleSetExitNode(rec, req)
 	if rec.Code != http.StatusBadGateway {
 		t.Errorf("code = %d want 502", rec.Code)
+	}
+}
+
+// --- group (zone) handlers ----------------------------------------------------
+
+// newGroupAPI wires an API over a REAL groups.Store (temp file) so the handler
+// tests exercise the actual validation / 404 / structural-error seam end to end.
+func newGroupAPI(t *testing.T) *API {
+	t.Helper()
+	gs, err := groups.New(filepath.Join(t.TempDir(), "groups.json"))
+	if err != nil {
+		t.Fatalf("groups.New: %v", err)
+	}
+	return New(store.New(), fakeWhoIs{login: "alice"}, &fakeController{},
+		Config{Owner: "alice", AllowedHosts: []string{"tsctl"}, Groups: gs})
+}
+
+func TestHandleGroups_CRUD(t *testing.T) {
+	a := newGroupAPI(t)
+
+	// List empty -> 200 and a JSON ARRAY (never null).
+	rec := httptest.NewRecorder()
+	a.handleListGroups(rec, httptest.NewRequest(http.MethodGet, "/api/groups", nil))
+	if rec.Code != 200 {
+		t.Fatalf("list code = %d", rec.Code)
+	}
+	if got := strings.TrimSpace(rec.Body.String()); got != "[]" {
+		t.Errorf("empty list body = %q, want []", got)
+	}
+
+	// Create -> 201, returns id + echoed raw fields.
+	rec = httptest.NewRecorder()
+	a.handleCreateGroup(rec, httptest.NewRequest(http.MethodPost, "/api/groups",
+		strings.NewReader(`{"name":"work","consumers":["n-a"],"allowedExitNodes":["n-x"]}`)))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create code = %d body=%s", rec.Code, rec.Body)
+	}
+	var created map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal create: %v", err)
+	}
+	for _, k := range []string{"id", "name", "consumers", "allowedExitNodes"} {
+		if _, ok := created[k]; !ok {
+			t.Errorf("created group missing key %q (got %v)", k, created)
+		}
+	}
+	id, _ := created["id"].(string)
+	if id == "" {
+		t.Fatal("create did not assign an id")
+	}
+	if created["name"] != "work" {
+		t.Errorf("name = %v", created["name"])
+	}
+
+	// Create invalid (empty name) -> 422 {error,detail}.
+	rec = httptest.NewRecorder()
+	a.handleCreateGroup(rec, httptest.NewRequest(http.MethodPost, "/api/groups", strings.NewReader(`{"name":"   "}`)))
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Errorf("invalid create code = %d want 422", rec.Code)
+	}
+	var errBody map[string]string
+	json.Unmarshal(rec.Body.Bytes(), &errBody)
+	if errBody["error"] == "" || errBody["detail"] == "" {
+		t.Errorf("422 body must carry error+detail, got %v", errBody)
+	}
+
+	// Update -> 200, id preserved, fields replaced.
+	rec = httptest.NewRecorder()
+	ureq := httptest.NewRequest(http.MethodPut, "/api/groups/"+id, strings.NewReader(`{"name":"work2","consumers":["n-b"]}`))
+	ureq.SetPathValue("id", id)
+	a.handleUpdateGroup(rec, ureq)
+	if rec.Code != 200 {
+		t.Fatalf("update code = %d body=%s", rec.Code, rec.Body)
+	}
+	var updated map[string]any
+	json.Unmarshal(rec.Body.Bytes(), &updated)
+	if updated["id"] != id {
+		t.Errorf("update must preserve id: %v != %v", updated["id"], id)
+	}
+	if updated["name"] != "work2" {
+		t.Errorf("update name = %v", updated["name"])
+	}
+
+	// Update missing -> 404.
+	rec = httptest.NewRecorder()
+	ureq = httptest.NewRequest(http.MethodPut, "/api/groups/nope", strings.NewReader(`{"name":"x"}`))
+	ureq.SetPathValue("id", "nope")
+	a.handleUpdateGroup(rec, ureq)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("update missing code = %d want 404", rec.Code)
+	}
+
+	// List now has exactly one group.
+	rec = httptest.NewRecorder()
+	a.handleListGroups(rec, httptest.NewRequest(http.MethodGet, "/api/groups", nil))
+	var list []map[string]any
+	json.Unmarshal(rec.Body.Bytes(), &list)
+	if len(list) != 1 {
+		t.Errorf("list len = %d want 1", len(list))
+	}
+
+	// Delete -> 204 (empty body).
+	rec = httptest.NewRecorder()
+	dreq := httptest.NewRequest(http.MethodDelete, "/api/groups/"+id, nil)
+	dreq.SetPathValue("id", id)
+	a.handleDeleteGroup(rec, dreq)
+	if rec.Code != http.StatusNoContent {
+		t.Errorf("delete code = %d want 204", rec.Code)
+	}
+
+	// Delete missing -> 404.
+	rec = httptest.NewRecorder()
+	dreq = httptest.NewRequest(http.MethodDelete, "/api/groups/"+id, nil)
+	dreq.SetPathValue("id", id)
+	a.handleDeleteGroup(rec, dreq)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("delete missing code = %d want 404", rec.Code)
+	}
+}
+
+// TestGroups_WriteSecurity proves a group write goes through the SAME middleware
+// as the data routes: a no-CSRF POST is 403, a bad Host is 403, an unauthenticated
+// caller is 401, and a valid owner+CSRF+Host POST is 201.
+func TestGroups_WriteSecurity(t *testing.T) {
+	const host = "tsctl"
+	gs, err := groups.New(filepath.Join(t.TempDir(), "groups.json"))
+	if err != nil {
+		t.Fatalf("groups.New: %v", err)
+	}
+	a := New(store.New(), fakeWhoIs{login: "alice"}, &fakeController{},
+		Config{Owner: "alice", AllowedHosts: []string{host}, Groups: gs})
+	h := a.Routes()
+
+	post := func(reqHost string, withCSRF bool) int {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/groups", strings.NewReader(`{"name":"z"}`))
+		req.Host = reqHost
+		req.Header.Set("Content-Type", "application/json")
+		if withCSRF {
+			req.Header.Set("X-Tsctl-CSRF", "tok")
+			req.AddCookie(&http.Cookie{Name: "tsctl_csrf", Value: "tok"})
+		}
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	if got := post(host, false); got != http.StatusForbidden {
+		t.Errorf("no-CSRF POST /api/groups = %d want 403", got)
+	}
+	if got := post("evil.example", true); got != http.StatusForbidden {
+		t.Errorf("bad-Host POST /api/groups = %d want 403", got)
+	}
+	if got := post(host, true); got != http.StatusCreated {
+		t.Errorf("valid owner+CSRF+Host POST /api/groups = %d want 201", got)
+	}
+
+	// Unauthenticated (non-owner WhoIs, no session) -> 401, even with valid CSRF.
+	a2 := New(store.New(), fakeWhoIs{login: "intruder"}, &fakeController{},
+		Config{Owner: "alice", AllowedHosts: []string{host}, Groups: gs})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/groups", strings.NewReader(`{"name":"z"}`))
+	req.Host = host
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Tsctl-CSRF", "tok")
+	req.AddCookie(&http.Cookie{Name: "tsctl_csrf", Value: "tok"})
+	a2.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("unauth POST /api/groups = %d want 401", rec.Code)
+	}
+}
+
+// TestEncodeSnapshot_IncludesGroups proves the SSE/REST Snapshot DTO carries the
+// resolved `groups` field (camelCase) with resolved member info, and that an
+// empty snapshot still emits an array (never null).
+func TestEncodeSnapshot_IncludesGroups(t *testing.T) {
+	snap := &store.Snapshot{
+		Groups: []store.GroupView{{
+			ID:   "z1",
+			Name: "Work",
+			Consumers: []store.GroupMember{
+				{StableID: "n-a", Name: "router-a", IP: "100.64.0.10", Online: true, Present: true},
+			},
+			AllowedExitNodes: []store.GroupMember{
+				{StableID: "n-x", Present: false},
+			},
+		}},
+	}
+	b, err := EncodeSnapshot(snap)
+	if err != nil {
+		t.Fatalf("EncodeSnapshot: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	raw, ok := got["groups"].([]any)
+	if !ok {
+		t.Fatalf("snapshot missing groups array (json tag drift?): %v", got["groups"])
+	}
+	if len(raw) != 1 {
+		t.Fatalf("groups len = %d want 1", len(raw))
+	}
+	g0 := raw[0].(map[string]any)
+	for _, k := range []string{"id", "name", "consumers", "allowedExitNodes"} {
+		if _, ok := g0[k]; !ok {
+			t.Errorf("groupView missing camelCase key %q (got %v)", k, g0)
+		}
+	}
+	cons := g0["consumers"].([]any)
+	if len(cons) != 1 {
+		t.Fatalf("consumers len = %d", len(cons))
+	}
+	m0 := cons[0].(map[string]any)
+	for _, k := range []string{"stableID", "name", "ip", "online", "present"} {
+		if _, ok := m0[k]; !ok {
+			t.Errorf("groupMember missing camelCase key %q (got %v)", k, m0)
+		}
+	}
+	if m0["present"] != true || m0["ip"] != "100.64.0.10" || m0["online"] != true {
+		t.Errorf("present member resolved wrong: %v", m0)
+	}
+	allowed := g0["allowedExitNodes"].([]any)
+	if allowed[0].(map[string]any)["present"] != false {
+		t.Errorf("absent member present should be false: %v", allowed[0])
+	}
+
+	// An empty snapshot still emits groups as [] (never null).
+	b, err = EncodeSnapshot(&store.Snapshot{})
+	if err != nil {
+		t.Fatalf("EncodeSnapshot empty: %v", err)
+	}
+	json.Unmarshal(b, &got)
+	if arr, ok := got["groups"].([]any); !ok || len(arr) != 0 {
+		t.Errorf("empty snapshot groups = %v, want [] (non-null empty array)", got["groups"])
 	}
 }
 

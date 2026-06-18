@@ -24,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lifeart/tsctl/internal/groups"
 	"github.com/lifeart/tsctl/internal/router"
 	"github.com/lifeart/tsctl/internal/store"
 )
@@ -415,4 +416,146 @@ func primaryIPv4(ips []string) string {
 		return ips[0]
 	}
 	return ""
+}
+
+// --- demo group (zone) store -------------------------------------------------
+
+// Groups is an in-memory zone store for `tsctl demo` (no file persistence). It
+// satisfies BOTH poller.GroupReader (List) and api.GroupStore (full CRUD) and is
+// safe for concurrent use: the poller's List runs on the poll goroutine while
+// the api handlers CRUD on request goroutines. Validation + ID minting reuse the
+// real groups package so demo behaves exactly like prod.
+type Groups struct {
+	mu    sync.Mutex
+	items []store.Group
+}
+
+// NewGroups seeds the demo with two sample zones over the fixture nodes so the
+// graph renders with zones present and enforcement is observable:
+//
+//   - "Work": office-router + warehouse-router, allowed → tokyo, frankfurt. A
+//     drag to any OTHER online exit node (e.g. edge-combo) is rejected by
+//     enforcement, demonstrating the zone guard; Direct (clear) is always allowed.
+//   - "Lab": home-router, allowed → tokyo, frankfurt, flaky, broken. This lets the
+//     scripted amber (flaky) and command-error (broken) paths run from inside a
+//     zone (their targets are in the allowed set).
+//
+// cabin-router is intentionally left UNGROUPED so the implicit "Ungrouped"
+// section is also exercised.
+func NewGroups() *Groups {
+	return &Groups{items: []store.Group{
+		{
+			ID:               "zone-work",
+			Name:             "Work",
+			Consumers:        []string{"n-office-router", "n-warehouse-router"},
+			AllowedExitNodes: []string{"n-exit-tokyo", "n-exit-frankfurt"},
+		},
+		{
+			ID:               "zone-lab",
+			Name:             "Lab",
+			Consumers:        []string{"n-home-router"},
+			AllowedExitNodes: []string{"n-exit-tokyo", "n-exit-frankfurt", "n-exit-flaky", "n-exit-broken"},
+		},
+	}}
+}
+
+// List returns copies of every zone (poller.GroupReader + api.GroupStore).
+func (g *Groups) List() []store.Group {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return cloneGroups(g.items)
+}
+
+// Get returns a copy of the zone with id, or ok=false.
+func (g *Groups) Get(id string) (store.Group, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if i := g.indexOfLocked(id); i >= 0 {
+		return cloneGroup(g.items[i]), true
+	}
+	return store.Group{}, false
+}
+
+// Create validates+normalizes, assigns a fresh ID, and appends (in memory only).
+func (g *Groups) Create(in store.Group) (store.Group, error) {
+	norm, err := groups.Normalize(in)
+	if err != nil {
+		return store.Group{}, err
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	id, err := groups.NewID()
+	if err != nil {
+		return store.Group{}, err
+	}
+	for g.indexOfLocked(id) >= 0 {
+		if id, err = groups.NewID(); err != nil {
+			return store.Group{}, err
+		}
+	}
+	norm.ID = id
+	g.items = append(g.items, norm)
+	return cloneGroup(norm), nil
+}
+
+// Update validates+normalizes and replaces the zone at id (preserving id).
+func (g *Groups) Update(id string, in store.Group) (store.Group, error) {
+	norm, err := groups.Normalize(in)
+	if err != nil {
+		return store.Group{}, err
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	idx := g.indexOfLocked(id)
+	if idx < 0 {
+		return store.Group{}, demoGroupNotFound(id)
+	}
+	norm.ID = id
+	g.items[idx] = norm
+	return cloneGroup(norm), nil
+}
+
+// Delete removes the zone at id.
+func (g *Groups) Delete(id string) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	idx := g.indexOfLocked(id)
+	if idx < 0 {
+		return demoGroupNotFound(id)
+	}
+	g.items = append(g.items[:idx], g.items[idx+1:]...)
+	return nil
+}
+
+func (g *Groups) indexOfLocked(id string) int {
+	for i := range g.items {
+		if g.items[i].ID == id {
+			return i
+		}
+	}
+	return -1
+}
+
+// demoGroupNotFound mirrors the real store's 404 (the api maps it structurally).
+type demoGroupNotFound string
+
+func (e demoGroupNotFound) Error() string   { return "group not found" }
+func (e demoGroupNotFound) HTTPStatus() int { return 404 }
+func (e demoGroupNotFound) Detail() string  { return "no group with id " + string(e) }
+
+func cloneGroups(in []store.Group) []store.Group {
+	out := make([]store.Group, 0, len(in))
+	for _, g := range in {
+		out = append(out, cloneGroup(g))
+	}
+	return out
+}
+
+func cloneGroup(g store.Group) store.Group {
+	return store.Group{
+		ID:               g.ID,
+		Name:             g.Name,
+		Consumers:        append([]string(nil), g.Consumers...),
+		AllowedExitNodes: append([]string(nil), g.AllowedExitNodes...),
+	}
 }

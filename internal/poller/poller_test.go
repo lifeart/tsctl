@@ -3,6 +3,7 @@ package poller
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -83,7 +84,7 @@ func TestRefresh_BuildsSnapshot(t *testing.T) {
 	}}
 	bc := newFakeBC()
 	st := store.New()
-	p := New(st, nm, rc, []string{routerIP}, bc, make(chan int), time.Second, nopLogf)
+	p := New(st, nm, rc, nil, []string{routerIP}, bc, make(chan int), time.Second, nopLogf)
 
 	if err := p.Refresh(context.Background()); err != nil {
 		t.Fatalf("refresh: %v", err)
@@ -127,7 +128,7 @@ func TestRefresh_AutoDiscoversRouters(t *testing.T) {
 	}}
 	rc := &fakeRC{statusRT: store.RouterRuntime{Online: true}}
 	st := store.New()
-	p := New(st, nm, rc, nil /* auto-discover */, newFakeBC(), make(chan int), time.Second, nopLogf)
+	p := New(st, nm, rc, nil, nil /* auto-discover */, newFakeBC(), make(chan int), time.Second, nopLogf)
 
 	if err := p.Refresh(context.Background()); err != nil {
 		t.Fatalf("refresh: %v", err)
@@ -155,7 +156,7 @@ func TestRefresh_NetmapErrSurfacedNotAborted(t *testing.T) {
 	rc := &fakeRC{statusErr: errors.New("ssh dial failed")}
 	bc := newFakeBC()
 	st := store.New()
-	p := New(st, nm, rc, []string{"100.64.0.10"}, bc, make(chan int), time.Second, nopLogf)
+	p := New(st, nm, rc, nil, []string{"100.64.0.10"}, bc, make(chan int), time.Second, nopLogf)
 
 	err := p.Refresh(context.Background())
 	if err == nil {
@@ -201,7 +202,7 @@ func TestSetExitNode_Success(t *testing.T) {
 	seedSnapshot(st, routerIP, exitIP, true, true)
 	rc := &fakeRC{setRT: store.RouterRuntime{Online: true, Current: &store.ExitNodeRef{StableID: "exit1", IP: exitIP}}}
 	bc := newFakeBC()
-	p := New(st, &fakeNM{}, rc, []string{routerIP}, bc, make(chan int), time.Second, nopLogf)
+	p := New(st, &fakeNM{}, rc, nil, []string{routerIP}, bc, make(chan int), time.Second, nopLogf)
 
 	rv, err := p.SetExitNode(context.Background(), "router1", "exit1")
 	if err != nil {
@@ -232,7 +233,7 @@ func TestSetExitNode_Clear(t *testing.T) {
 	st := store.New()
 	seedSnapshot(st, routerIP, "100.64.0.20", true, true)
 	rc := &fakeRC{setRT: store.RouterRuntime{Online: true, Current: nil}}
-	p := New(st, &fakeNM{}, rc, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+	p := New(st, &fakeNM{}, rc, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
 
 	rv, err := p.SetExitNode(context.Background(), "router1", "") // "" = clear
 	if err != nil {
@@ -256,7 +257,7 @@ func TestSetExitNode_PreflightRefusals(t *testing.T) {
 		st := store.New()
 		seedSnapshot(st, routerIP, exitIP, false, true) // offline
 		rc := &fakeRC{}
-		p := New(st, &fakeNM{}, rc, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+		p := New(st, &fakeNM{}, rc, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
 		_, err := p.SetExitNode(context.Background(), "router1", "exit1")
 		assertPreflight(t, err)
 		if rc.calls() != 0 {
@@ -267,7 +268,7 @@ func TestSetExitNode_PreflightRefusals(t *testing.T) {
 		st := store.New()
 		seedSnapshot(st, routerIP, exitIP, true, false) // not ExitNodeOption
 		rc := &fakeRC{}
-		p := New(st, &fakeNM{}, rc, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+		p := New(st, &fakeNM{}, rc, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
 		_, err := p.SetExitNode(context.Background(), "router1", "exit1")
 		assertPreflight(t, err)
 		if rc.calls() != 0 {
@@ -277,7 +278,7 @@ func TestSetExitNode_PreflightRefusals(t *testing.T) {
 	t.Run("unknown router", func(t *testing.T) {
 		st := store.New()
 		seedSnapshot(st, routerIP, exitIP, true, true)
-		p := New(st, &fakeNM{}, &fakeRC{}, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+		p := New(st, &fakeNM{}, &fakeRC{}, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
 		_, err := p.SetExitNode(context.Background(), "ghost", "exit1")
 		assertPreflight(t, err)
 	})
@@ -313,7 +314,7 @@ func TestSetExitNode_RouterFailureIs502WithStderr(t *testing.T) {
 	// The poller best-effort re-reads via Status to learn that actual state.
 	rc := &fakeRC{setErr: cmdErr, statusRT: store.RouterRuntime{Online: true, Current: nil}}
 	bc := newFakeBC()
-	p := New(st, &fakeNM{}, rc, []string{routerIP}, bc, make(chan int), time.Second, nopLogf)
+	p := New(st, &fakeNM{}, rc, nil, []string{routerIP}, bc, make(chan int), time.Second, nopLogf)
 
 	rv, err := p.SetExitNode(context.Background(), "router1", "exit1")
 	if err == nil {
@@ -366,7 +367,7 @@ func TestSetExitNode_HardFailureRereadFails(t *testing.T) {
 	seedSnapshot(st, routerIP, exitIP, true, true)
 	cmdErr := &router.CommandError{Addr: routerIP, Cmd: "apply exit-node", StderrText: "permission denied", Exit: 1}
 	rc := &fakeRC{setErr: cmdErr, statusErr: errors.New("ssh dial failed")}
-	p := New(st, &fakeNM{}, rc, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+	p := New(st, &fakeNM{}, rc, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
 
 	rv, err := p.SetExitNode(context.Background(), "router1", "exit1")
 	if err == nil {
@@ -396,7 +397,7 @@ func TestSetExitNode_AppliedButUnconfirmed(t *testing.T) {
 		setRT:  store.RouterRuntime{Online: true, Current: nil},
 		setErr: errors.New("confirm read mismatch"),
 	}
-	p := New(st, &fakeNM{}, rc, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+	p := New(st, &fakeNM{}, rc, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
 
 	rv, err := p.SetExitNode(context.Background(), "router1", "exit1")
 	if err != nil {
@@ -446,7 +447,7 @@ func TestSetExitNode_RouterDropsFromNetmapMidOp(t *testing.T) {
 		st: st, routerIP: routerIP,
 		rt: store.RouterRuntime{Online: true, Current: &store.ExitNodeRef{StableID: "exit1", IP: exitIP}},
 	}
-	p := New(st, &fakeNM{}, rc, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+	p := New(st, &fakeNM{}, rc, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
 
 	rv, err := p.SetExitNode(context.Background(), "router1", "exit1")
 	if err != nil {
@@ -462,6 +463,162 @@ func TestSetExitNode_RouterDropsFromNetmapMidOp(t *testing.T) {
 	}
 }
 
+// --- zone (group) enforcement + resolution -----------------------------------
+
+type fakeGroups struct{ list []store.Group }
+
+func (f *fakeGroups) List() []store.Group { return f.list }
+
+var _ GroupReader = (*fakeGroups)(nil)
+
+// seedSnapshot2 seeds a router plus two online+approved exit nodes so zone
+// enforcement (allowed vs not-allowed) can be exercised independently of the
+// generic offline/unapproved pre-flight refusals.
+func seedSnapshot2(st *store.Store, routerIP, exit1IP, exit2IP string) {
+	st.Store(&store.Snapshot{
+		Nodes: []store.NodeView{
+			{StableID: "router1", TailscaleIPs: []string{routerIP}, Online: true, Type: store.NodeRouter},
+			{StableID: "exit1", Name: "e1", TailscaleIPs: []string{exit1IP}, Online: true, ExitNodeOption: true, Type: store.NodeExitNode},
+			{StableID: "exit2", Name: "e2", TailscaleIPs: []string{exit2IP}, Online: true, ExitNodeOption: true, Type: store.NodeExitNode},
+		},
+		Routers: []store.RouterView{
+			{Node: store.NodeView{StableID: "router1", TailscaleIPs: []string{routerIP}}, Reachable: true, State: store.RouterOK},
+		},
+	})
+}
+
+func TestSetExitNode_ZoneEnforcement(t *testing.T) {
+	const routerIP, exit1IP, exit2IP = "100.64.0.10", "100.64.0.20", "100.64.0.21"
+
+	t.Run("in-zone target allowed", func(t *testing.T) {
+		st := store.New()
+		seedSnapshot2(st, routerIP, exit1IP, exit2IP)
+		rc := &fakeRC{setRT: store.RouterRuntime{Online: true, Current: &store.ExitNodeRef{StableID: "exit1", IP: exit1IP}}}
+		fg := &fakeGroups{list: []store.Group{{ID: "z", Name: "Work", Consumers: []string{"router1"}, AllowedExitNodes: []string{"exit1"}}}}
+		p := New(st, &fakeNM{}, rc, fg, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+		rv, err := p.SetExitNode(context.Background(), "router1", "exit1")
+		if err != nil {
+			t.Fatalf("in-zone change must be allowed: %v", err)
+		}
+		if rv.State != store.RouterOK {
+			t.Errorf("state = %q, want ok", rv.State)
+		}
+		if rc.calls() != 1 {
+			t.Errorf("router should be touched once, calls = %d", rc.calls())
+		}
+	})
+
+	t.Run("out-of-zone target rejected, no SSH issued", func(t *testing.T) {
+		st := store.New()
+		seedSnapshot2(st, routerIP, exit1IP, exit2IP)
+		rc := &fakeRC{}
+		fg := &fakeGroups{list: []store.Group{{ID: "z", Name: "Work", Consumers: []string{"router1"}, AllowedExitNodes: []string{"exit1"}}}}
+		p := New(st, &fakeNM{}, rc, fg, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+		_, err := p.SetExitNode(context.Background(), "router1", "exit2") // online+approved, but NOT in zone
+		assertPreflight(t, err)
+		if !strings.Contains(err.Error(), "not allowed") {
+			t.Errorf("error should explain the zone refusal, got %q", err.Error())
+		}
+		if rc.calls() != 0 {
+			t.Errorf("router must NOT be touched on a zone refusal, calls = %d", rc.calls())
+		}
+	})
+
+	t.Run("Direct (clear) always allowed even in a restrictive zone", func(t *testing.T) {
+		st := store.New()
+		seedSnapshot2(st, routerIP, exit1IP, exit2IP)
+		rc := &fakeRC{setRT: store.RouterRuntime{Online: true, Current: nil}}
+		fg := &fakeGroups{list: []store.Group{{ID: "z", Name: "Work", Consumers: []string{"router1"}, AllowedExitNodes: []string{"exit1"}}}}
+		p := New(st, &fakeNM{}, rc, fg, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+		rv, err := p.SetExitNode(context.Background(), "router1", "") // clear
+		if err != nil {
+			t.Fatalf("Direct/clear must always be allowed: %v", err)
+		}
+		if rv.CurrentExitNode != nil {
+			t.Errorf("currentExitNode should be nil after clear, got %+v", rv.CurrentExitNode)
+		}
+		if rc.calls() != 1 {
+			t.Errorf("clear should reach the router, calls = %d", rc.calls())
+		}
+	})
+
+	t.Run("ungrouped consumer is unrestricted", func(t *testing.T) {
+		st := store.New()
+		seedSnapshot2(st, routerIP, exit1IP, exit2IP)
+		rc := &fakeRC{setRT: store.RouterRuntime{Online: true, Current: &store.ExitNodeRef{StableID: "exit2", IP: exit2IP}}}
+		// A zone exists but does NOT contain router1, so router1 is ungrouped.
+		fg := &fakeGroups{list: []store.Group{{ID: "z", Name: "Other", Consumers: []string{"someone-else"}, AllowedExitNodes: []string{"exit1"}}}}
+		p := New(st, &fakeNM{}, rc, fg, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+		if _, err := p.SetExitNode(context.Background(), "router1", "exit2"); err != nil {
+			t.Fatalf("ungrouped consumer must be unrestricted: %v", err)
+		}
+		if rc.calls() != 1 {
+			t.Errorf("ungrouped change should reach the router, calls = %d", rc.calls())
+		}
+	})
+
+	t.Run("multi-group allowed set is the union", func(t *testing.T) {
+		st := store.New()
+		seedSnapshot2(st, routerIP, exit1IP, exit2IP)
+		rc := &fakeRC{setRT: store.RouterRuntime{Online: true, Current: &store.ExitNodeRef{StableID: "exit2", IP: exit2IP}}}
+		// router1 is in BOTH zones; exit2 is allowed only by the second → union admits it.
+		fg := &fakeGroups{list: []store.Group{
+			{ID: "z1", Name: "A", Consumers: []string{"router1"}, AllowedExitNodes: []string{"exit1"}},
+			{ID: "z2", Name: "B", Consumers: []string{"router1"}, AllowedExitNodes: []string{"exit2"}},
+		}}
+		p := New(st, &fakeNM{}, rc, fg, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+		if _, err := p.SetExitNode(context.Background(), "router1", "exit2"); err != nil {
+			t.Fatalf("union of zones must admit exit2: %v", err)
+		}
+		if rc.calls() != 1 {
+			t.Errorf("union-allowed change should reach the router, calls = %d", rc.calls())
+		}
+	})
+}
+
+func TestBuild_ResolvesGroupViews(t *testing.T) {
+	const routerIP, exitIP = "100.64.0.10", "100.64.0.20"
+	nm := &fakeNM{nodes: []store.NodeView{
+		{StableID: "router1", Name: "r1", Hostname: "r1h", TailscaleIPs: []string{routerIP}, Online: true, Type: store.NodeRouter},
+		{StableID: "exit1", Name: "e1", TailscaleIPs: []string{exitIP}, Online: true, ExitNodeOption: true, Type: store.NodeExitNode},
+	}}
+	rc := &fakeRC{statusRT: store.RouterRuntime{Online: true}}
+	fg := &fakeGroups{list: []store.Group{
+		{ID: "z2", Name: "Beta", Consumers: []string{"router1"}, AllowedExitNodes: []string{"exit1", "ghost"}},
+		{ID: "z1", Name: "Alpha", Consumers: []string{"ghost"}, AllowedExitNodes: []string{"exit1"}},
+	}}
+	st := store.New()
+	p := New(st, nm, rc, fg, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+	if err := p.Refresh(context.Background()); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	snap := st.Load()
+	if len(snap.Groups) != 2 {
+		t.Fatalf("groups = %d, want 2", len(snap.Groups))
+	}
+	// Stable order: sorted by Name (Alpha, Beta).
+	if snap.Groups[0].Name != "Alpha" || snap.Groups[1].Name != "Beta" {
+		t.Fatalf("groups not sorted by name: %q, %q", snap.Groups[0].Name, snap.Groups[1].Name)
+	}
+	beta := snap.Groups[1]
+	if len(beta.Consumers) != 1 || beta.Consumers[0].StableID != "router1" || !beta.Consumers[0].Present {
+		t.Fatalf("beta consumers wrong: %+v", beta.Consumers)
+	}
+	if beta.Consumers[0].IP != routerIP || !beta.Consumers[0].Online || beta.Consumers[0].Name != "r1" {
+		t.Errorf("present member not resolved: %+v", beta.Consumers[0])
+	}
+	if len(beta.AllowedExitNodes) != 2 {
+		t.Fatalf("allowed = %d, want 2 (order preserved)", len(beta.AllowedExitNodes))
+	}
+	if beta.AllowedExitNodes[0].StableID != "exit1" || !beta.AllowedExitNodes[0].Present {
+		t.Errorf("exit1 should resolve present: %+v", beta.AllowedExitNodes[0])
+	}
+	ghost := beta.AllowedExitNodes[1]
+	if ghost.StableID != "ghost" || ghost.Present || ghost.Name != "" || ghost.IP != "" || ghost.Online {
+		t.Errorf("absent member must be flagged Present=false with empty Name/IP: %+v", ghost)
+	}
+}
+
 func TestRun_IdleSuspension(t *testing.T) {
 	routerIP := "100.64.0.10"
 	nm := &fakeNM{nodes: []store.NodeView{{StableID: "router1", TailscaleIPs: []string{routerIP}, Type: store.NodeRouter}}}
@@ -469,7 +626,7 @@ func TestRun_IdleSuspension(t *testing.T) {
 	bc := newFakeBC()
 	st := store.New()
 	tr := make(chan int, 1)
-	p := New(st, nm, rc, []string{routerIP}, bc, tr, 10*time.Millisecond, nopLogf)
+	p := New(st, nm, rc, nil, []string{routerIP}, bc, tr, 10*time.Millisecond, nopLogf)
 	p.linger = 30 * time.Millisecond
 
 	ctx, cancel := context.WithCancel(context.Background())

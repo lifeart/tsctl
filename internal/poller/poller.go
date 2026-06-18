@@ -45,6 +45,16 @@ type RouterClient interface {
 	SetExitNode(ctx context.Context, addr string, target *store.ExitNodeRef, prev *store.ExitNodeRef) (store.RouterRuntime, error)
 }
 
+// GroupReader supplies the current zone/group definitions (DESIGN
+// docs/design/zones.md). Implemented by *groups.Store. Declared here (consumer
+// side) so the poller never imports the groups package. The poller resolves them
+// into Snapshot.Groups every build and enforces the allowed-exit-node set in
+// SetExitNode. A nil GroupReader (or an empty list) means "no zones": no resolved
+// groups and unrestricted exit-node changes.
+type GroupReader interface {
+	List() []store.Group
+}
+
 // Broadcaster receives each freshly built Snapshot for fan-out to SSE clients.
 // Implemented by *sse.Hub. The poller calls Broadcast after every Store so the
 // browser sees changes in real time; declared here (consumer side) so the
@@ -74,6 +84,7 @@ type Poller struct {
 	store       *store.Store
 	nm          Netmapper
 	rc          RouterClient
+	groups      GroupReader // zone/group definitions (may be nil = no zones)
 	bc          Broadcaster
 	routers     []string   // router 100.x IPv4s
 	transitions <-chan int // client-count edges from the SSE hub (Transitions())
@@ -92,7 +103,8 @@ type Poller struct {
 // New constructs a Poller. transitions is the SSE hub's Transitions() channel
 // (drives idle suspension). interval is the poll cadence while ≥1 client is
 // connected (<=0 → default). logf must be non-nil; pass log.Printf or similar.
-func New(st *store.Store, nm Netmapper, rc RouterClient, routers []string, bc Broadcaster, transitions <-chan int, interval time.Duration, logf Logf) *Poller {
+// groups supplies the zone definitions (may be nil = no zones / unrestricted).
+func New(st *store.Store, nm Netmapper, rc RouterClient, groups GroupReader, routers []string, bc Broadcaster, transitions <-chan int, interval time.Duration, logf Logf) *Poller {
 	if interval <= 0 {
 		interval = defaultInterval
 	}
@@ -103,6 +115,7 @@ func New(st *store.Store, nm Netmapper, rc RouterClient, routers []string, bc Br
 		store:       st,
 		nm:          nm,
 		rc:          rc,
+		groups:      groups,
 		bc:          bc,
 		routers:     routers,
 		transitions: transitions,
@@ -110,6 +123,15 @@ func New(st *store.Store, nm Netmapper, rc RouterClient, routers []string, bc Br
 		linger:      defaultLinger,
 		logf:        logf,
 	}
+}
+
+// groupList returns the current zone definitions, or nil when no GroupReader was
+// injected. Centralizes the nil-guard so build/enforcement stay simple.
+func (p *Poller) groupList() []store.Group {
+	if p.groups == nil {
+		return nil
+	}
+	return p.groups.List()
 }
 
 // controlError carries a user-facing message plus an HTTP status / detail /
@@ -186,6 +208,20 @@ func (p *Poller) SetExitNode(ctx context.Context, routerID, targetStableID strin
 			// The only loop we can detect from inventory: routing a router
 			// through itself. Deeper path loops aren't derivable here.
 			return store.RouterView{}, preflightErr("cannot route router %q through itself (loop)", routerID)
+		}
+		// ZONE ENFORCEMENT (DESIGN docs/design/zones.md "Enforce"): if this
+		// consumer (router StableID) belongs to ≥1 zone, the target must be in the
+		// UNION of those zones' AllowedExitNodes. Direct/clear (target==nil) is
+		// always allowed -- handled by being inside this targetStableID!="" block.
+		// A consumer in no zone is unrestricted. The backend is the source of
+		// truth; the UI guard is advisory.
+		allowed, inAnyZone := p.allowedExitNodeSet(routerID)
+		if inAnyZone {
+			if _, ok := allowed[nv.StableID]; !ok {
+				return store.RouterView{}, preflightErr(
+					"exit node %q is not allowed for %q in its zone(s)",
+					displayName(nv), displayName(prevRV.Node))
+			}
 		}
 		target = &store.ExitNodeRef{StableID: nv.StableID, Name: nv.Name, IP: ip}
 	}
@@ -384,6 +420,7 @@ func (p *Poller) build(ctx context.Context) (*store.Snapshot, error) {
 	return &store.Snapshot{
 		Nodes:     nodes,
 		Routers:   routers,
+		Groups:    buildGroupViews(p.groupList(), nodes),
 		NetmapAt:  netmapAt,
 		NetmapErr: netmapErr,
 		BuiltAt:   now,
@@ -563,6 +600,78 @@ func sameExitNode(a, b *store.ExitNodeRef) bool {
 		return a.StableID == b.StableID
 	}
 	return a.IP == b.IP
+}
+
+// allowedExitNodeSet computes the union of AllowedExitNodes (by StableID) across
+// every zone whose Consumers contain the given consumer StableID. inAnyZone
+// reports whether the consumer belongs to at least one zone -- when false the
+// consumer is unrestricted (ungrouped). Used by SetExitNode enforcement.
+func (p *Poller) allowedExitNodeSet(consumerStableID string) (set map[string]struct{}, inAnyZone bool) {
+	set = make(map[string]struct{})
+	for _, g := range p.groupList() {
+		member := false
+		for _, c := range g.Consumers {
+			if c == consumerStableID {
+				member = true
+				break
+			}
+		}
+		if !member {
+			continue
+		}
+		inAnyZone = true
+		for _, ex := range g.AllowedExitNodes {
+			set[ex] = struct{}{}
+		}
+	}
+	return set, inAnyZone
+}
+
+// buildGroupViews resolves the raw groups into Snapshot GroupViews: groups are
+// sorted by Name then ID for a stable order; each member StableID is resolved
+// against the inventory (Name/IP/Online filled, Present=true) or flagged absent
+// (Present=false). Member ORDER is preserved as given. Always returns a non-nil
+// (possibly empty) slice so the Snapshot's Groups field is never null.
+func buildGroupViews(gs []store.Group, nodes []store.NodeView) []store.GroupView {
+	byID := make(map[string]store.NodeView, len(nodes))
+	for _, n := range nodes {
+		byID[n.StableID] = n
+	}
+	sorted := append([]store.Group(nil), gs...)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].Name != sorted[j].Name {
+			return sorted[i].Name < sorted[j].Name
+		}
+		return sorted[i].ID < sorted[j].ID
+	})
+	out := make([]store.GroupView, 0, len(sorted))
+	for _, g := range sorted {
+		out = append(out, store.GroupView{
+			ID:               g.ID,
+			Name:             g.Name,
+			Consumers:        resolveMembers(g.Consumers, byID),
+			AllowedExitNodes: resolveMembers(g.AllowedExitNodes, byID),
+		})
+	}
+	return out
+}
+
+// resolveMembers maps member StableIDs to GroupMembers via the inventory index.
+// A StableID absent from the netmap yields Present=false (empty Name/IP, Online
+// false) -- soft membership: kept and flagged, never dropped.
+func resolveMembers(ids []string, byID map[string]store.NodeView) []store.GroupMember {
+	out := make([]store.GroupMember, 0, len(ids))
+	for _, id := range ids {
+		m := store.GroupMember{StableID: id}
+		if n, ok := byID[id]; ok {
+			m.Name = displayName(n)
+			m.IP = primaryIP(n)
+			m.Online = n.Online
+			m.Present = true
+		}
+		out = append(out, m)
+	}
+	return out
 }
 
 // autoDiscoverRouters returns the 100.x IPv4s of every tag:router node in the

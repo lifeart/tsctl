@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -32,6 +33,7 @@ import (
 
 	"github.com/lifeart/tsctl/internal/api"
 	"github.com/lifeart/tsctl/internal/demo"
+	"github.com/lifeart/tsctl/internal/groups"
 	"github.com/lifeart/tsctl/internal/netmap"
 	"github.com/lifeart/tsctl/internal/poller"
 	"github.com/lifeart/tsctl/internal/router"
@@ -47,14 +49,19 @@ var (
 	_ poller.Netmapper    = (*netmap.Mapper)(nil)
 	_ poller.RouterClient = (*router.Client)(nil)
 	_ poller.Broadcaster  = (*sse.Hub)(nil)
+	_ poller.GroupReader  = (*groups.Store)(nil)
 	_ api.WhoIser         = (*netmap.Mapper)(nil)
 	_ api.Controller      = (*poller.Poller)(nil)
+	_ api.GroupStore      = (*groups.Store)(nil)
 
 	// The demo World plays the Mapper (Netmapper+WhoIser) and RouterClient roles
-	// against the SAME frozen seams, so `tsctl demo` exercises the real stack.
+	// against the SAME frozen seams, so `tsctl demo` exercises the real stack;
+	// demo.Groups plays the GroupReader + GroupStore roles.
 	_ poller.Netmapper    = (*demo.World)(nil)
 	_ poller.RouterClient = (*demo.World)(nil)
 	_ api.WhoIser         = (*demo.World)(nil)
+	_ poller.GroupReader  = (*demo.Groups)(nil)
+	_ api.GroupStore      = (*demo.Groups)(nil)
 )
 
 // demoListen is the plain loopback address `tsctl demo` serves on (no tsnet).
@@ -198,14 +205,21 @@ func runServe(args []string, lg *log.Logger) error {
 	st := store.New()
 	mapper := netmap.New(lc) // implements poller.Netmapper AND api.WhoIser
 	rc := router.New(srv.Dial, cfg.SSHUser, cfg.SSHTimeout, cfg.ExitNodeLANAccess)
+	// Persisted zone/group store ($STATE_DIR/groups.json). Fail-fast on a corrupt
+	// file (never silently start empty and risk clobbering the user's data).
+	grpStore, err := groups.New(filepath.Join(cfg.StateDir, "groups.json"))
+	if err != nil {
+		return fmt.Errorf("groups store: %w", err)
+	}
 	// hub.Transitions() drives the poller's idle suspension; api.EncodeSnapshot
 	// makes SSE frames identical to the REST Snapshot DTO (PHASE_B §3).
 	hub := sse.New(st, api.EncodeSnapshot)
-	pol := poller.New(st, mapper, rc, cfg.Routers, hub, hub.Transitions(), cfg.PollInterval, lg.Printf)
+	pol := poller.New(st, mapper, rc, grpStore, cfg.Routers, hub, hub.Transitions(), cfg.PollInterval, lg.Printf)
 	apiH := api.New(st, mapper, pol, api.Config{
 		Owner:        cfg.Owner,
 		UIPassword:   cfg.UIPassword,
 		AllowedHosts: allowedHosts(ctx, cfg, lc, lg),
+		Groups:       grpStore,
 	})
 
 	// Long-lived workers run off appCtx so shutdown can stop them in order.
@@ -485,14 +499,15 @@ func runDemo(lg *log.Logger) error {
 	defer stop()
 
 	world := demo.New()
+	dgroups := demo.NewGroups() // in-memory sample zones (no file)
 
 	// --- wiring (mirrors runServe, with the demo World as both edges) ---
 	st := store.New()
 	hub := sse.New(st, api.EncodeSnapshot)
 	// Short poll interval so live SSE updates (ticking stats, the flipping node)
 	// are visibly streamed to the browser.
-	pol := poller.New(st, world, world, world.RouterIPs(), hub, hub.Transitions(), demo.TickInterval, lg.Printf)
-	demoCfg := api.Config{Owner: demo.Owner, AllowedHosts: world.AllowedHosts()}
+	pol := poller.New(st, world, world, dgroups, world.RouterIPs(), hub, hub.Transitions(), demo.TickInterval, lg.Printf)
+	demoCfg := api.Config{Owner: demo.Owner, AllowedHosts: world.AllowedHosts(), Groups: dgroups}
 	// Optional password-preview: with TSCTL_UI_PASSWORD set, disable the auto-owner
 	// path so the login overlay (the host-port/session UI) is exercised offline.
 	if pw := os.Getenv("TSCTL_UI_PASSWORD"); pw != "" {
