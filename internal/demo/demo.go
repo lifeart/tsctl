@@ -220,6 +220,27 @@ func (w *World) Status(ctx context.Context, addr string) (store.RouterRuntime, e
 	return w.runtimeLocked(addr), nil
 }
 
+// Probe implements poller.RouterClient: a read-only diagnostic over the same
+// (simulated) transport as Status. An offline router can't be reached, so it
+// errors like a failed dial; an online one returns canned busybox-style output.
+// (Required wiring: poller.RouterClient gained Probe, which *World must satisfy.)
+func (w *World) Probe(ctx context.Context, addr string) (string, error) {
+	unlock := w.lockAddr(addr)
+	defer unlock()
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	rn := w.findByIPLocked(addr)
+	if rn == nil {
+		return "", fmt.Errorf("demo: no router configured at %s", addr)
+	}
+	if !rn.online {
+		return "", fmt.Errorf("dial %s:22: connect: host is down (demo: router offline)", addr)
+	}
+	return fmt.Sprintf("Linux %s 5.15.0\n123456.78 98765.43\n0.08 0.12 0.09\nMemTotal: 131072 kB\nMemAvailable: 65536 kB",
+		rn.hostname), nil
+}
+
 // SetExitNode implements poller.RouterClient with the three scripted outcomes
 // (DESIGN §8 failure-mode table). It honours (target, prev): on success current
 // becomes target; on any failure current is left at prev (i.e. the armed revert

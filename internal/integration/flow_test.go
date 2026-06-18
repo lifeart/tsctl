@@ -184,6 +184,12 @@ func (f *fakeRouterClient) SetExitNode(ctx context.Context, addr string, target,
 	return f.setResult, f.setErr
 }
 
+func (f *fakeRouterClient) Probe(ctx context.Context, addr string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return "Linux router 5.15.0\n0.10 0.20 0.30", nil
+}
+
 func (f *fakeRouterClient) configureSet(rt store.RouterRuntime, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

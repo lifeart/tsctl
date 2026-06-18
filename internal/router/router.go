@@ -359,6 +359,25 @@ func (c *Client) SetExitNode(ctx context.Context, addr string, target *store.Exi
 	return rt, nil
 }
 
+// Probe runs a READ-ONLY diagnostic on the router over the SAME transport/runner
+// as Status (per-addr lock + per-command timeout). It changes no state. addr is
+// the router's 100.x IPv4 (no port). On success it returns the command's trimmed
+// stdout; a non-zero exit returns a *CommandError carrying stderr (the same error
+// type Status surfaces); a transport/auth/host-key failure is returned verbatim.
+func (c *Client) Probe(ctx context.Context, addr string) (string, error) {
+	unlock := c.lockAddr(addr)
+	defer unlock()
+
+	stdout, stderr, exit, err := c.runner.run(ctx, addr, probeCmd)
+	if err != nil {
+		return "", fmt.Errorf("router %s: probe: %w", addr, err)
+	}
+	if exit != 0 {
+		return "", &CommandError{Addr: addr, Cmd: "probe", StderrText: string(stderr), Exit: exit}
+	}
+	return strings.TrimSpace(string(stdout)), nil
+}
+
 // ParseStatus turns the bytes of `tailscale status --json` into a RouterRuntime.
 // Pure and version-tolerant.
 func ParseStatus(raw []byte) (store.RouterRuntime, error) {
@@ -573,6 +592,11 @@ func (b *cappedBuffer) overflowed() bool { return b.overflow }
 const (
 	statusCmd           = "tailscale status --json"
 	revertWindowSeconds = 60 // dead-man's-switch window
+
+	// probeCmd is the read-only diagnostic run by Probe: kernel/uname, uptime,
+	// load average, and total/available memory. Portable across busybox/OpenWRT;
+	// it reads only and changes no state.
+	probeCmd = "uname -snr; cat /proc/uptime; cat /proc/loadavg; awk '/^MemTotal:|^MemAvailable:/{print $1, $2, $3}' /proc/meminfo"
 )
 
 // armCmd schedules a self-reverting timer that fires unless marker exists.

@@ -16,6 +16,9 @@
 //   DELETE /api/groups/{id}                -> 204 | 404
 //   POST   /api/routers/{id}/exit-node     -> scripted ok / unconfirmed / broken /
 //                                             zone-enforcement reject / clear
+//   POST   /api/routers/{id}/probe         -> SSH probe: 200 {ok,durationMs,output|
+//                                             error,checkedAt} (online OK / control-
+//                                             error / offline) | 404 unknown id
 //   POST   /api/login, /api/logout         -> 200 (no auth in the demo)
 //   (anything else under /api/)            -> 404
 //   EventSource /api/events                -> full Snapshot frame on connect, then
@@ -27,6 +30,8 @@
   // ----------------------------------------------------------- timings -----
   var APPLY_MS = 1200;     // scripted SetExitNode latency (UI shows "Applying…")
   var PREFLIGHT_MS = 140;  // a pre-flight rejection resolves quickly
+  var PROBE_MIN_MS = 600;  // artificial SSH-probe latency floor (UI shows "Probing…")
+  var PROBE_VAR_MS = 300;  // + up to this much jitter (~600-900ms total)
   var OPEN_MS = 120;       // EventSource "connect" delay (well under the 8s watchdog)
   var TICK_MS = 3000;      // SSE frame cadence + world time-variation
 
@@ -37,6 +42,7 @@
   var r3IP = "100.64.0.12"; // cabin-router     — OFFLINE (control disabled)
   var r4IP = "100.64.0.13"; // warehouse-router — online, current exit OFFLINE+out-of-zone -> warn
   var r5IP = "100.64.0.14"; // depot-router     — ONLINE but CONTROL ERROR (reachable:false)
+  var r6IP = "100.64.0.15"; // garage-pi        — online, UNPROBED (fallback-listed, never auto-SSHed)
 
   var tokyoIP = "100.64.0.20";     // online exit node (normal -> confirmed)
   var frankfurtIP = "100.64.0.21"; // online exit node (normal -> confirmed)
@@ -52,7 +58,7 @@
   var FLIP_ID = "n-bob-iphone"; // the generic node the ticker toggles
 
   // The configured, controllable router set (order = stable card/row order).
-  var ROUTER_IPS = [r1IP, r2IP, r3IP, r4IP, r5IP];
+  var ROUTER_IPS = [r1IP, r2IP, r3IP, r4IP, r5IP, r6IP];
 
   var now0 = Date.now();
   function ago(ms) { return new Date(now0 - ms); }
@@ -73,6 +79,10 @@
       ips: [r4IP], os: "linux", online: true, lastSeen: null, exitOpt: false, tags: ["tag:router"], type: "router" },
     { stableID: "n-depot-router", name: "depot-router.tail-demo.ts.net", hostname: "depot-router",
       ips: [r5IP], os: "linux", online: true, lastSeen: null, exitOpt: false, tags: ["tag:router"], type: "router" },
+    // Fallback-listed device: NO tag:router — surfaced as a consumer but never
+    // auto-probed (shows "not probed" until a manual Test SSH / exit-node set).
+    { stableID: "n-garage-pi", name: "garage-pi.tail-demo.ts.net", hostname: "garage-pi",
+      ips: [r6IP], os: "linux", online: true, lastSeen: null, exitOpt: false, tags: [], type: "generic" },
 
     // --- approved exit nodes (exitNodeOption=true) ---
     { stableID: "n-exit-tokyo", name: "exit-tokyo.tail-demo.ts.net", hostname: "exit-tokyo",
@@ -116,6 +126,9 @@
   routers[r5IP] = { cur: frankfurtIP, desired: "", rx: 0, tx: 0, hs: null, controlError: true,
     lastError: "ssh: handshake failed: host key mismatch for " + r5IP +
       " (tsctl can reach the device but cannot authenticate to control it)" };
+  // Fallback-listed device: online but never auto-probed -> neutral "not probed"
+  // until a manual Test SSH or an exit-node set (it has no tag:router).
+  routers[r6IP] = { unprobed: true, cur: "", desired: "", rx: 0, tx: 0, hs: null, controlError: false, lastError: "" };
 
   // ---------------------------------------------------- in-memory zones ----
   // RAW groups (member arrays = StableID strings), mirroring internal/demo
@@ -188,6 +201,16 @@
         currentExitNode: null, desired: null, state: "unreachable",
         stats: { rxBytes: 0, txBytes: 0, lastHandshake: "" },
         reachable: false, lastError: "router not present in the netmap", lastConfirmedAt: "",
+      };
+    }
+    // Fallback-listed but never auto-probed: neutral "unprobed" (not an error, not
+    // offline). Resolved by a manual Test SSH or an exit-node set.
+    if (rt.unprobed) {
+      return {
+        node: nodeDTO(node),
+        currentExitNode: null, desired: null, state: "unprobed",
+        stats: { rxBytes: 0, txBytes: 0, lastHandshake: "" },
+        reachable: false, lastError: "", lastConfirmedAt: "",
       };
     }
     var reachable = node.online && !rt.controlError;
@@ -507,6 +530,52 @@
     });
   }
 
+  // --- the scripted SSH probe ("Test SSH") --------------------------------
+  // Mirrors the backend's POST /api/routers/{id}/probe contract: a 200 with
+  // {ok,durationMs,output|error,checkedAt} for every reachable/unreachable router,
+  // a 404 for an unknown id. The states mirror the fixtures: a healthy online
+  // router returns a realistic multi-line stats blob; the depot router (online but
+  // reachable:false) fails the SSH handshake; the cabin router (offline) reports it.
+  function probeOutput(node) {
+    var host = node.hostname || node.stableID || "router";
+    return "Linux " + host + " 5.15.0-91-generic #101-Ubuntu SMP x86_64 GNU/Linux\n" +
+      " 14:32:07 up 6 days,  3:11,  1 user,  load average: 0.12, 0.09, 0.05\n" +
+      "0.12 0.09 0.05 1/214 18922\n" +
+      "MemTotal:        256000 kB\n" +
+      "MemAvailable:    180240 kB";
+  }
+  function probeRouter(routerID) {
+    var wait = PROBE_MIN_MS + rnd(PROBE_VAR_MS);
+    var checkedAt = rfc3339(new Date());
+    var node = nodeByID(routerID);
+    // Unknown id, or a node that isn't one of the configured routers → 404.
+    if (!node || !node.ips.length || ROUTER_IPS.indexOf(node.ips[0]) === -1) {
+      return delay(wait, json(404, errBody('unknown router "' + routerID + '"', "", "")));
+    }
+    var ip = node.ips[0];
+    var rt = routers[ip];
+    // OFFLINE router (cabin): no SSH attempt at all — no durationMs (per contract).
+    if (!node.online) {
+      return delay(wait, json(200, { ok: false, error: "node is offline", checkedAt: checkedAt }));
+    }
+    // ONLINE but control error (depot): tsctl can dial it but can't authenticate.
+    if (rt.controlError) {
+      return delay(wait, json(200, {
+        ok: false,
+        durationMs: 80 + rnd(25),
+        error: "ssh: handshake failed: ssh: unable to authenticate (no supported methods remain)",
+        checkedAt: checkedAt,
+      }));
+    }
+    // Healthy online router: SSH OK + a multi-line stats sample.
+    return delay(wait, json(200, {
+      ok: true,
+      durationMs: 110 + rnd(40),
+      output: probeOutput(node),
+      checkedAt: checkedAt,
+    }));
+  }
+
   // --- router table -------------------------------------------------------
   function route(method, path, bodyText) {
     var body = null;
@@ -568,6 +637,12 @@
       var routerID = decodeURIComponent(rm[1]);
       var target = (body && typeof body.exitNode === "string") ? body.exitNode : "";
       return setExitNode(routerID, target);
+    }
+
+    // SSH probe ("Test SSH").
+    var pm = path.match(/^\/api\/routers\/([^/]+)\/probe$/);
+    if (pm && method === "POST") {
+      return probeRouter(decodeURIComponent(pm[1]));
     }
 
     // Any other /api/ path: 404 (mirrors the backend's unknown-route behavior).

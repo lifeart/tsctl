@@ -55,6 +55,14 @@ type WhoIser interface {
 // RouterView (the device's ACTUAL state, never optimistic).
 type Controller interface {
 	SetExitNode(ctx context.Context, routerID, targetStableID string) (store.RouterView, error)
+	// Probe runs a read-only SSH diagnostic against the router. An SSH failure is
+	// a RESULT (ProbeResult.OK=false), not an error; only a router-not-found (or
+	// similar) returns a non-nil error (mapped to its HTTP status).
+	Probe(ctx context.Context, routerID string) (store.ProbeResult, error)
+	// RefreshGroups re-renders the snapshot's zone (group) view from the live store
+	// and broadcasts it, so a group create/edit/delete is reflected immediately
+	// (no router SSH). The api calls it after every successful group mutation.
+	RefreshGroups()
 }
 
 // GroupStore is the CRUD seam for zone/group definitions (DESIGN
@@ -144,6 +152,11 @@ func (a *API) Routes() http.Handler {
 	data.HandleFunc("GET /api/nodes", a.handleNodes)
 	data.HandleFunc("GET /api/routers/{id}", a.handleRouter)
 	data.HandleFunc("POST /api/routers/{id}/exit-node", a.handleSetExitNode)
+	// Read-only "test SSH + get router stats" probe. Registered on the SAME data
+	// mux as exit-node, so it inherits the identical middleware stack: RequireAuth
+	// (here) + RequireHost + RequireCSRF (outer) -- a state-changing POST requires
+	// auth + a valid CSRF token + an allowed Host, exactly like exit-node.
+	data.HandleFunc("POST /api/routers/{id}/probe", a.handleProbe)
 	// Zone/group CRUD (DESIGN docs/design/zones.md). Same middleware as the data
 	// routes: RequireAuth (here) + RequireHost + RequireCSRF (outer). The writes
 	// thus require auth + a valid CSRF token + an allowed Host, like exit-node.
@@ -446,6 +459,38 @@ func (a *API) handleSetExitNode(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, routerViewDTO(rv))
 }
 
+// handleProbe runs the read-only "test SSH" diagnostic for the router {id} and
+// returns the ProbeResult as JSON (200). There is no request body. An SSH/command
+// failure is a RESULT (ProbeResult.OK=false) returned with 200; only a control
+// error (e.g. unknown router) maps to a 4xx via the SAME structural status/detail/
+// stderr mapping as handleSetExitNode.
+func (a *API) handleProbe(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	res, err := a.ctrl.Probe(r.Context(), id)
+	if err != nil {
+		status := http.StatusBadGateway
+		detail := ""
+		stderr := ""
+		var hs interface{ HTTPStatus() int }
+		if errors.As(err, &hs) {
+			status = hs.HTTPStatus()
+		}
+		var de interface{ Detail() string }
+		if errors.As(err, &de) {
+			detail = de.Detail()
+		}
+		var se interface{ Stderr() string }
+		if errors.As(err, &se) {
+			stderr = se.Stderr()
+		}
+		writeErrDetail(w, status, err.Error(), detail, stderr)
+		return
+	}
+	// res IS the frozen wire shape (store.ProbeResult carries the JSON tags), so it
+	// is written directly: {ok, durationMs, output?, error?, checkedAt}.
+	writeJSON(w, http.StatusOK, res)
+}
+
 // --- group (zone) CRUD handlers (DESIGN docs/design/zones.md) ------------------
 
 // groupReqLimit caps a group request body (defense-in-depth; member lists are
@@ -480,6 +525,7 @@ func (a *API) handleCreateGroup(w http.ResponseWriter, r *http.Request) {
 		writeGroupErr(w, err)
 		return
 	}
+	a.ctrl.RefreshGroups() // re-render + broadcast so the new zone appears at once
 	writeJSON(w, http.StatusCreated, groupDTO(g))
 }
 
@@ -500,6 +546,7 @@ func (a *API) handleUpdateGroup(w http.ResponseWriter, r *http.Request) {
 		writeGroupErr(w, err)
 		return
 	}
+	a.ctrl.RefreshGroups() // re-render + broadcast so the edit appears at once
 	writeJSON(w, http.StatusOK, groupDTO(g))
 }
 
@@ -509,6 +556,7 @@ func (a *API) handleDeleteGroup(w http.ResponseWriter, r *http.Request) {
 		writeGroupErr(w, err)
 		return
 	}
+	a.ctrl.RefreshGroups() // re-render + broadcast so the deletion appears at once
 	w.WriteHeader(http.StatusNoContent)
 }
 

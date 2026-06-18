@@ -34,6 +34,12 @@ type fakeController struct {
 	err         error
 	gotRouterID string
 	gotTarget   string
+
+	probeRes   store.ProbeResult
+	probeErr   error
+	gotProbeID string
+
+	refreshGroupsCalls int
 }
 
 func (f *fakeController) SetExitNode(ctx context.Context, routerID, targetStableID string) (store.RouterView, error) {
@@ -41,6 +47,13 @@ func (f *fakeController) SetExitNode(ctx context.Context, routerID, targetStable
 	f.gotTarget = targetStableID
 	return f.rv, f.err
 }
+
+func (f *fakeController) Probe(ctx context.Context, routerID string) (store.ProbeResult, error) {
+	f.gotProbeID = routerID
+	return f.probeRes, f.probeErr
+}
+
+func (f *fakeController) RefreshGroups() { f.refreshGroupsCalls++ }
 
 // ctrlErr mirrors the structural error the poller returns (status/detail/stderr).
 type ctrlErr struct {
@@ -570,6 +583,138 @@ func TestHandleSetExitNode_GenericErrorIs502(t *testing.T) {
 	}
 }
 
+func TestHandleProbe_OK(t *testing.T) {
+	checkedAt := time.Date(2026, 6, 18, 10, 0, 0, 0, time.UTC)
+	fc := &fakeController{probeRes: store.ProbeResult{
+		OK: true, DurationMs: 42, Output: "Linux router 5.15", CheckedAt: checkedAt,
+	}}
+	a := New(store.New(), fakeWhoIs{login: "alice"}, fc, Config{Owner: "alice"})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/routers/r1/probe", nil)
+	req.SetPathValue("id", "r1")
+	a.handleProbe(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("code = %d body=%s", rec.Code, rec.Body)
+	}
+	if fc.gotProbeID != "r1" {
+		t.Errorf("controller called with %q, want r1", fc.gotProbeID)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got["ok"] != true {
+		t.Errorf("ok = %v, want true", got["ok"])
+	}
+	if got["durationMs"].(float64) != 42 {
+		t.Errorf("durationMs = %v, want 42", got["durationMs"])
+	}
+	if got["output"] != "Linux router 5.15" {
+		t.Errorf("output = %v", got["output"])
+	}
+	if got["checkedAt"] != "2026-06-18T10:00:00Z" {
+		t.Errorf("checkedAt = %v, want RFC3339", got["checkedAt"])
+	}
+	// error is omitempty -> absent on success.
+	if _, ok := got["error"]; ok {
+		t.Errorf("error key must be omitted on success, got %v", got["error"])
+	}
+}
+
+func TestHandleProbe_SSHFailIs200(t *testing.T) {
+	checkedAt := time.Date(2026, 6, 18, 10, 0, 0, 0, time.UTC)
+	// An SSH failure is a RESULT (OK:false + error), returned with 200 -- not an
+	// HTTP error.
+	fc := &fakeController{probeRes: store.ProbeResult{
+		OK: false, DurationMs: 12, Error: "ssh handshake failed", CheckedAt: checkedAt,
+	}}
+	a := New(store.New(), fakeWhoIs{login: "alice"}, fc, Config{Owner: "alice"})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/routers/r1/probe", nil)
+	req.SetPathValue("id", "r1")
+	a.handleProbe(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("ssh-fail probe code = %d want 200 (result, not error)", rec.Code)
+	}
+	var got map[string]any
+	json.Unmarshal(rec.Body.Bytes(), &got)
+	if got["ok"] != false {
+		t.Errorf("ok = %v, want false", got["ok"])
+	}
+	if got["error"] != "ssh handshake failed" {
+		t.Errorf("error = %v", got["error"])
+	}
+	// output is omitempty -> absent when empty.
+	if _, ok := got["output"]; ok {
+		t.Errorf("output key must be omitted when empty, got %v", got["output"])
+	}
+}
+
+func TestHandleProbe_NotFoundIs404(t *testing.T) {
+	fc := &fakeController{probeErr: &ctrlErr{status: 404, msg: `unknown router "ghost"`}}
+	a := New(store.New(), fakeWhoIs{login: "alice"}, fc, Config{Owner: "alice"})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/routers/ghost/probe", nil)
+	req.SetPathValue("id", "ghost")
+	a.handleProbe(rec, req)
+
+	if rec.Code != 404 {
+		t.Fatalf("code = %d want 404", rec.Code)
+	}
+	var got map[string]string
+	json.Unmarshal(rec.Body.Bytes(), &got)
+	if got["error"] == "" {
+		t.Errorf("404 body must carry an error, got %v", got)
+	}
+}
+
+// TestRoutes_ProbeSecurity proves the probe route runs through the SAME middleware
+// as exit-node: missing CSRF -> 403, non-owner with no session -> 401, and a valid
+// owner + CSRF + Host POST -> 200.
+func TestRoutes_ProbeSecurity(t *testing.T) {
+	const host = "tsctl"
+	fc := &fakeController{probeRes: store.ProbeResult{OK: true, CheckedAt: time.Now()}}
+	a := New(store.New(), fakeWhoIs{login: "alice"}, fc, Config{Owner: "alice", AllowedHosts: []string{host}})
+	h := a.Routes()
+
+	// Missing CSRF -> 403.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/routers/r1/probe", nil)
+	req.Host = host
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("probe missing CSRF = %d want 403", rec.Code)
+	}
+
+	// Valid owner + CSRF + Host -> 200.
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/routers/r1/probe", nil)
+	req.Host = host
+	req.Header.Set("X-Tsctl-CSRF", "tok")
+	req.AddCookie(&http.Cookie{Name: "tsctl_csrf", Value: "tok"})
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("valid probe = %d want 200 body=%s", rec.Code, rec.Body)
+	}
+	if fc.gotProbeID != "r1" {
+		t.Errorf("controller probed %q, want r1", fc.gotProbeID)
+	}
+
+	// Non-owner, no session -> 401 (even with valid CSRF).
+	a2 := New(store.New(), fakeWhoIs{login: "bob"}, &fakeController{}, Config{Owner: "alice", AllowedHosts: []string{host}})
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/routers/r1/probe", nil)
+	req.Host = host
+	req.Header.Set("X-Tsctl-CSRF", "tok")
+	req.AddCookie(&http.Cookie{Name: "tsctl_csrf", Value: "tok"})
+	a2.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("non-owner probe = %d want 401", rec.Code)
+	}
+}
+
 // --- group (zone) handlers ----------------------------------------------------
 
 // newGroupAPI wires an API over a REAL groups.Store (temp file) so the handler
@@ -582,6 +727,56 @@ func newGroupAPI(t *testing.T) *API {
 	}
 	return New(store.New(), fakeWhoIs{login: "alice"}, &fakeController{},
 		Config{Owner: "alice", AllowedHosts: []string{"tsctl"}, Groups: gs})
+}
+
+// TestGroupMutations_TriggerRefresh covers the zone-create-invisible fix: every
+// SUCCESSFUL group mutation must call RefreshGroups (which rebuilds + broadcasts
+// the snapshot so the new/edited/deleted zone shows immediately); a REJECTED
+// mutation must not.
+func TestGroupMutations_TriggerRefresh(t *testing.T) {
+	gs, err := groups.New(filepath.Join(t.TempDir(), "groups.json"))
+	if err != nil {
+		t.Fatalf("groups.New: %v", err)
+	}
+	ctrl := &fakeController{}
+	a := New(store.New(), fakeWhoIs{login: "alice"}, ctrl,
+		Config{Owner: "alice", AllowedHosts: []string{"tsctl"}, Groups: gs})
+
+	rec := httptest.NewRecorder()
+	a.handleCreateGroup(rec, httptest.NewRequest(http.MethodPost, "/api/groups", strings.NewReader(`{"name":"work"}`)))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create code = %d body=%s", rec.Code, rec.Body)
+	}
+	if ctrl.refreshGroupsCalls != 1 {
+		t.Fatalf("a successful create must RefreshGroups once, got %d", ctrl.refreshGroupsCalls)
+	}
+	var created map[string]any
+	json.Unmarshal(rec.Body.Bytes(), &created)
+	id, _ := created["id"].(string)
+
+	// A rejected create (empty name) must NOT refresh.
+	rec = httptest.NewRecorder()
+	a.handleCreateGroup(rec, httptest.NewRequest(http.MethodPost, "/api/groups", strings.NewReader(`{"name":"   "}`)))
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("invalid create = %d, want 422", rec.Code)
+	}
+	if ctrl.refreshGroupsCalls != 1 {
+		t.Errorf("a rejected create must NOT RefreshGroups, calls = %d", ctrl.refreshGroupsCalls)
+	}
+
+	ureq := httptest.NewRequest(http.MethodPut, "/api/groups/"+id, strings.NewReader(`{"name":"work2"}`))
+	ureq.SetPathValue("id", id)
+	a.handleUpdateGroup(httptest.NewRecorder(), ureq)
+	if ctrl.refreshGroupsCalls != 2 {
+		t.Errorf("update must RefreshGroups, calls = %d", ctrl.refreshGroupsCalls)
+	}
+
+	dreq := httptest.NewRequest(http.MethodDelete, "/api/groups/"+id, nil)
+	dreq.SetPathValue("id", id)
+	a.handleDeleteGroup(httptest.NewRecorder(), dreq)
+	if ctrl.refreshGroupsCalls != 3 {
+		t.Errorf("delete must RefreshGroups, calls = %d", ctrl.refreshGroupsCalls)
+	}
 }
 
 func TestHandleGroups_CRUD(t *testing.T) {

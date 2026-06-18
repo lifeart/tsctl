@@ -56,6 +56,14 @@ out-of-zone target (the union of a consumer's zones), so the policy holds no
 matter how the change is issued. Zones are server-side (`$STATE_DIR/groups.json`)
 and edited in the UI; a "Devices" tab shows the classic per-router cards.
 
+Each router card (and consumer) has a **Test SSH** button: a one-off, read-only
+diagnostic over the configured router transport that proves connectivity *end to
+end* (dial → auth → exec) and prints live stats (kernel, uptime, load, memory).
+On success you get `✓ SSH OK · <ms>` + the output; on failure the **exact reason**
+(auth / host-key mismatch / offline / no address mapping). It is **manual** — tsctl
+never auto-probes; this is how you check a device, especially one the non-exit-node
+fallback listed as "not probed".
+
 Try all of it — drag, zones, the offline/unconfirmed/control-error states, the
 enforcement rejection — in the [live demo](https://lifeart.github.io/tsctl/) or
 locally via `tsctl demo`.
@@ -133,6 +141,12 @@ Everything required to bring tsctl up, in one place. A copy-paste template is in
    identity allowed to view/control (everyone else is denied, fail-closed).
 3. **Router IPs** (`TSCTL_ROUTERS`) — *optional.* Leave empty and tsctl
    auto-discovers every `tag:router` node; set it only to pin an explicit subset.
+   **No `tag:router` nodes at all?** tsctl falls back to listing *every non-exit
+   node* as a controllable consumer (so you needn't tag anything) — but it does
+   **not** auto-SSH them; a tailnet can have many devices. They show **"not
+   probed"** until you click **Test SSH** or set an exit node (both contact the
+   device on demand). Only `tag:router`/`TSCTL_ROUTERS` devices are actively
+   polled — tag your routers (or pin them) to scope that set.
 4. **The ACL** below (`tag:tsctl` → `tag:router`, ssh `accept`, `users:["root"]`).
 5. **Tailscale SSH enabled on each router** (`tailscale set --ssh`).
 
@@ -147,7 +161,7 @@ env equivalent.
 | `-owner` | `TSCTL_OWNER` | — | one of† | tailnet login allowed to control (tailnet auth path) |
 | `-ui-password` | `TSCTL_UI_PASSWORD` | — | one of† | shared password for the host-port/session auth path; **required** when `-http-listen` is set |
 | `-http-listen` | `TSCTL_HTTP_LISTEN` | — (off) | no | ALSO serve the UI+API on this host socket, e.g. `:8080` (separate from `/healthz`); requires `-ui-password` |
-| `-routers` | `TSCTL_ROUTERS` | — (auto) | no | comma-separated router `100.x` IPv4s; **empty = auto-discover all `tag:router` nodes** |
+| `-routers` | `TSCTL_ROUTERS` | — (auto) | no | comma-separated router `100.x` IPv4s; **empty = auto-discover all `tag:router` nodes** (or, if none exist, list every non-exit node as an unprobed consumer — see the checklist) |
 | `-hostname` | `TSCTL_HOSTNAME` | `tsctl` | no | node hostname; the UI URL `http://<hostname>/` |
 | `-state-dir` | `TSCTL_STATE_DIR` | `./tsnet-state` (or systemd `STATE_DIRECTORY`) | no | node key store — **must persist** (treat as a private key) |
 | `-listen` | `TSCTL_LISTEN` | `:80` | no | tailnet-side listen address |
@@ -473,7 +487,7 @@ policy it will loop on a fatal startup error. Match the log line:
 | `tsnet.Up: backend: requested tags [tag:tsctl] are invalid or not permitted` | The tag can't be applied: `tag:tsctl` is **missing from the ACL `tagOwners`**, and/or the auth key **doesn't carry `tag:tsctl`**. | Add `tag:tsctl` (+ `tag:router`) to `tagOwners` (see [Required ACL](#required-acl)), **and** generate the auth key / OAuth client **with the `tag:tsctl` tag**. Both are required. |
 | `LocalBackend state is NeedsLogin` repeating with one of the above | Not enrolled yet; tsnet keeps retrying the bad `TS_AUTHKEY`. | Fix the key/tag error above — it enrolls once, then persists and stops needing the token. If it still loops after a known-good key, the state volume may hold stale partial state: clear `tsctl-state` and retry. |
 | UI on the host port shows a blank/blocked page; logs show a **403** | The anti-DNS-rebinding **Host check** rejected the address you browsed to. | Add that hostname/IP (without the port) to `TSCTL_ALLOWED_HOSTS` — see [Reaching the UI](#run-on-a-nas-docker). |
-| Router shows **"Control error"** (online, but tsctl can't drive it) | SSH to the router failed: wrong `ssh`/`ip-password` setup — bad password, host-key mismatch, missing `TSCTL_ROUTER_ADDRS` mapping, or the ACL/`tailscale set --ssh` not done. | Prove the path in isolation with [`tsctl spike <100.x>`](#tsctl-spike--prove-the-router-transport-on-your-real-network); the error it prints is the exact reason. |
+| Router shows **"Control error"** (online, but tsctl can't drive it) | SSH to the router failed: wrong `ssh`/`ip-password` setup — bad password, host-key mismatch, missing `TSCTL_ROUTER_ADDRS` mapping, or the ACL/`tailscale set --ssh` not done. | Click **Test SSH** on the router card for the exact reason, or prove the path in isolation with [`tsctl spike <100.x>`](#tsctl-spike--prove-the-router-transport-on-your-real-network). |
 
 When in doubt, prove the two external dependencies separately before running the
 full server: **enrollment** (the token + tags + ACL — the node appears in your

@@ -534,6 +534,9 @@ body {
 /* Online in the netmap but tsctl can't control it: amber (a problem that needs
    attention), distinct from red genuine-offline/unreachable. */
 .state-control-error { background: var(--amber-tint); color: var(--c-amber); }
+/* Listed by the fallback but never auto-probed: neutral grey — NOT a problem,
+   just unknown until a manual Test SSH. */
+.state-unprobed { background: var(--fill); color: var(--text-secondary); }
 
 /* ----------------------------------------------- picker / select ------- */
 .picker { margin-top: 0.85rem; }
@@ -617,6 +620,56 @@ body {
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+/* ----------------------------------------------- SSH probe ------------- */
+.probe { margin-top: 0.7rem; }
+.probe-btn {
+  font: inherit;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--c-accent);
+  background: var(--fill);
+  border: none;
+  border-radius: var(--radius-pill);
+  padding: 0.3rem 0.85rem;
+  min-height: 32px;
+  cursor: pointer;
+  transition: background var(--t), opacity var(--t);
+}
+.probe-btn:hover { background: var(--fill-strong); }
+.probe-btn:disabled { opacity: 0.7; cursor: progress; }
+.probe-btn .spinner { width: 0.85rem; height: 0.85rem; }
+
+.probe-result {
+  margin-top: 0.55rem;
+  padding: 0.55rem 0.7rem;
+  border-radius: var(--radius);
+  font-size: 0.8125rem;
+  line-height: 1.4;
+}
+.probe-result.hidden { display: none; }
+.probe-result.ok { background: var(--green-tint); color: var(--c-green); }
+.probe-result.is-fail { background: var(--red-tint); color: var(--c-red); }
+.probe-status { font-weight: 600; }
+.probe-detail { margin-top: 0.3rem; word-break: break-word; white-space: pre-wrap; }
+.probe-output {
+  margin: 0.45rem 0 0;
+  padding: 0.5rem 0.6rem;
+  max-height: 9rem;
+  overflow: auto;
+  background: var(--card-nested);
+  color: var(--text);
+  border-radius: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.75rem;
+  line-height: 1.45;
+  white-space: pre;
+  -webkit-overflow-scrolling: touch;
+}
+.probe-when { margin-top: 0.35rem; font-size: 0.75rem; opacity: 0.8; }
 
 /* ----------------------------------------------- empty / footer -------- */
 .empty {
@@ -967,6 +1020,10 @@ body {
    like genuine-offline (the device is up; the control path is the problem). */
 .gnode.is-control-error { border: 1px solid var(--amber); }
 .gnode.is-control-error .gnode-name { color: var(--text); }
+/* Unprobed (fallback-listed, not yet contacted): dashed edge = "unknown, not a
+   failure". The device is interactive (set on demand) so the name stays readable. */
+.gnode.is-unprobed { border: 1px dashed var(--border); }
+.gnode.is-unprobed .gnode-name { color: var(--text); }
 .gnode.is-drop-hover { outline: 2px solid var(--accent); outline-offset: 2px; background: var(--accent-tint); }
 .gnode-head { display: flex; align-items: center; gap: 0.45rem; min-width: 0; }
 .gnode-name {

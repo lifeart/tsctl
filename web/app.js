@@ -45,6 +45,7 @@
     busyTarget: {},    // stableID -> the value picked while busy
     actionErrors: {},  // stableID -> {error, detail, stderr}
     pendingSince: {},  // stableID -> ms when the pending/applying began (countdown)
+    probes: {},        // stableID -> {busy} | {data:{ok,durationMs,output|error,checkedAt}} | {netError} (transient SSH-probe result; not from the snapshot)
     es: null,
     reconnectTimer: null,
     reconnectDelay: RECONNECT_MIN,
@@ -411,6 +412,16 @@
     var stats = el("div", "stats");
     var errBox = el("div", "error-box hidden");
 
+    // SSH probe ("Test SSH"): a per-router connectivity check, separate from the
+    // exit-node mutation. The result is a TRANSIENT UI thing (state.probes[sid]) —
+    // never persisted, never part of the snapshot. Re-clicking re-probes + replaces.
+    var probe = el("div", "probe");
+    var probeBtn = el("button", "probe-btn", "Test SSH");
+    probeBtn.type = "button";
+    var probeResult = el("div", "probe-result hidden");
+    probe.appendChild(probeBtn);
+    probe.appendChild(probeResult);
+
     root.appendChild(head);
     root.appendChild(ips);
     root.appendChild(currentLine);
@@ -421,14 +432,16 @@
     root.appendChild(pending);
     root.appendChild(stats);
     root.appendChild(errBox);
+    root.appendChild(probe);
 
     select.addEventListener("change", function () { onSelectChange(sid, select); });
+    probeBtn.addEventListener("click", function () { onProbe(sid); });
 
     return {
       root: root, dot: dot, name: name, stateBadge: stateBadge, ips: ips,
       currentLine: currentLine, currentText: currentText, warn: warn, warnText: warnText,
       offlineNote: offlineNote, picker: picker, pickerHint: pickerHint, select: select, pending: pending,
-      stats: stats, errBox: errBox, optionsSig: null,
+      stats: stats, errBox: errBox, probeBtn: probeBtn, probeResult: probeResult, optionsSig: null,
     };
   }
 
@@ -534,7 +547,11 @@
       disabled = true;
     } else {
       val = rv.currentExitNode ? rv.currentExitNode.stableID : "";
-      disabled = !reachable;
+      // An unprobed fallback device is reachable-UNKNOWN, not unreachable: keep the
+      // picker enabled so the user can set an exit node on demand (that's what
+      // contacts it). Genuinely offline/unreachable devices stay disabled.
+      var unprobed = (rv.state || "") === "unprobed";
+      disabled = !reachable && !unprobed;
     }
     ensureOption(sel, val);
     if (sel.value !== (val == null ? "" : val)) sel.value = val == null ? "" : val;
@@ -546,11 +563,15 @@
     var sid = node.stableID;
     var online = node.online === true;
     var reachable = rv.reachable !== false && online;
+    var st = rv.state || (online ? "ok" : "unreachable");
+    // Listed by the non-exit-node fallback but never auto-probed: a NEUTRAL "not
+    // probed" — tsctl hasn't contacted it (probing is manual on a large tailnet).
+    // Not an error, not offline; resolved by a manual Test SSH or an exit-node set.
+    var unprobed = st === "unprobed";
     // Online in the netmap but tsctl can't control it (reachable === false): a
     // DISTINCT control error (wrong ip-password / host-key mismatch / no addr
-    // mapping), NOT "offline". The genuine-offline path (!online) is kept separate.
-    var controlError = online && rv.reachable === false;
-    var st = rv.state || (online ? "ok" : "unreachable");
+    // mapping), NOT "offline" and NOT merely "unprobed".
+    var controlError = online && rv.reachable === false && !unprobed;
     var localBusy = !!state.busyRouters[sid];
 
     var routerName = node.name || node.hostname || sid || "(router)";
@@ -559,7 +580,10 @@
     var pickerLabel = "Route " + routerName + "’s internet through";
     if (rec.select.getAttribute("aria-label") !== pickerLabel) rec.select.setAttribute("aria-label", pickerLabel);
     setDot(rec.dot, online);
-    if (controlError) {
+    if (unprobed) {
+      setText(rec.stateBadge, "not probed");
+      rec.stateBadge.className = "state state-unprobed";
+    } else if (controlError) {
       setText(rec.stateBadge, "control error");
       rec.stateBadge.className = "state state-control-error";
     } else {
@@ -572,7 +596,10 @@
 
     // current exit node line (greyed/last-known when offline)
     var curRef = rv.currentExitNode;
-    if (!reachable) {
+    if (unprobed && !curRef) {
+      setText(rec.currentText, "Exit node unknown — not probed yet");
+      rec.currentLine.classList.add("is-stale");
+    } else if (!reachable) {
       setText(rec.currentText, curRef ? "Last known: routing through " + shortLabel(curRef) : "Last known: direct");
       rec.currentLine.classList.add("is-stale");
     } else {
@@ -580,8 +607,11 @@
       rec.currentLine.classList.remove("is-stale");
     }
 
-    // offline note (control disabled) — control-error vs genuine-offline wording.
-    if (controlError) {
+    // offline note — unprobed (neutral) vs control-error vs genuine-offline wording.
+    if (unprobed) {
+      setText(rec.offlineNote, "Not probed yet — tsctl lists this device but hasn’t contacted it. Use Test SSH to check connectivity, or pick an exit node to control it.");
+      show(rec.offlineNote, true);
+    } else if (controlError) {
       // Device is online; the CONTROL path failed. The raw rv.lastError is shown in
       // the error box below (don't duplicate it here).
       setText(rec.offlineNote, "Control error — the device is online, but tsctl can’t control it (e.g. wrong ip-password, host-key mismatch, or no address mapping). See the error below.");
@@ -667,6 +697,93 @@
       setText(rec.errBox, "");
       rec.errBox.className = "error-box hidden";
     }
+
+    renderProbe(rec, sid);
+  }
+
+  // ------------------------------------------------------------ SSH probe ---
+  // Per-router "Test SSH": disable the button + show "Probing…", POST to the
+  // probe endpoint (same CSRF/auth flow as the exit-node write via apiWrite),
+  // then render the device's ACTUAL result. Never silently swallows a failure —
+  // a transport/network error shows inline (CLAUDE.md). Result is transient.
+  function onProbe(sid) {
+    if (!sid) return;
+    var p = state.probes[sid];
+    if (p && p.busy) return;      // a probe is already in flight for this router
+    state.probes[sid] = { busy: true };
+    render();                     // show "Probing…" immediately (doesn't block other cards)
+    runProbe(sid);
+  }
+
+  function runProbe(sid) {
+    // apiWrite mirrors the exit-node POST path exactly: CSRF header, 401 →
+    // promptLogin (resolves undefined), 403 → refresh token + retry once. No body.
+    apiWrite("POST", "/api/routers/" + encodeURIComponent(sid) + "/probe", null)
+      .then(function (res) {
+        if (!res) { delete state.probes[sid]; return; } // 401 → login overlay took over
+        if (res.status === 404) {
+          state.probes[sid] = { busy: false, netError: "This router is no longer known to tsctl (404)." };
+          return;
+        }
+        if (!res.ok) {
+          var msg = (res.data && (res.data.error || res.data.detail)) || ("Probe failed (HTTP " + res.status + ").");
+          state.probes[sid] = { busy: false, netError: msg };
+          return;
+        }
+        // 200: {ok, durationMs, output|error, checkedAt}. ok:false is a REAL probe
+        // result (auth/host-key/dial/offline), not an HTTP error — render it as such.
+        state.probes[sid] = { busy: false, data: res.data || {} };
+      })
+      .catch(function (err) {
+        state.probes[sid] = { busy: false, netError: String((err && err.message) || err) };
+      })
+      .then(function () { render(); });
+  }
+
+  function renderProbe(rec, sid) {
+    var p = state.probes[sid];
+    var btn = rec.probeBtn, box = rec.probeResult;
+    if (!p) {
+      btn.disabled = false;
+      setText(btn, "Test SSH");
+      setText(box, "");
+      box.className = "probe-result hidden";
+      return;
+    }
+    if (p.busy) {
+      btn.disabled = true;
+      btn.textContent = "";
+      btn.appendChild(spinnerIcon());
+      btn.appendChild(document.createTextNode(" Probing…"));
+      setText(box, "");
+      box.className = "probe-result hidden";
+      return;
+    }
+    btn.disabled = false;
+    setText(btn, "Test SSH");
+    box.textContent = "";
+    if (p.netError) {
+      box.className = "probe-result is-fail";
+      box.appendChild(el("div", "probe-status", "✗ SSH probe failed"));
+      box.appendChild(el("div", "probe-detail", p.netError));
+      return;
+    }
+    var d = p.data || {};
+    var dur = (typeof d.durationMs === "number") ? " · " + d.durationMs + " ms" : "";
+    if (d.ok) {
+      box.className = "probe-result ok";
+      box.appendChild(el("div", "probe-status", "✓ SSH OK" + dur));
+      if (d.output) {
+        var pre = el("pre", "probe-output");
+        pre.textContent = String(d.output);
+        box.appendChild(pre);
+      }
+    } else {
+      box.className = "probe-result is-fail";
+      box.appendChild(el("div", "probe-status", "✗ SSH failed" + dur));
+      if (d.error) box.appendChild(el("div", "probe-detail", String(d.error)));
+    }
+    if (d.checkedAt && parseTime(d.checkedAt)) box.appendChild(el("div", "probe-when", "Checked " + relTime(d.checkedAt)));
   }
 
   // --------------------------------------------------- pick + confirm flow ---
@@ -944,16 +1061,20 @@
     var node = rv.node || {};
     var online = node.online === true;
     var reachable = rv.reachable !== false && online;
+    var st = rv.state || (online ? "ok" : "unreachable");
+    // Listed by the non-exit-node fallback but never auto-probed: NEUTRAL "not
+    // probed" (manual Test SSH / set), not an error and not offline.
+    var unprobed = st === "unprobed";
     // Online in the netmap but tsctl can't control it (reachable === false): a
     // distinct CONTROL error (wrong ip-password / host-key mismatch / no addr
-    // mapping), NOT "offline". Keep the genuine-offline path (!online) separate.
-    var controlError = online && rv.reachable === false;
-    var st = rv.state || (online ? "ok" : "unreachable");
+    // mapping), NOT "offline" and NOT merely "unprobed".
+    var controlError = online && rv.reachable === false && !unprobed;
     var localBusy = !!state.busyRouters[c.sid];
     var cur = rv.currentExitNode;
     var wire;
     if (localBusy || st === "pending") wire = "pending";
     else if (st === "unconfirmed") wire = "unconfirmed";
+    else if (unprobed) wire = "off";
     else if (!reachable || st === "unreachable") wire = "off";
     else wire = "ok";
     // Union-correct (fix): a current exit node is only "out of zone" if NONE of the
@@ -964,7 +1085,7 @@
       var union = allowedUnionFor(c.sid);
       outOfZone = union.inAnyZone && !union.set[cur.stableID];
     }
-    return { online: online, reachable: reachable, controlError: controlError, st: st, localBusy: localBusy, cur: cur, wire: wire, outOfZone: outOfZone };
+    return { online: online, reachable: reachable, controlError: controlError, unprobed: unprobed, st: st, localBusy: localBusy, cur: cur, wire: wire, outOfZone: outOfZone };
   }
 
   function createConsumerNode(item) {
@@ -1028,7 +1149,10 @@
 
     setDot(rec.dot, s.online);
     var stMap = { ok: "connected", pending: "applying", unconfirmed: "unconfirmed", unreachable: "offline" };
-    if (s.controlError) {
+    if (s.unprobed) {
+      setText(rec.state, "not probed");
+      rec.state.className = "gnode-state state-unprobed";
+    } else if (s.controlError) {
       setText(rec.state, "control error");
       rec.state.className = "gnode-state state-control-error";
     } else {
@@ -1041,6 +1165,7 @@
     else if (s.st === "pending") { subText = "Applying " + shortLabel(rv.desired) + countdownSuffix(item.sid); ariaConn = "applying " + shortLabel(rv.desired); }
     else if (s.st === "unconfirmed") { subText = "Sent to " + shortLabel(rv.desired) + " — not confirmed"; ariaConn = "sent to " + shortLabel(rv.desired) + ", not confirmed"; }
     else if (s.controlError) { subText = "Control error — can’t control"; ariaConn = "control error, tsctl can’t control this router"; }
+    else if (s.unprobed) { subText = "Not probed — Test SSH, or pick an exit node"; ariaConn = "not probed yet"; }
     else if (!s.reachable) { subText = "Offline — control disabled"; ariaConn = "offline, control disabled"; }
     else if (s.cur) { subText = "→ " + shortLabel(s.cur) + (s.outOfZone ? " (out of zone)" : ""); ariaConn = "routing through " + shortLabel(s.cur) + (s.outOfZone ? ", out of zone" : ""); }
     else { subText = "Direct — no exit node"; ariaConn = "direct, no exit node"; }
@@ -1049,12 +1174,14 @@
     // Disabled while settling (busy/pending/unconfirmed) or offline/control-error —
     // mirrors the card picker; the never-optimistic machine owns the transition.
     var settling = s.localBusy || s.st === "pending" || s.st === "unconfirmed";
-    var interactive = s.reachable && !settling;
+    // Unprobed devices are reachable-UNKNOWN, not unreachable: keep them actionable
+    // so the user can set an exit node (which contacts them) without probing first.
+    var interactive = (s.reachable || s.unprobed) && !settling;
     rec.interactive = interactive;
     rec.root.className = "gnode gnode-consumer"
       + (settling ? " is-busy" : "")
       + (s.controlError ? " is-control-error" : "")
-      + (s.reachable ? "" : " is-off")
+      + (s.unprobed ? " is-unprobed" : (s.reachable ? "" : " is-off"))
       + (interactive ? " is-actionable" : "");
     if (interactive) {
       rec.root.setAttribute("tabindex", "0");

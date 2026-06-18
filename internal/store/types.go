@@ -50,6 +50,12 @@ const (
 	RouterPending     RouterState = "pending"
 	RouterUnconfirmed RouterState = "unconfirmed"
 	RouterUnreachable RouterState = "unreachable"
+	// RouterUnprobed is a router that is LISTED but has never been contacted:
+	// the non-exit-node auto-discovery fallback surfaces every device as a
+	// consumer WITHOUT auto-SSHing it (a tailnet can have many nodes), so its
+	// SSH state is unknown until a manual probe or an exit-node change. Neutral,
+	// not an error -- the UI shows "Not probed" + the Test SSH action.
+	RouterUnprobed RouterState = "unprobed"
 )
 
 // RouterStats are the counters of the router's CURRENT exit-node peer, read from
@@ -89,6 +95,20 @@ type RouterView struct {
 	Reachable       bool
 	LastError       string // "" = healthy; NEVER swallow -- surface here
 	LastConfirmedAt time.Time
+}
+
+// ProbeResult is the outcome of a read-only SSH diagnostic against a router
+// (the "test SSH + get router stats" probe). An SSH/transport failure is a
+// RESULT (OK=false + Error), not a Go error -- only a router-not-found surfaces
+// as an HTTP error. CheckedAt is always set. This type carries JSON tags (unlike
+// the other store types) because it IS the frozen wire shape the api writes back
+// directly for POST /api/routers/{id}/probe.
+type ProbeResult struct {
+	OK         bool      `json:"ok"`
+	DurationMs int64     `json:"durationMs"`
+	Output     string    `json:"output,omitempty"`
+	Error      string    `json:"error,omitempty"`
+	CheckedAt  time.Time `json:"checkedAt"`
 }
 
 // Group is the RAW, persisted/CRUD shape of a zone (DESIGN docs/design/zones.md):

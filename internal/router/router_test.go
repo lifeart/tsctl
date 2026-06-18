@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -312,6 +313,54 @@ func TestStatus_NonZeroExit(t *testing.T) {
 	c := newFakeClient(f, "")
 	if _, err := c.Status(context.Background(), "100.64.0.1"); err == nil {
 		t.Fatal("expected error for non-zero exit, got nil")
+	}
+}
+
+func TestProbe_OK(t *testing.T) {
+	f := &fakeRunner{respond: func(cmd string) ([]byte, []byte, int, error) {
+		if cmd == probeCmd {
+			return []byte("  Linux router 5.15.0\n12345.67 1000.00\n0.10 0.20 0.30  "), nil, 0, nil
+		}
+		return nil, nil, 0, nil
+	}}
+	c := newFakeClient(f, "")
+
+	out, err := c.Probe(context.Background(), "100.64.0.1")
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	if out != "Linux router 5.15.0\n12345.67 1000.00\n0.10 0.20 0.30" {
+		t.Errorf("probe output not trimmed/returned correctly: %q", out)
+	}
+	// Exactly one read-only command issued, against the probe command.
+	if got := f.cmds(); !eqStrings(got, []string{probeCmd}) {
+		t.Errorf("commands = %v, want [%q]", got, probeCmd)
+	}
+	if c := f.calls[0]; c.addr != "100.64.0.1" {
+		t.Errorf("probe addr = %q, want 100.64.0.1", c.addr)
+	}
+}
+
+func TestProbe_CommandError(t *testing.T) {
+	f := &fakeRunner{respond: func(cmd string) ([]byte, []byte, int, error) {
+		// The command RAN but exited non-zero, with stderr -- a *CommandError.
+		return nil, []byte("  uname: not found\n"), 127, nil
+	}}
+	c := newFakeClient(f, "")
+
+	_, err := c.Probe(context.Background(), "100.64.0.1")
+	if err == nil {
+		t.Fatal("expected a command error on a non-zero exit")
+	}
+	var ce *CommandError
+	if !errors.As(err, &ce) {
+		t.Fatalf("expected a *CommandError, got %T: %v", err, err)
+	}
+	if ce.Exit != 127 {
+		t.Errorf("exit = %d, want 127", ce.Exit)
+	}
+	if ce.Stderr() != "uname: not found" {
+		t.Errorf("stderr = %q, want trimmed %q", ce.Stderr(), "uname: not found")
 	}
 }
 

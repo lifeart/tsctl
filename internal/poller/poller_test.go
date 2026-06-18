@@ -24,18 +24,25 @@ type fakeNM struct {
 func (f *fakeNM) Inventory(ctx context.Context) ([]store.NodeView, error) { return f.nodes, f.err }
 
 type fakeRC struct {
-	mu         sync.Mutex
-	statusRT   store.RouterRuntime
-	statusErr  error
-	setRT      store.RouterRuntime
-	setErr     error
-	setCalls   int
-	lastAddr   string
-	lastTarget *store.ExitNodeRef
-	lastPrev   *store.ExitNodeRef
+	mu          sync.Mutex
+	statusRT    store.RouterRuntime
+	statusErr   error
+	statusCalls int
+	setRT       store.RouterRuntime
+	setErr      error
+	setCalls    int
+	lastAddr    string
+	lastTarget  *store.ExitNodeRef
+	lastPrev    *store.ExitNodeRef
+	probeOut    string
+	probeErr    error
+	probeCalls  int
 }
 
 func (f *fakeRC) Status(ctx context.Context, addr string) (store.RouterRuntime, error) {
+	f.mu.Lock()
+	f.statusCalls++
+	f.mu.Unlock()
 	return f.statusRT, f.statusErr
 }
 
@@ -47,7 +54,16 @@ func (f *fakeRC) SetExitNode(ctx context.Context, addr string, target, prev *sto
 	return f.setRT, f.setErr
 }
 
-func (f *fakeRC) calls() int { f.mu.Lock(); defer f.mu.Unlock(); return f.setCalls }
+func (f *fakeRC) Probe(ctx context.Context, addr string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.probeCalls++
+	return f.probeOut, f.probeErr
+}
+
+func (f *fakeRC) calls() int           { f.mu.Lock(); defer f.mu.Unlock(); return f.setCalls }
+func (f *fakeRC) statusCallCount() int { f.mu.Lock(); defer f.mu.Unlock(); return f.statusCalls }
+func (f *fakeRC) probeCallCount() int  { f.mu.Lock(); defer f.mu.Unlock(); return f.probeCalls }
 
 type fakeBC struct {
 	mu    sync.Mutex
@@ -149,6 +165,269 @@ func TestRefresh_AutoDiscoversRouters(t *testing.T) {
 			t.Errorf("auto-discovered a non-router: %+v", rv.Node)
 		}
 	}
+}
+
+func TestRefresh_FallbackListsWithoutProbing(t *testing.T) {
+	// No tag:router and no -routers: the fallback LISTS every non-exit, non-self
+	// node as a consumer, but must NOT auto-SSH any of them (a tailnet can be
+	// large -- probing is manual). They appear unprobed; the exit node and the
+	// tsctl self node (tag:tsctl) are excluded.
+	exitIP := "100.64.0.20"
+	nm := &fakeNM{nodes: []store.NodeView{
+		{StableID: "phone", TailscaleIPs: []string{"100.64.0.30"}, Online: true, Type: store.NodeGeneric},
+		{StableID: "laptop", TailscaleIPs: []string{"100.64.0.31"}, Online: true, Type: store.NodeGeneric},
+		{StableID: "exit1", TailscaleIPs: []string{exitIP}, Online: true, ExitNodeOption: true, Type: store.NodeExitNode},
+		{StableID: "self", TailscaleIPs: []string{"100.64.0.5"}, Online: true, Tags: []string{"tag:tsctl"}, Type: store.NodeGeneric},
+	}}
+	rc := &fakeRC{statusRT: store.RouterRuntime{Online: true}}
+	st := store.New()
+	p := New(st, nm, rc, nil, nil /* auto-discover -> fallback */, newFakeBC(), make(chan int), time.Second, nopLogf)
+
+	if err := p.Refresh(context.Background()); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	snap := st.Load()
+	if len(snap.Routers) != 2 {
+		t.Fatalf("fallback listed %d routers, want 2 (non-exit, non-self)", len(snap.Routers))
+	}
+	for _, rv := range snap.Routers {
+		if rv.State != store.RouterUnprobed {
+			t.Errorf("fallback router %s state = %q, want %q", primaryIP(rv.Node), rv.State, store.RouterUnprobed)
+		}
+		if rv.Reachable {
+			t.Errorf("fallback router %s must not be marked reachable before a probe", primaryIP(rv.Node))
+		}
+	}
+	if n := rc.statusCallCount(); n != 0 {
+		t.Errorf("fallback must NOT auto-SSH any device; Status calls = %d, want 0", n)
+	}
+}
+
+func TestRefreshGroups_RebuildsAndBroadcastsWithoutDial(t *testing.T) {
+	// Creating/editing a zone calls RefreshGroups: it must re-render Groups from the
+	// live store and broadcast IMMEDIATELY, without re-dialing any router.
+	routerIP := "100.64.0.10"
+	nm := &fakeNM{nodes: []store.NodeView{
+		{StableID: "r1", Name: "r1", TailscaleIPs: []string{routerIP}, Online: true, Type: store.NodeRouter},
+	}}
+	rc := &fakeRC{statusRT: store.RouterRuntime{Online: true}}
+	grp := &fakeGroups{}
+	bc := newFakeBC()
+	st := store.New()
+	p := New(st, nm, rc, grp, []string{routerIP}, bc, make(chan int), time.Second, nopLogf)
+
+	if err := p.Refresh(context.Background()); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if got := len(st.Load().Groups); got != 0 {
+		t.Fatalf("groups before = %d, want 0", got)
+	}
+	bc.mu.Lock()
+	broadcastsBefore := len(bc.snaps)
+	bc.mu.Unlock()
+	statusBefore := rc.statusCallCount()
+
+	// A zone is created in the store, then RefreshGroups is invoked (as the api does).
+	grp.list = []store.Group{{ID: "z1", Name: "Work", Consumers: []string{"r1"}}}
+	p.RefreshGroups()
+
+	snap := st.Load()
+	if len(snap.Groups) != 1 || snap.Groups[0].Name != "Work" {
+		t.Fatalf("after RefreshGroups, groups = %+v, want one named Work", snap.Groups)
+	}
+	if got := rc.statusCallCount(); got != statusBefore {
+		t.Errorf("RefreshGroups must not dial routers: Status calls %d -> %d", statusBefore, got)
+	}
+	bc.mu.Lock()
+	after := len(bc.snaps)
+	bc.mu.Unlock()
+	if after <= broadcastsBefore {
+		t.Errorf("RefreshGroups must broadcast the updated snapshot: snaps %d -> %d", broadcastsBefore, after)
+	}
+}
+
+func eqStrs(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestAutoDiscoverRouters_TagRouterWins(t *testing.T) {
+	// tag:router nodes present -> only those (sorted), usedFallback=false. Exit
+	// nodes and generic nodes are NOT discovered.
+	nodes := []store.NodeView{
+		{StableID: "rA", TailscaleIPs: []string{"100.64.0.11"}, Type: store.NodeRouter},
+		{StableID: "rB", TailscaleIPs: []string{"100.64.0.10"}, Type: store.NodeRouter},
+		{StableID: "exit1", TailscaleIPs: []string{"100.64.0.20"}, ExitNodeOption: true, Type: store.NodeExitNode},
+		{StableID: "laptop", TailscaleIPs: []string{"100.64.0.30"}, Type: store.NodeGeneric},
+	}
+	addrs, usedFallback := autoDiscoverRouters(nodes)
+	if usedFallback {
+		t.Fatal("tag:router nodes present -> usedFallback must be false")
+	}
+	if want := []string{"100.64.0.10", "100.64.0.11"}; !eqStrs(addrs, want) {
+		t.Errorf("addrs = %v, want %v (only tag:router, sorted)", addrs, want)
+	}
+}
+
+func TestAutoDiscoverRouters_Fallback(t *testing.T) {
+	// No tag:router nodes at all -> fallback to every non-exit, non-tsctl node that
+	// has a primary IP. Excludes: exit-capable nodes, the tag:tsctl self node, and
+	// any node without an IP.
+	nodes := []store.NodeView{
+		{StableID: "self", TailscaleIPs: []string{"100.64.0.1"}, Tags: []string{"tag:tsctl"}, Type: store.NodeGeneric},
+		{StableID: "exit1", TailscaleIPs: []string{"100.64.0.20"}, ExitNodeOption: true, Type: store.NodeExitNode},
+		{StableID: "nas", TailscaleIPs: []string{"100.64.0.31"}, Type: store.NodeGeneric},
+		{StableID: "laptop", TailscaleIPs: []string{"100.64.0.30"}, Type: store.NodeGeneric},
+		{StableID: "noip", Type: store.NodeGeneric},
+	}
+	addrs, usedFallback := autoDiscoverRouters(nodes)
+	if !usedFallback {
+		t.Fatal("no tag:router nodes -> usedFallback must be true")
+	}
+	if want := []string{"100.64.0.30", "100.64.0.31"}; !eqStrs(addrs, want) {
+		t.Errorf("fallback addrs = %v, want %v (exclude exit-capable, tag:tsctl self, and no-IP)", addrs, want)
+	}
+}
+
+// TestRefresh_OfflineRouterSkipsDial proves an offline router present in the
+// netmap is marked unreachable WITHOUT dialing (no rc.Status call) and keeps its
+// last-confirmed selection as stale.
+func TestRefresh_OfflineRouterSkipsDial(t *testing.T) {
+	routerIP, exitIP := "100.64.0.10", "100.64.0.20"
+	nm := &fakeNM{nodes: []store.NodeView{
+		{StableID: "router1", TailscaleIPs: []string{routerIP}, Online: false, Type: store.NodeRouter},
+	}}
+	rc := &fakeRC{statusRT: store.RouterRuntime{Online: true}}
+	st := store.New()
+	// Seed a prior confirmed selection so we can prove it's kept as stale.
+	st.Store(&store.Snapshot{
+		Routers: []store.RouterView{{
+			Node:            store.NodeView{StableID: "router1", TailscaleIPs: []string{routerIP}},
+			CurrentExitNode: &store.ExitNodeRef{StableID: "exit1", IP: exitIP},
+			Reachable:       true, State: store.RouterOK,
+		}},
+	})
+	p := New(st, nm, rc, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+
+	if err := p.Refresh(context.Background()); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	rv := st.Load().Routers[0]
+	if rv.Reachable || rv.State != store.RouterUnreachable {
+		t.Errorf("offline router: reachable=%v state=%q, want unreachable", rv.Reachable, rv.State)
+	}
+	if rv.LastError != "node is offline" {
+		t.Errorf("lastError = %q, want %q", rv.LastError, "node is offline")
+	}
+	if rv.CurrentExitNode == nil || rv.CurrentExitNode.IP != exitIP {
+		t.Errorf("last-confirmed selection must be kept as stale, got %+v", rv.CurrentExitNode)
+	}
+	if rc.statusCallCount() != 0 {
+		t.Errorf("offline router must NOT be dialed, Status calls = %d", rc.statusCallCount())
+	}
+}
+
+func TestProbe(t *testing.T) {
+	const routerIP, exitIP = "100.64.0.10", "100.64.0.20"
+
+	onlineRouterSnapshot := func(st *store.Store, online bool) {
+		st.Store(&store.Snapshot{
+			Routers: []store.RouterView{{
+				Node: store.NodeView{StableID: "router1", TailscaleIPs: []string{routerIP}, Online: online},
+			}},
+		})
+	}
+
+	t.Run("unknown router -> 404 error, no probe", func(t *testing.T) {
+		st := store.New()
+		seedSnapshot(st, routerIP, exitIP, true, true)
+		rc := &fakeRC{}
+		p := New(st, &fakeNM{}, rc, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+		_, err := p.Probe(context.Background(), "ghost")
+		if err == nil {
+			t.Fatal("expected an error for an unknown router")
+		}
+		var hs interface{ HTTPStatus() int }
+		if !errors.As(err, &hs) || hs.HTTPStatus() != 404 {
+			t.Fatalf("expected a 404 control error, got %v", err)
+		}
+		if rc.probeCallCount() != 0 {
+			t.Errorf("unknown router must not be probed, calls = %d", rc.probeCallCount())
+		}
+	})
+
+	t.Run("offline -> OK:false 'node is offline', no dial", func(t *testing.T) {
+		st := store.New()
+		onlineRouterSnapshot(st, false)
+		rc := &fakeRC{probeOut: "should-not-run"}
+		p := New(st, &fakeNM{}, rc, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+		res, err := p.Probe(context.Background(), "router1")
+		if err != nil {
+			t.Fatalf("offline probe must not return a Go error: %v", err)
+		}
+		if res.OK {
+			t.Error("offline probe OK must be false")
+		}
+		if res.Error != "node is offline" {
+			t.Errorf("error = %q, want %q", res.Error, "node is offline")
+		}
+		if res.CheckedAt.IsZero() {
+			t.Error("checkedAt must be set")
+		}
+		if rc.probeCallCount() != 0 {
+			t.Errorf("offline router must NOT be dialed, probe calls = %d", rc.probeCallCount())
+		}
+	})
+
+	t.Run("success -> OK:true with output", func(t *testing.T) {
+		st := store.New()
+		onlineRouterSnapshot(st, true)
+		rc := &fakeRC{probeOut: "Linux router 5.15\n0.5 0.1 0.0"}
+		p := New(st, &fakeNM{}, rc, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+		res, err := p.Probe(context.Background(), "router1")
+		if err != nil {
+			t.Fatalf("probe: %v", err)
+		}
+		if !res.OK {
+			t.Error("OK must be true on success")
+		}
+		if res.Output != "Linux router 5.15\n0.5 0.1 0.0" {
+			t.Errorf("output = %q", res.Output)
+		}
+		if res.Error != "" {
+			t.Errorf("error must be empty on success, got %q", res.Error)
+		}
+		if res.CheckedAt.IsZero() {
+			t.Error("checkedAt must be set")
+		}
+		if rc.probeCallCount() != 1 {
+			t.Errorf("probe calls = %d, want 1", rc.probeCallCount())
+		}
+	})
+
+	t.Run("rc.Probe error -> OK:false with error (not a Go error)", func(t *testing.T) {
+		st := store.New()
+		onlineRouterSnapshot(st, true)
+		rc := &fakeRC{probeErr: errors.New("ssh handshake failed")}
+		p := New(st, &fakeNM{}, rc, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+		res, err := p.Probe(context.Background(), "router1")
+		if err != nil {
+			t.Fatalf("an SSH failure is a RESULT, not a returned Go error: %v", err)
+		}
+		if res.OK {
+			t.Error("OK must be false on an ssh failure")
+		}
+		if res.Error != "ssh handshake failed" {
+			t.Errorf("error = %q, want the ssh error verbatim", res.Error)
+		}
+	})
 }
 
 func TestRefresh_NetmapErrSurfacedNotAborted(t *testing.T) {
@@ -427,6 +706,8 @@ type dropMidOpRC struct {
 func (d *dropMidOpRC) Status(ctx context.Context, addr string) (store.RouterRuntime, error) {
 	return d.rt, nil
 }
+
+func (d *dropMidOpRC) Probe(ctx context.Context, addr string) (string, error) { return "", nil }
 
 func (d *dropMidOpRC) SetExitNode(ctx context.Context, addr string, target, prev *store.ExitNodeRef) (store.RouterRuntime, error) {
 	// Same IP, empty StableID -- the buildRouterView fallback for a configured
