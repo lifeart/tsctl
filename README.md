@@ -108,6 +108,10 @@ env equivalent.
 | `-listen` | `TSCTL_LISTEN` | `:80` | no | tailnet-side listen address |
 | `-healthz` | `TSCTL_HEALTH_ADDR` | `127.0.0.1:8088` | no | loopback-only health endpoint |
 | `-ssh-user` | `TSCTL_SSH_USER` | `root` | no | router SSH login |
+| `-router-transport` | `TSCTL_ROUTER_TRANSPORT` | `tailscale-ssh` | no | router command transport: `tailscale-ssh` (default) \| `ip-password` (opt-in; see [Router transport](#router-transport)) |
+| `-router-hostkey-mode` | `TSCTL_ROUTER_HOSTKEY_MODE` | `tofu` | no | ip-password host-key verification: `tofu`\|`strict`\|`pin`\|`insecure` |
+| `-router-addrs` | `TSCTL_ROUTER_ADDRS` | — | for `ip-password` | `100.x=host[:port]` LAN-endpoint map; the `100.x` stays the router identity (unmapped routers fail loudly) |
+| *(secret)* | `TSCTL_SSH_PASSWORD` | — | for `ip-password` | router SSH password; env or systemd `LoadCredential`/Docker secret `ssh_password` — **never a flag, never logged** |
 | `-exit-node-lan-access` | `TSCTL_EXIT_NODE_LAN_ACCESS` | `preserve` | no | manage `--exit-node-allow-lan-access`: `preserve`\|`true`\|`false` |
 | `-allowed-hosts` | `TSCTL_ALLOWED_HOSTS` | — | no | extra Host values to allow (rebinding defense); hostname/MagicDNS/`100.x` auto-trusted |
 | `-poll-interval` | `TSCTL_POLL_INTERVAL` | `30s` | no | refresh cadence while a client is connected |
@@ -133,25 +137,84 @@ the dead-man's-switch revert. The one exception is `--exit-node-allow-lan-access
 by default tsctl **preserves** it too (`TSCTL_EXIT_NODE_LAN_ACCESS=preserve`); set
 it to `true`/`false` only if you want tsctl to manage that single flag.
 
+### Router transport
+
+How tsctl reaches a router to read/set its exit node. The default is
+**`tailscale-ssh`** and you should keep it: tsctl dials the router's `:22` over
+the tailnet with `none` auth, gated by the [ACL](#required-acl). There is no
+router-side password, and the host key is implicitly trusted because WireGuard
+already authenticates the peer.
+
+The opt-in **`ip-password`** transport (`TSCTL_ROUTER_TRANSPORT=ip-password`)
+instead SSHes to the router's **LAN IP** with a shared password — useful to skip
+the router-side Tailscale-SSH plumbing (the ACL `ssh` rule, the `tag:router` SSH
+grant, `tailscale set --ssh` on every router). It does **not** remove Tailscale:
+the tsnet node still provides inventory, online state, exit-node candidates, the
+UI listener, and owner identity — only the *router command transport* changes.
+Understand the trade-offs before enabling it:
+
+- **Weaker than Tailscale SSH.** It swaps ACL-governed, per-identity, revocable
+  access for a flat reusable root secret with no central revocation, no per-source
+  ACL, and no audit trail. Reasonable only on a **trusted, single-operator LAN**.
+  **Keys still beat passwords** — prefer SSH keys / `dropbear authorized_keys`
+  even here.
+- **Host-key verification is mandatory** (and on by default). Over plain LAN there
+  is no WireGuard peer auth, so an unverified host key lets an active MITM complete
+  the handshake and harvest the root password. Modes:
+  - **`tofu`** (default) — trust-on-first-use: a new router's host key is recorded
+    in `$STATE_DIR/known_hosts` (0600) and accepted; a **changed** key is refused
+    hard ("possible MITM") and **never** auto-trusted.
+  - **`strict`** — accept only host keys already present in `known_hosts` (you
+    pre-seed it); unknown hosts fail.
+  - **`pin`** — v1: identical to `strict` against a pre-seeded per-router entry
+    (the pinned key is the only match).
+  - **`insecure`** — no host-key verification. tsctl logs a loud startup warning;
+    use only for throwaway testing on a trusted segment.
+- **Identity stays the 100.x.** The router's `100.x` IPv4 remains its identity
+  everywhere (inventory, `--exit-node` arg, store keys). You map each router to a
+  LAN endpoint with `TSCTL_ROUTER_ADDRS=100.x=host[:port]` (`:22` assumed when no
+  port). A router with **no mapping fails loudly** at use-time — tsctl never
+  silently falls back to the tailnet path. (Routers may be auto-discovered, so the
+  mapping is checked per router when used, not at startup.)
+- **The password is a secret**, loaded like the auth key: `TSCTL_SSH_PASSWORD`
+  env, or systemd `LoadCredential` / a Docker secret read via
+  `$CREDENTIALS_DIRECTORY/ssh_password` (tmpfs) — never a flag, never logged. tsctl
+  refuses to start `ip-password` without a password. (OpenWRT/dropbear: password
+  auth works only once a **root password is set** — `passwd` first; fresh OpenWRT
+  rejects empty passwords.)
+
+Prove it before trusting the full binary with `tsctl spike` (below) — for
+`ip-password` it dials the mapped LAN endpoint with the password and host-key
+check, no tailnet required.
+
 Health check (loopback only, never exposed to the tailnet or LAN):
 
 ```sh
 curl http://127.0.0.1:8088/healthz
 ```
 
-## `tsctl spike` — prove the SSH path on your real tailnet
+## `tsctl spike` — prove the router transport on your real network
 
-No agent here has a live tailnet or router. **You** must prove the
-SSH-over-tailnet path before trusting the full binary. `spike` brings tsnet up,
-dials the router's `:22` over the tailnet, SSHes with `none` auth, runs
-`tailscale status --json`, and prints stdout/stderr/exit code:
+No agent here has a live tailnet or router. **You** must prove the router
+transport before trusting the full binary. `spike` honors the **configured
+transport** — it builds the same `router.Client` the server uses, runs
+`tailscale status --json` against ONE router, and prints a summary (online state,
+the current exit node, and the available options):
 
 ```sh
-export TS_AUTHKEY=tskey-auth-xxxxx        # first run only
+export TS_AUTHKEY=tskey-auth-xxxxx        # tailscale-ssh: first run only
 ./tsctl spike 100.64.0.10                 # the router's 100.x IPv4
 ```
 
-If this prints the router's status JSON, the ACL and SSH path are correct.
+- **`tailscale-ssh` (default):** brings tsnet up and dials the router's `:22`
+  over the tailnet with `none` auth. If it prints the router's status, the ACL
+  and SSH path are correct.
+- **`ip-password`:** with `TSCTL_ROUTER_TRANSPORT=ip-password` (plus
+  `TSCTL_SSH_PASSWORD` and a `TSCTL_ROUTER_ADDRS` mapping for that `100.x`), it
+  dials the **mapped LAN endpoint** with the password and host-key verification —
+  **no tsnet needed**, so it proves the password path in isolation. On first
+  contact under `tofu` it records the router's host key in
+  `$STATE_DIR/known_hosts`.
 
 ## Required ACL
 

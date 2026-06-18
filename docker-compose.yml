@@ -43,6 +43,27 @@ services:
       # preserve|true|false — 'preserve' (default) never touches the router's
       # --exit-node-allow-lan-access (or any other `tailscale up` setting).
       TSCTL_EXIT_NODE_LAN_ACCESS: preserve
+      # --- router transport (DEFAULT: tailscale-ssh — SSH over the tailnet) -----
+      # The OPT-IN ip-password transport reaches routers over plain LAN IP with an
+      # SSH password instead of Tailscale SSH. It trades ACL-governed identity for
+      # a flat shared secret, so it MUST verify host keys (tofu by default) and is
+      # only sane on a trusted LAN — keys still beat passwords. To enable it:
+      #   1. uncomment the three vars below,
+      #   2. uncomment the `secrets:` reference + top-level block (password is a
+      #      file-based secret, NEVER plain env),
+      #   3. map each router's 100.x identity to its LAN endpoint in ROUTER_ADDRS.
+      # TSCTL_ROUTER_TRANSPORT: ip-password
+      # TSCTL_ROUTER_HOSTKEY_MODE: tofu          # tofu|strict|pin|insecure (insecure logs a warning)
+      # TSCTL_ROUTER_ADDRS: 100.64.0.10=192.168.1.1,100.64.0.11=192.168.1.2:2222
+      # tsctl reads the SSH password from $CREDENTIALS_DIRECTORY/ssh_password (the
+      # same filename systemd LoadCredential uses); point it at the secrets mount.
+      # Keep TS_AUTHKEY set in env (or also mount a ts_authkey secret): once
+      # CREDENTIALS_DIRECTORY is set and TS_AUTHKEY is blank, tsctl looks for
+      # $CREDENTIALS_DIRECTORY/ts_authkey too.
+      # CREDENTIALS_DIRECTORY: /run/secrets
+    # Uncomment to deliver the ip-password SSH secret as a file (not env):
+    # secrets:
+    #   - ssh_password
     volumes:
       - tsctl-state:/var/lib/tsctl        # PERSISTENT — holds the node key; do not lose it
     ports:
@@ -56,3 +77,11 @@ services:
 
 volumes:
   tsctl-state:
+
+# Uncomment alongside the service `secrets:` reference above to enable the
+# ip-password transport. Put the router root password in ./secrets/ssh_password
+# (0600, gitignored) — it is mounted read-only at /run/secrets/ssh_password and
+# read via CREDENTIALS_DIRECTORY, so it never appears in `docker inspect` env.
+# secrets:
+#   ssh_password:
+#     file: ./secrets/ssh_password

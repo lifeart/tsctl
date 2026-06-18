@@ -1,8 +1,10 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"net"
 	"net/netip"
 	"os"
@@ -41,6 +43,28 @@ type Config struct {
 	// non-nil = tsctl sets it to this value when setting an exit node. Other
 	// `tailscale up` settings are always preserved (we use incremental `set`).
 	ExitNodeLANAccess *bool
+
+	// --- router command transport (DEFAULT: tailscale-ssh) ---------------------
+	// RouterTransport selects how tsctl reaches a router to run commands:
+	//   - "tailscale-ssh" (default): SSH over the tailnet, `none` auth (ACL-gated).
+	//   - "ip-password": SSH to the router's LAN endpoint with a password, host-key
+	//     verified. Opt-in; trades ACL-governed identity for a flat secret.
+	RouterTransport string
+	// RouterHostKeyMode is the ip-password host-key verification mode:
+	// "tofu" (default) | "strict" | "pin" | "insecure". Unused by tailscale-ssh
+	// (which uses InsecureIgnoreHostKey -- safe, WireGuard authenticates the peer).
+	RouterHostKeyMode string
+	// SSHPassword is the shared router SSH password for the ip-password transport.
+	// It is a SECRET: loaded via loadSSHPassword (TSCTL_SSH_PASSWORD env or the
+	// systemd LoadCredential ssh_password), NEVER a flag and never logged.
+	SSHPassword string
+	// RouterAddrs maps a router's canonical 100.x identity to the LAN endpoint to
+	// dial ("host" or "host:port") for the ip-password transport. The 100.x stays
+	// the identity everywhere; this is consumed only at the SSH dial boundary.
+	RouterAddrs map[string]string
+	// KnownHostsPath is the OpenSSH known_hosts file used by the ip-password
+	// tofu/strict/pin host-key modes. Defaults to $STATE_DIR/known_hosts.
+	KnownHostsPath string
 }
 
 // env returns the env var or a default.
@@ -100,6 +124,12 @@ func loadConfig(args []string) (*Config, error) {
 	fs.DurationVar(&c.PollInterval, "poll-interval", pollIntervalDef, "refresh cadence while a client is connected")
 	lanAccess := fs.String("exit-node-lan-access", env("TSCTL_EXIT_NODE_LAN_ACCESS", "preserve"),
 		"manage --exit-node-allow-lan-access on the router: preserve|true|false (preserve keeps the router's existing setting)")
+	fs.StringVar(&c.RouterTransport, "router-transport", env("TSCTL_ROUTER_TRANSPORT", "tailscale-ssh"),
+		"router command transport: tailscale-ssh (default) | ip-password (opt-in, host-key-verified, LAN-trusted)")
+	fs.StringVar(&c.RouterHostKeyMode, "router-hostkey-mode", env("TSCTL_ROUTER_HOSTKEY_MODE", "tofu"),
+		"ip-password host-key verification: tofu (default) | strict | pin | insecure")
+	routerAddrs := fs.String("router-addrs", env("TSCTL_ROUTER_ADDRS", ""),
+		"ip-password LAN endpoints: comma-separated 100.x=host[:port] pairs (the 100.x stays the router identity)")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -150,6 +180,37 @@ func loadConfig(args []string) (*Config, error) {
 	}
 	c.AuthKey = key
 
+	// ip-password transport: parse the 100.x->LAN-endpoint map, default the
+	// known_hosts path under the (private) state dir, and load the SSH password
+	// secret (env or systemd LoadCredential; never a flag, never logged). These
+	// are parsed for any transport (cheap) but only required by validate() when
+	// the ip-password transport is selected.
+	c.RouterAddrs = map[string]string{}
+	for _, pair := range strings.Split(*routerAddrs, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		id, ep, ok := strings.Cut(pair, "=")
+		id = strings.TrimSpace(id)
+		ep = strings.TrimSpace(ep)
+		if !ok || id == "" || ep == "" {
+			return nil, fmt.Errorf("invalid -router-addrs entry %q: want 100.x=host[:port]", pair)
+		}
+		if _, err := netip.ParseAddr(id); err != nil {
+			return nil, fmt.Errorf("invalid -router-addrs key %q: must be the router's 100.x IPv4: %w", id, err)
+		}
+		c.RouterAddrs[id] = ep
+	}
+	if c.StateDir != "" {
+		c.KnownHostsPath = filepath.Join(c.StateDir, "known_hosts")
+	}
+	pw, err := loadSSHPassword()
+	if err != nil {
+		return nil, err
+	}
+	c.SSHPassword = pw
+
 	if err := c.validate(); err != nil {
 		return nil, err
 	}
@@ -169,6 +230,31 @@ func loadAuthKey() (string, error) {
 		b, err := os.ReadFile(filepath.Join(dir, "ts_authkey"))
 		if err != nil {
 			return "", fmt.Errorf("reading LoadCredential ts_authkey: %w", err)
+		}
+		return strings.TrimSpace(string(b)), nil
+	}
+	return "", nil
+}
+
+// loadSSHPassword returns the shared router SSH password for the ip-password
+// transport, mirroring loadAuthKey's secret pattern: TSCTL_SSH_PASSWORD env, or
+// the systemd LoadCredential ($CREDENTIALS_DIRECTORY/ssh_password, on tmpfs). It
+// is NEVER a flag and never logged. Empty is OK here (the default tailscale-ssh
+// transport needs no password); validate() fails closed if ip-password is
+// selected without one. Because LoadCredential=ssh_password is OPTIONAL in the
+// systemd unit, a MISSING credential file is treated as "unset" (empty), not an
+// error -- only a genuinely unreadable file is a hard error.
+func loadSSHPassword() (string, error) {
+	if v, ok := os.LookupEnv("TSCTL_SSH_PASSWORD"); ok {
+		return strings.TrimSpace(v), nil
+	}
+	if dir := os.Getenv("CREDENTIALS_DIRECTORY"); dir != "" {
+		b, err := os.ReadFile(filepath.Join(dir, "ssh_password"))
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return "", nil // credential not provided -> unset (fine unless ip-password)
+			}
+			return "", fmt.Errorf("reading LoadCredential ssh_password: %w", err)
 		}
 		return strings.TrimSpace(string(b)), nil
 	}
@@ -201,6 +287,36 @@ func (c *Config) validate() error {
 		if _, err := netip.ParseAddr(r); err != nil {
 			return fmt.Errorf("router %q is not a valid IP (use the 100.x IPv4): %w", r, err)
 		}
+	}
+
+	// Router transport + host-key mode (fail-closed; default tailscale-ssh).
+	// Reject unknown values for both. The host-key mode is validated regardless
+	// of transport so a typo never silently degrades verification.
+	switch c.RouterTransport {
+	case "tailscale-ssh", "ip-password":
+	default:
+		return fmt.Errorf("invalid -router-transport %q: want tailscale-ssh or ip-password", c.RouterTransport)
+	}
+	switch c.RouterHostKeyMode {
+	case "tofu", "strict", "pin", "insecure":
+	default:
+		return fmt.Errorf("invalid -router-hostkey-mode %q: want tofu, strict, pin, or insecure", c.RouterHostKeyMode)
+	}
+	if c.RouterTransport == "ip-password" {
+		// Require the password secret (fail loud -- the whole point of the mode).
+		if c.SSHPassword == "" {
+			return errors.New("router transport ip-password requires an SSH password: set TSCTL_SSH_PASSWORD or provide the systemd LoadCredential ssh_password (it is never a flag and never logged)")
+		}
+		// insecure is allowed ONLY because it was explicitly selected (the default
+		// is tofu); main logs a loud warning. tofu/strict/pin need a known_hosts
+		// path (defaulted to $STATE_DIR/known_hosts above).
+		if c.RouterHostKeyMode != "insecure" && c.KnownHostsPath == "" {
+			return fmt.Errorf("router transport ip-password with host-key mode %q requires a known_hosts path (default $STATE_DIR/known_hosts; set a non-empty -state-dir)", c.RouterHostKeyMode)
+		}
+		// NOTE: that each managed router has a -router-addrs mapping is enforced at
+		// use-time (router.endpointFor fails loud per router), not here, because
+		// routers may be auto-discovered from the netmap and are unknown at config
+		// time. Document the mapping requirement (README) for ip-password users.
 	}
 	return nil
 }

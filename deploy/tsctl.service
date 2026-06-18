@@ -34,6 +34,17 @@ Environment=TSCTL_HEALTH_ADDR=127.0.0.1:8088
 # enrollment the node key lives in StateDirectory and this can be removed.
 LoadCredential=ts_authkey:/etc/tsctl/ts_authkey
 
+# Router transport (DEFAULT: tailscale-ssh -- SSH over the tailnet, no secret to
+# deliver). The OPT-IN ip-password transport (SSH to the router's LAN IP with a
+# password, host-key verified) needs a shared SSH password, delivered via tmpfs
+# credential exactly like the auth key above -- never via env/log. Uncomment the
+# block below and set the transport to enable it. The known_hosts file for the
+# tofu/strict/pin host-key modes lives under StateDirectory (the private state).
+# Environment=TSCTL_ROUTER_TRANSPORT=ip-password
+# Environment=TSCTL_ROUTER_HOSTKEY_MODE=tofu
+# Environment=TSCTL_ROUTER_ADDRS=100.x.y.z=192.168.1.1,100.a.b.c=192.168.1.2
+# LoadCredential=ssh_password:/etc/tsctl/ssh_password
+
 # --- Hardening (DESIGN §7) ---
 NoNewPrivileges=yes
 ProtectSystem=strict

@@ -8,7 +8,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -27,7 +26,6 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/crypto/ssh"
 	"tailscale.com/client/local"
 	"tailscale.com/tsnet"
 
@@ -204,7 +202,11 @@ func runServe(args []string, lg *log.Logger) error {
 	// --- wiring ---
 	st := store.New()
 	mapper := netmap.New(lc) // implements poller.Netmapper AND api.WhoIser
-	rc := router.New(srv.Dial, cfg.SSHUser, cfg.SSHTimeout, cfg.ExitNodeLANAccess)
+	rc, err := router.New(routerOptions(cfg, srv.Dial))
+	if err != nil {
+		return fmt.Errorf("router client: %w", err)
+	}
+	warnIfInsecureHostKey(cfg, lg)
 	// Persisted zone/group store ($STATE_DIR/groups.json). Fail-fast on a corrupt
 	// file (never silently start empty and risk clobbering the user's data).
 	grpStore, err := groups.New(filepath.Join(cfg.StateDir, "groups.json"))
@@ -399,10 +401,48 @@ func allowedHosts(ctx context.Context, cfg *Config, lc *local.Client, lg *log.Lo
 	return hosts
 }
 
-// runSpike is a REAL, runnable diagnostic (DESIGN §9): bring tsnet up, dial the
-// router's :22 over the tailnet, SSH with `none` auth, run `tailscale status
-// --json`, and print stdout/stderr/exit code. Use it to prove the SSH path in a
-// real tailnet before trusting the full binary.
+// routerOptions builds router.Options from cfg. tailscaleDial is
+// tsnet.Server.Dial for the tailscale-ssh transport (pass nil for ip-password,
+// which dials the router's LAN endpoint with its own net.Dialer). Keyboard-
+// interactive is enabled so older dropbear builds that advertise it instead of
+// the password method still authenticate; it is ignored by the tailscale-ssh
+// (`none` auth) transport.
+func routerOptions(cfg *Config, tailscaleDial router.DialFunc) router.Options {
+	return router.Options{
+		Transport:           cfg.RouterTransport,
+		TailscaleDial:       tailscaleDial,
+		RouterAddrs:         cfg.RouterAddrs,
+		User:                cfg.SSHUser,
+		Password:            cfg.SSHPassword,
+		KeyboardInteractive: true,
+		HostKeyMode:         cfg.RouterHostKeyMode,
+		KnownHostsPath:      cfg.KnownHostsPath,
+		Timeout:             cfg.SSHTimeout,
+		LANAccess:           cfg.ExitNodeLANAccess,
+	}
+}
+
+// warnIfInsecureHostKey logs a loud warning when the ip-password transport runs
+// with host-key verification disabled -- an active MITM on the LAN could then
+// capture the SSH password. insecure is never the default (tofu is), so this
+// only ever fires on an explicit opt-in.
+func warnIfInsecureHostKey(cfg *Config, lg *log.Logger) {
+	if cfg.RouterTransport == "ip-password" && cfg.RouterHostKeyMode == "insecure" {
+		lg.Printf("WARNING: router transport ip-password with host-key mode 'insecure' -- router host keys are NOT verified; an active MITM on the LAN can capture the SSH password. Use tofu (default), strict, or pin instead.")
+	}
+}
+
+// runSpike is a REAL, runnable diagnostic (DESIGN §9): it proves the CONFIGURED
+// router transport end to end against ONE router, then prints a summary. Use it
+// to prove the path before trusting the full binary.
+//   - tailscale-ssh (default): bring tsnet up and dial the router's :22 over the
+//     tailnet with `none` auth.
+//   - ip-password: dial the router's MAPPED LAN endpoint with a plain net.Dialer,
+//     the configured password, and host-key verification -- no tsnet needed, so
+//     the password path is proven in isolation.
+//
+// Either way it runs `tailscale status --json`, parses it (the same router.Client
+// the server uses), and prints online state + the current/available exit nodes.
 func runSpike(addr string, lg *log.Logger) error {
 	cfg, err := loadConfig(nil) // env + defaults; spike takes the addr positionally
 	if err != nil {
@@ -412,79 +452,51 @@ func runSpike(addr string, lg *log.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	srv := newTSNet(cfg, lg)
-	defer srv.Close()
-
-	upCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
-	_, err = srv.Up(upCtx)
-	cancel()
-	if err != nil {
-		return fmt.Errorf("tsnet up: %w", err)
-	}
-	lg.Printf("tsnet up; dialing %s:22 over the tailnet", addr)
-
-	target := net.JoinHostPort(addr, "22")
-	dialCtx, dcancel := context.WithTimeout(ctx, cfg.SSHTimeout)
-	defer dcancel()
-	conn, err := srv.Dial(dialCtx, "tcp", target)
-	if err != nil {
-		return fmt.Errorf("dial %s: %w", target, err)
-	}
-
-	sshConf := &ssh.ClientConfig{
-		User: cfg.SSHUser,
-		Auth: nil, // `none` auth: the ACL grants tagged src (tag:tsctl) action:accept (DESIGN §2/§7)
-		// HostKeyCallback: ssh.InsecureIgnoreHostKey is DELIBERATE (DESIGN §7).
-		// tsnet.Dial only reaches the WireGuard-authenticated peer; there is no
-		// known_hosts and WireGuard already authenticates the peer. This is NOT a
-		// silent host-key skip -- it is the documented, intended choice.
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         cfg.SSHTimeout,
-	}
-	sshConn, chans, reqs, err := ssh.NewClientConn(conn, target, sshConf)
-	if err != nil {
-		conn.Close()
-		return fmt.Errorf("ssh handshake: %w", err)
-	}
-	client := ssh.NewClient(sshConn, chans, reqs)
-	defer client.Close()
-
-	sess, err := client.NewSession()
-	if err != nil {
-		return fmt.Errorf("ssh session: %w", err)
-	}
-	defer sess.Close()
-
-	// Sessions predate context; cancel by closing the session on ctx.Done (DESIGN §6).
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		select {
-		case <-ctx.Done():
-			sess.Close()
-		case <-done:
+	var tailscaleDial router.DialFunc
+	switch cfg.RouterTransport {
+	case "ip-password":
+		// No tsnet needed -- the ip-password transport dials the LAN endpoint
+		// directly. router.endpointFor fails loud below if addr is unmapped.
+		warnIfInsecureHostKey(cfg, lg)
+		lg.Printf("spike: ip-password transport -- dialing %s's mapped LAN endpoint %q (host-key mode %q)", addr, cfg.RouterAddrs[addr], cfg.RouterHostKeyMode)
+	default: // tailscale-ssh
+		srv := newTSNet(cfg, lg)
+		defer srv.Close()
+		upCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+		_, err = srv.Up(upCtx)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("tsnet up: %w", err)
 		}
-	}()
+		lg.Printf("spike: tailscale-ssh transport -- tsnet up; dialing %s:22 over the tailnet", addr)
+		tailscaleDial = srv.Dial
+	}
 
-	var stdout, stderr bytes.Buffer
-	sess.Stdout = &stdout
-	sess.Stderr = &stderr
+	rc, err := router.New(routerOptions(cfg, tailscaleDial))
+	if err != nil {
+		return fmt.Errorf("router client: %w", err)
+	}
 
-	const cmd = "tailscale status --json"
-	exitCode := 0
-	if runErr := sess.Run(cmd); runErr != nil {
-		var ee *ssh.ExitError
-		if errors.As(runErr, &ee) {
-			exitCode = ee.ExitStatus() // non-zero exit is still a useful result
-		} else {
-			return fmt.Errorf("run %q: %w", cmd, runErr)
+	runCtx, cancel := context.WithTimeout(ctx, cfg.SSHTimeout+10*time.Second)
+	defer cancel()
+	rt, err := rc.Status(runCtx, addr) // dial + auth + host-key + run + parse
+	if err != nil {
+		return err // surfaces dial/handshake/host-key/auth failures and command stderr
+	}
+
+	current := "(none)"
+	if rt.Current != nil {
+		current = rt.Current.IP
+		if rt.Current.Name != "" {
+			current = fmt.Sprintf("%s (%s)", rt.Current.IP, rt.Current.Name)
 		}
 	}
-
-	fmt.Printf("=== %s @ %s (exit %d) ===\n", cmd, addr, exitCode)
-	fmt.Printf("--- stdout (%d bytes) ---\n%s\n", stdout.Len(), stdout.String())
-	if stderr.Len() > 0 {
-		fmt.Printf("--- stderr ---\n%s\n", stderr.String())
+	fmt.Printf("=== tailscale status --json @ %s via %s transport ===\n", addr, cfg.RouterTransport)
+	fmt.Printf("online:            %t\n", rt.Online)
+	fmt.Printf("current exit node: %s\n", current)
+	fmt.Printf("exit-node options: %d\n", len(rt.Options))
+	for _, o := range rt.Options {
+		fmt.Printf("  - %s %s\n", o.IP, o.Name)
 	}
 	return nil
 }

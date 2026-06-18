@@ -1,9 +1,20 @@
-// Package router talks to OpenWRT routers over Tailscale SSH.
+// Package router talks to OpenWRT routers over SSH.
 //
-// Connect-per-action (DESIGN §2/§6): for each Status/SetExitNode we dial fresh
-// via the injected Dialer (tsnet.Server.Dial), run one command with x/crypto/ssh
-// (`none` auth -- the ACL grants tagged src action:accept), capture
-// stdout+stderr+exit code, and close. No long-lived *ssh.Client.
+// Connect-per-action (DESIGN §2/§6): for each Status/SetExitNode we dial fresh,
+// run one command with x/crypto/ssh, capture stdout+stderr+exit code, and close.
+// No long-lived *ssh.Client.
+//
+// Two transports plug into the SAME runSSH seam (see Options/New):
+//   - tailscale-ssh (DEFAULT): dial over the tailnet (tsnet.Server.Dial), `none`
+//     auth -- the ACL grants tagged src action:accept -- and an InsecureIgnore
+//     host key (safe: WireGuard authenticates the peer; DESIGN §7).
+//   - ip-password (opt-in): dial the router's LAN endpoint with a plain
+//     net.Dialer, authenticate with a password (+ keyboard-interactive dropbear
+//     fallback), and VERIFY the host key via known_hosts (see hostkey.go).
+//
+// The 100.x IPv4 stays the canonical router identity everywhere (poller, exitArg,
+// store keys, Status/SetExitNode addr arg). Only the ip-password transport maps
+// that identity to a LAN dial target, and ONLY at the runSSH boundary.
 //
 // ParseStatus is a PURE function (DESIGN §4): golden-fixture tested,
 // version-tolerant. *Client implements poller.RouterClient.
@@ -71,11 +82,24 @@ func (e *CommandError) Error() string {
 // Stderr returns the trimmed command stderr; the api surfaces it in {stderr}.
 func (e *CommandError) Stderr() string { return strings.TrimSpace(e.StderrText) }
 
-// Client runs commands on routers over Tailscale SSH.
+// Client runs commands on routers over SSH (transport set by New, see Options).
 type Client struct {
 	dial    DialFunc
 	user    string        // OpenWRT login, "root" in v1 (DESIGN §7)
 	timeout time.Duration // per dial/exec deadline
+
+	// Transport knobs, set by New per the selected transport and consumed ONLY
+	// at the runSSH boundary (the 100.x identity is unchanged everywhere else):
+	//   - endpointFor maps the canonical 100.x addr to the "host:port" to dial.
+	//     tailscale-ssh => addr+":22"; ip-password => the configured LAN endpoint
+	//     (errors loudly if a router has no mapping -- never falls back silently).
+	//   - authMethods is nil for tailscale-ssh (`none` auth) or [Password, ...]
+	//     for ip-password.
+	//   - hostKey is InsecureIgnoreHostKey for tailscale-ssh (safe: WireGuard
+	//     authenticates the peer) or a verifying known_hosts callback otherwise.
+	endpointFor func(addr string) (string, error)
+	authMethods []ssh.AuthMethod
+	hostKey     ssh.HostKeyCallback
 
 	runner    commandRunner // defaults to the real ssh runner built from dial
 	newMarker func() string // keep-marker path generator; settable for tests
@@ -96,14 +120,126 @@ type Client struct {
 	locks   map[string]*sync.Mutex
 }
 
-// New constructs a router Client. dial is tsnet.Server.Dial; user is "root".
-// lanAccess is nil to PRESERVE the router's existing --exit-node-allow-lan-access
-// (the safe default -- tsctl then changes only --exit-node), or non-nil for tsctl
-// to manage that one flag when setting an exit node.
-func New(dial DialFunc, user string, timeout time.Duration, lanAccess *bool) *Client {
-	c := &Client{dial: dial, user: user, timeout: timeout, lanAccess: lanAccess, newMarker: defaultMarker, locks: make(map[string]*sync.Mutex)}
+// Options configures a router Client and its command transport. Transport
+// selects how runSSH reaches a router; everything else (the dead-man's-switch,
+// per-addr lock, ParseStatus, the frozen poller.RouterClient seam) is identical
+// across transports.
+type Options struct {
+	// Transport is "tailscale-ssh" (default; "" is treated as the default) or
+	// "ip-password". Any other value is an error.
+	Transport string
+
+	// TailscaleDial dials over the tailnet (tsnet.Server.Dial). REQUIRED for the
+	// tailscale-ssh transport; ignored for ip-password.
+	TailscaleDial DialFunc
+
+	// RouterAddrs maps a router's canonical 100.x identity to the LAN endpoint to
+	// dial ("host" or "host:port"; ":22" is appended when no port is given). Used
+	// ONLY by ip-password. A missing mapping is a loud, use-time error.
+	RouterAddrs map[string]string
+
+	// User is the SSH login ("root" in v1). Password is the SSH password for the
+	// ip-password transport (loaded as a secret; never logged). KeyboardInteractive
+	// also offers the keyboard-interactive method (answering every prompt with the
+	// password) as a fallback for older dropbear builds.
+	User                string
+	Password            string
+	KeyboardInteractive bool
+
+	// HostKeyMode selects host-key verification for ip-password: "tofu" (default),
+	// "strict", "pin", or "insecure" (see hostkey.go). KnownHostsPath is the
+	// known_hosts file used by tofu/strict/pin.
+	HostKeyMode    string
+	KnownHostsPath string
+
+	// Timeout is the per dial/exec deadline. LANAccess is nil to PRESERVE the
+	// router's existing --exit-node-allow-lan-access (the safe default), or non-nil
+	// for tsctl to manage that one flag when setting an exit node.
+	Timeout   time.Duration
+	LANAccess *bool
+}
+
+// New constructs a router Client for the transport in opts. It returns an error
+// (never a half-built client) if the transport is unknown or its required inputs
+// are missing -- e.g. tailscale-ssh without a dial func, ip-password without a
+// password, or a known_hosts/host-key mode that cannot be built. Fail-closed.
+func New(opts Options) (*Client, error) {
+	c := &Client{
+		user:      opts.User,
+		timeout:   opts.Timeout,
+		lanAccess: opts.LANAccess,
+		newMarker: defaultMarker,
+		locks:     make(map[string]*sync.Mutex),
+	}
+
+	switch opts.Transport {
+	case "", "tailscale-ssh":
+		if opts.TailscaleDial == nil {
+			return nil, errors.New("router: tailscale-ssh transport requires a dial func (tsnet.Server.Dial)")
+		}
+		c.dial = opts.TailscaleDial
+		// Identity == endpoint: dial the router's 100.x over the tailnet on :22.
+		c.endpointFor = func(addr string) (string, error) { return net.JoinHostPort(addr, "22"), nil }
+		c.authMethods = nil // `none` auth: ACL grants tagged src action:accept (DESIGN §2/§7)
+		// HostKeyCallback: ssh.InsecureIgnoreHostKey is DELIBERATE here (DESIGN §7) --
+		// tsnet.Dial only reaches the WireGuard-authenticated peer, there is no
+		// known_hosts, and this is NOT a silent skip.
+		c.hostKey = ssh.InsecureIgnoreHostKey()
+
+	case "ip-password":
+		if opts.Password == "" {
+			return nil, errors.New("router: ip-password transport requires a password")
+		}
+		c.dial = (&net.Dialer{}).DialContext
+		// Resolve the 100.x identity to a LAN endpoint; FAIL LOUD if unmapped --
+		// never silently fall back to the tailnet path (a missing mapping would
+		// otherwise dial the userspace 100.x, which a host net.Dialer can't reach).
+		addrs := opts.RouterAddrs
+		c.endpointFor = func(addr string) (string, error) {
+			ep := strings.TrimSpace(addrs[addr])
+			if ep == "" {
+				return "", fmt.Errorf("router %s: no LAN endpoint mapping for the ip-password transport "+
+					"(add it to -router-addrs / TSCTL_ROUTER_ADDRS as %s=host[:port])", addr, addr)
+			}
+			return ensurePort(ep), nil
+		}
+		auth := []ssh.AuthMethod{ssh.Password(opts.Password)}
+		if opts.KeyboardInteractive {
+			pw := opts.Password
+			// Older dropbear may advertise keyboard-interactive instead of password:
+			// answer every challenge with the same password.
+			auth = append(auth, ssh.KeyboardInteractive(
+				func(name, instruction string, questions []string, echos []bool) ([]string, error) {
+					answers := make([]string, len(questions))
+					for i := range answers {
+						answers[i] = pw
+					}
+					return answers, nil
+				}))
+		}
+		c.authMethods = auth
+		hk, err := hostKeyCallback(opts.HostKeyMode, opts.KnownHostsPath)
+		if err != nil {
+			return nil, err
+		}
+		c.hostKey = hk
+
+	default:
+		return nil, fmt.Errorf("router: unknown transport %q (want tailscale-ssh or ip-password)", opts.Transport)
+	}
+
 	c.runner = sshRunnerFunc(c.runSSH)
-	return c
+	return c, nil
+}
+
+// ensurePort appends the default SSH port to a LAN endpoint that has none. It
+// handles bare hostnames/IPv4 ("host" -> "host:22"), bracketless IPv6
+// ("fe80::1" -> "[fe80::1]:22"), and leaves an explicit port untouched.
+func ensurePort(endpoint string) string {
+	if _, _, err := net.SplitHostPort(endpoint); err == nil {
+		return endpoint // already host:port
+	}
+	return net.JoinHostPort(endpoint, "22")
 }
 
 // lockAddr acquires the per-router lock for addr, creating it on first use, and
@@ -290,22 +426,28 @@ func ParseStatus(raw []byte) (store.RouterRuntime, error) {
 	return rt, nil
 }
 
-// runSSH dials addr:22, runs one command over a `none`-auth SSH session, and
-// returns stdout, stderr and the exit code. Non-zero exit is a RESULT (returned
-// with err==nil and exitCode set); only transport/dial/handshake failures are
-// errors. Context cancellation closes the session (sessions predate context).
+// runSSH resolves addr (the canonical 100.x identity) to the transport's dial
+// endpoint, dials it, runs one command over an SSH session, and returns stdout,
+// stderr and the exit code. Non-zero exit is a RESULT (returned with err==nil
+// and exitCode set); only transport/dial/handshake failures are errors. Context
+// cancellation closes the session (sessions predate context).
 //
-// HostKeyCallback: ssh.InsecureIgnoreHostKey is DELIBERATE here (DESIGN §7) --
-// tsnet.Dial only reaches the WireGuard-authenticated peer, there is no
-// known_hosts, and this is NOT a silent skip.
+// The Auth and HostKeyCallback come from the transport selected in New: `none`
+// auth + InsecureIgnoreHostKey for tailscale-ssh (safe -- WireGuard authenticates
+// the peer), or password auth + a verifying known_hosts callback for ip-password.
+// This is the ONLY place identity->endpoint translation and the auth/host-key
+// swap happen; everything else treats addr as the canonical 100.x.
 func (c *Client) runSSH(ctx context.Context, addr, cmd string) (stdout, stderr []byte, exitCode int, err error) {
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 
-	hostport := net.JoinHostPort(addr, "22")
-	conn, err := c.dial(ctx, "tcp", hostport)
+	endpoint, err := c.endpointFor(addr)
 	if err != nil {
-		return nil, nil, 0, fmt.Errorf("dial %s: %w", hostport, err)
+		return nil, nil, 0, err
+	}
+	conn, err := c.dial(ctx, "tcp", endpoint)
+	if err != nil {
+		return nil, nil, 0, fmt.Errorf("dial %s: %w", endpoint, err)
 	}
 
 	// Bound the SSH handshake (M1): ClientConfig.Timeout does NOT cover
@@ -316,23 +458,20 @@ func (c *Client) runSSH(ctx context.Context, addr, cmd string) (stdout, stderr [
 	// the handshake succeeds so it doesn't also bound the session.
 	if err := conn.SetDeadline(time.Now().Add(c.timeout)); err != nil {
 		_ = conn.Close()
-		return nil, nil, 0, fmt.Errorf("set handshake deadline %s: %w", hostport, err)
+		return nil, nil, 0, fmt.Errorf("set handshake deadline %s: %w", endpoint, err)
 	}
 
 	config := &ssh.ClientConfig{
-		User: c.user,
-		Auth: nil, // `none` auth: ACL grants tagged src action:accept (DESIGN §2/§7)
-		// HostKeyCallback: ssh.InsecureIgnoreHostKey is DELIBERATE here (DESIGN §7) --
-		// tsnet.Dial only reaches the WireGuard-authenticated peer, there is no
-		// known_hosts, and this is NOT a silent skip.
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		User:            c.user,
+		Auth:            c.authMethods, // nil (`none`) for tailscale-ssh; password (+ki) for ip-password
+		HostKeyCallback: c.hostKey,     // Insecure for tailscale-ssh (WireGuard auths); verifying for ip-password
 		Timeout:         c.timeout,
 	}
 
-	sshConn, chans, reqs, err := ssh.NewClientConn(conn, hostport, config)
+	sshConn, chans, reqs, err := ssh.NewClientConn(conn, endpoint, config)
 	if err != nil {
 		_ = conn.Close()
-		return nil, nil, 0, fmt.Errorf("ssh handshake %s: %w", hostport, err)
+		return nil, nil, 0, fmt.Errorf("ssh handshake %s: %w", endpoint, err)
 	}
 	client := ssh.NewClient(sshConn, chans, reqs) // takes ownership of conn
 	defer client.Close()
@@ -340,12 +479,12 @@ func (c *Client) runSSH(ctx context.Context, addr, cmd string) (stdout, stderr [
 	// Handshake done: clear the deadline so it does not bound the session run.
 	// ctx (and the watcher below) governs the per-command timeout from here.
 	if err := conn.SetDeadline(time.Time{}); err != nil {
-		return nil, nil, 0, fmt.Errorf("clear handshake deadline %s: %w", hostport, err)
+		return nil, nil, 0, fmt.Errorf("clear handshake deadline %s: %w", endpoint, err)
 	}
 
 	session, err := client.NewSession()
 	if err != nil {
-		return nil, nil, 0, fmt.Errorf("ssh session %s: %w", hostport, err)
+		return nil, nil, 0, fmt.Errorf("ssh session %s: %w", endpoint, err)
 	}
 
 	// Cap captured output (M2): the buffers are otherwise unbounded, so a
@@ -379,7 +518,7 @@ func (c *Client) runSSH(ctx context.Context, addr, cmd string) (stdout, stderr [
 	// Overflow protection (M2): if either stream blew the cap, fail the command
 	// rather than trusting truncated output (a router flooding us is a fault).
 	if outBuf.overflowed() || errBuf.overflowed() {
-		return stdout, stderr, 0, fmt.Errorf("ssh run %q on %s: captured output exceeded %d-byte cap", cmd, hostport, maxOutputBytes)
+		return stdout, stderr, 0, fmt.Errorf("ssh run %q on %s: captured output exceeded %d-byte cap", cmd, endpoint, maxOutputBytes)
 	}
 
 	if runErr != nil {
@@ -389,9 +528,9 @@ func (c *Client) runSSH(ctx context.Context, addr, cmd string) (stdout, stderr [
 			return stdout, stderr, exitErr.ExitStatus(), nil
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return stdout, stderr, 0, fmt.Errorf("ssh run on %s canceled: %w", hostport, ctxErr)
+			return stdout, stderr, 0, fmt.Errorf("ssh run on %s canceled: %w", endpoint, ctxErr)
 		}
-		return stdout, stderr, 0, fmt.Errorf("ssh run %q on %s: %w", cmd, hostport, runErr)
+		return stdout, stderr, 0, fmt.Errorf("ssh run %q on %s: %w", cmd, endpoint, runErr)
 	}
 	return stdout, stderr, 0, nil
 }
