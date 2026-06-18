@@ -363,6 +363,8 @@ container needs **no `NET_ADMIN`, no `/dev/net/tun`, no host networking** — ju
 outbound internet to reach Tailscale. The image is a ~24 MB static binary on
 distroless, running **nonroot**. Works on Synology Container Manager, QNAP
 Container Station, Unraid, TrueNAS, Portainer, or plain `docker`/`podman`.
+**Synology users:** a ready-made Container Manager project (UI on port 8087) is in
+[`deploy/docker-compose.synology.yml`](deploy/docker-compose.synology.yml).
 
 ```sh
 docker build -t tsctl:latest .                 # or pull a published image

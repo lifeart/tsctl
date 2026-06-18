@@ -1,0 +1,66 @@
+# tsctl on Synology — DSM 7.2+ Container Manager "Project". UI on host port 8087.
+#
+# SETUP
+#   1. Make the image pullable. This repo is PRIVATE, so its GHCR image is private
+#      too — pick one:
+#        a) Make the package public (it holds no secrets): GitHub → your profile →
+#           Packages → tsctl → Package settings → Change visibility → Public.
+#        b) Log in on the NAS once (SSH): `sudo docker login ghcr.io -u <github-user>`
+#           and paste a Personal Access Token with the `read:packages` scope.
+#   2. Container Manager → Project → Create → upload this file (or paste it), fill
+#      in the environment values below, then Build → Run.
+#   3. Open  http://<synology-ip>:8087/  and sign in with TSCTL_UI_PASSWORD.
+#
+# tsctl still joins your tailnet (userspace — no special NAS networking) to reach
+# the routers; only the *web UI* is published on :8087. The tailnet path keeps
+# working too if you also set TSCTL_OWNER.
+
+services:
+  tsctl:
+    image: ghcr.io/lifeart/tsctl:latest      # pin e.g. :v0.1.0 for reproducibility
+    container_name: tsctl
+    restart: unless-stopped
+    environment:
+      # --- one-time tailnet enrollment (REQUIRED for the first run) -------------
+      # A tag:tsctl auth key, or (recommended, never expires) an OAuth client
+      # secret (tskey-client-...). After the node registers, its key lives in the
+      # volume and this is no longer used — you can blank it out.
+      TS_AUTHKEY: "tskey-client-xxxxxxxxxxxx"
+
+      # --- web UI on the host port (REQUIRED: a password gates it) --------------
+      # tsctl refuses to expose an unauthenticated control UI on a host port.
+      TSCTL_HTTP_LISTEN: ":8087"
+      TSCTL_UI_PASSWORD: "change-me-to-a-strong-password"
+      # The hostname/IP you actually browse to, WITHOUT the port — REQUIRED for the
+      # host port's anti-DNS-rebinding Host check. Add your NAS name and/or LAN IP.
+      TSCTL_ALLOWED_HOSTS: "synology.local,192.168.1.50"
+
+      # --- optional -------------------------------------------------------------
+      # Also accept the tailnet path (your exact tailnet login) alongside the
+      # password — then a tailnet device is admitted without signing in:
+      # TSCTL_OWNER: "you@example.com"
+      # Pin specific routers; leave unset to auto-discover every tag:router node:
+      # TSCTL_ROUTERS: "100.64.0.10,100.64.0.11"
+      # Router transport: default "tailscale-ssh"; "ip-password" reaches routers by
+      # LAN IP+password (see README "Router transport" — needs TSCTL_ROUTER_ADDRS +
+      # TSCTL_SSH_PASSWORD and host-key verification).
+
+    ports:
+      - "8087:8087"          # host:container — the UI is at http://<nas>:8087/
+
+    volumes:
+      # Named volume = simplest correct permissions (the image pre-creates the dir
+      # owned by the nonroot uid 65532). It holds the node identity key — back it
+      # up; do not lose it.
+      - tsctl-state:/var/lib/tsctl
+      # Prefer a visible Synology shared folder instead? Use a bind mount, but the
+      # folder MUST be writable by uid 65532 (the container runs nonroot) — set its
+      # permissions in DSM / chown 65532:65532:
+      # - /volume1/docker/tsctl:/var/lib/tsctl
+
+    # tsnet is userspace: no cap_add, no /dev/net/tun, no host networking needed.
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  tsctl-state:
