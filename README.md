@@ -71,12 +71,48 @@ export TS_AUTHKEY=tskey-auth-xxxxx
   -ssh-user root
 ```
 
-Config is **flags + env only** (no YAML, no committed secrets). Each flag has an
-env equivalent: `TSCTL_HOSTNAME`, `TSCTL_STATE_DIR`, `TSCTL_LISTEN`,
-`TSCTL_HEALTH_ADDR`, `TSCTL_ROUTERS`, `TSCTL_SSH_USER`, `TSCTL_OWNER`,
-`TSCTL_ALLOWED_HOSTS`, `TSCTL_EXIT_NODE_LAN_ACCESS`, `TSCTL_DEBUG`, and
-`TS_AUTHKEY`. After first enrollment the node key lives in the state dir and the
-auth key is no longer needed — drop it.
+### What you need to authenticate (checklist)
+
+Everything required to bring tsctl up, in one place. A copy-paste template is in
+[`.env.example`](.env.example).
+
+1. **A Tailscale enrollment token** (`TS_AUTHKEY`) — one of:
+   - **OAuth client secret** (recommended, never expires): admin console →
+     OAuth clients → scope **`auth_keys`**, tag **`tag:tsctl`** → use the
+     `tskey-client-…` secret.
+   - **Tagged auth key**: Keys → Generate, tag **`tag:tsctl`** (+ Pre-approved
+     if device approval is on) → `tskey-auth-…`.
+   - Needed only for the first run; after that the node key lives in the state
+     dir. (An API token `tskey-api-…` will **not** enroll a node.)
+2. **The owner login** (`TSCTL_OWNER`) — your exact tailnet email; the only
+   identity allowed to view/control (everyone else is denied, fail-closed).
+3. **Router IPs** (`TSCTL_ROUTERS`) — the OpenWRT routers' `100.x` IPv4s.
+4. **The ACL** below (`tag:tsctl` → `tag:router`, ssh `accept`, `users:["root"]`).
+5. **Tailscale SSH enabled on each router** (`tailscale set --ssh`).
+
+### Configuration (flags & env)
+
+Config is **flags + env only** (no YAML, no committed secrets); every flag has an
+env equivalent.
+
+| Flag | Env | Default | Required | Purpose |
+|---|---|---|---|---|
+| *(token)* | `TS_AUTHKEY` | — | first run | Tailscale enrollment token (see above); or systemd `LoadCredential` `ts_authkey` |
+| `-owner` | `TSCTL_OWNER` | — | **yes** (serve) | tailnet login allowed to control |
+| `-routers` | `TSCTL_ROUTERS` | — | **yes** | comma-separated router `100.x` IPv4s |
+| `-hostname` | `TSCTL_HOSTNAME` | `tsctl` | no | node hostname; the UI URL `http://<hostname>/` |
+| `-state-dir` | `TSCTL_STATE_DIR` | `./tsnet-state` (or systemd `STATE_DIRECTORY`) | no | node key store — **must persist** (treat as a private key) |
+| `-listen` | `TSCTL_LISTEN` | `:80` | no | tailnet-side listen address |
+| `-healthz` | `TSCTL_HEALTH_ADDR` | `127.0.0.1:8088` | no | loopback-only health endpoint |
+| `-ssh-user` | `TSCTL_SSH_USER` | `root` | no | router SSH login |
+| `-exit-node-lan-access` | `TSCTL_EXIT_NODE_LAN_ACCESS` | `preserve` | no | manage `--exit-node-allow-lan-access`: `preserve`\|`true`\|`false` |
+| `-allowed-hosts` | `TSCTL_ALLOWED_HOSTS` | — | no | extra Host values to allow (rebinding defense); hostname/MagicDNS/`100.x` auto-trusted |
+| `-poll-interval` | `TSCTL_POLL_INTERVAL` | `30s` | no | refresh cadence while a client is connected |
+| `-ssh-timeout` | `TSCTL_SSH_TIMEOUT` | `15s` | no | per dial/exec SSH deadline |
+| `-debug` | `TSCTL_DEBUG` | off | no | verbose tsnet backend logs |
+
+After first enrollment the node key lives in the state dir and `TS_AUTHKEY` is no
+longer needed — drop it.
 
 **Your router's other settings are preserved.** Changing an exit node runs an
 incremental `tailscale set --exit-node=…` on the router — never `tailscale up`

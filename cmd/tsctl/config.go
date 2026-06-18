@@ -42,11 +42,36 @@ func env(key, def string) string {
 	return def
 }
 
+// envDur returns a duration from the env var, or def if unset. A set-but-invalid
+// value is a hard error (never silently swallowed) so container/env config is
+// accurate.
+func envDur(key string, def time.Duration) (time.Duration, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok {
+		return def, nil
+	}
+	d, err := time.ParseDuration(strings.TrimSpace(v))
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s %q: %w", key, v, err)
+	}
+	return d, nil
+}
+
 // loadConfig resolves config from env defaults overridden by flags. args is the
 // flag slice (e.g. os.Args[1:] for `serve`).
 func loadConfig(args []string) (*Config, error) {
 	fs := flag.NewFlagSet("tsctl", flag.ContinueOnError)
 	c := &Config{}
+
+	// Duration defaults are env-overridable too (fail fast on a bad value).
+	sshTimeoutDef, err := envDur("TSCTL_SSH_TIMEOUT", 15*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	pollIntervalDef, err := envDur("TSCTL_POLL_INTERVAL", 30*time.Second)
+	if err != nil {
+		return nil, err
+	}
 
 	// StateDir default: systemd's STATE_DIRECTORY when present, else local dir.
 	defStateDir := env("TSCTL_STATE_DIR", env("STATE_DIRECTORY", "./tsnet-state"))
@@ -58,10 +83,10 @@ func loadConfig(args []string) (*Config, error) {
 	fs.StringVar(&c.SSHUser, "ssh-user", env("TSCTL_SSH_USER", "root"), "OpenWRT SSH login")
 	fs.BoolVar(&c.Debug, "debug", env("TSCTL_DEBUG", "") != "", "forward verbose tsnet backend logs")
 	routers := fs.String("routers", env("TSCTL_ROUTERS", ""), "comma-separated router 100.x IPv4s")
-	fs.DurationVar(&c.SSHTimeout, "ssh-timeout", 15*time.Second, "per dial/exec SSH deadline")
+	fs.DurationVar(&c.SSHTimeout, "ssh-timeout", sshTimeoutDef, "per dial/exec SSH deadline")
 	fs.StringVar(&c.Owner, "owner", env("TSCTL_OWNER", ""), "tailnet login (email) allowed to control")
 	allowed := fs.String("allowed-hosts", env("TSCTL_ALLOWED_HOSTS", ""), "extra comma-separated Host values to allow (DNS-rebinding defense)")
-	fs.DurationVar(&c.PollInterval, "poll-interval", 30*time.Second, "refresh cadence while a client is connected")
+	fs.DurationVar(&c.PollInterval, "poll-interval", pollIntervalDef, "refresh cadence while a client is connected")
 	lanAccess := fs.String("exit-node-lan-access", env("TSCTL_EXIT_NODE_LAN_ACCESS", "preserve"),
 		"manage --exit-node-allow-lan-access on the router: preserve|true|false (preserve keeps the router's existing setting)")
 
