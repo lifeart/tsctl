@@ -360,6 +360,14 @@ docker compose logs -f tsctl                   # watch enrollment
    anti-DNS-rebinding Host check blocks the page. The `TSCTL_HTTP_LISTEN` host and
    the tsnet hostname/MagicDNS/`100.x` are trusted automatically.
 
+   > ⚠️ **The host port is plain HTTP** — unlike the tailnet path (encrypted by
+   > WireGuard), the password and the session cookie cross this socket in the
+   > clear. That's fine on a trusted home LAN, but on any shared/untrusted network
+   > **front it with a TLS reverse proxy** (Caddy / Nginx Proxy Manager / your
+   > NAS's HTTPS) and point browsers at the HTTPS endpoint. Sessions are signed,
+   > HttpOnly, `SameSite=Strict`, and reset on restart, but TLS is what protects
+   > the password in transit.
+
 `/healthz` stays bound to loopback *inside* the container by design (it's a
 security boundary, not a NAS health endpoint, and is separate from the host-port
 UI); rely on the container restart policy + the Tailscale admin console for

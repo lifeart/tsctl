@@ -292,6 +292,14 @@ func (s *Store) persistLocked() error {
 		return fmt.Errorf("groups: renaming temp file into place: %w", err)
 	}
 	cleanup = false // renamed; nothing to clean up
+	// Best-effort: fsync the directory so the rename (the directory entry) itself
+	// survives a crash on filesystems that don't order it. The file contents are
+	// already fsync'd above and the rename succeeded, so a dir-sync failure does
+	// not fail the save -- it's a durability hardening, not the source of truth.
+	if d, derr := os.Open(dir); derr == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
 	return nil
 }
 

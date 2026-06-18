@@ -365,14 +365,32 @@ func runServe(args []string, lg *log.Logger) error {
 // (tailnet WhoIs==owner, or a password session) flow through api.RequireAuth, so
 // one handler serves them all. Go 1.22 mux: the more specific "/api/events" wins
 // over "/api/".
-func buildMux(apiH *api.API, hub *sse.Hub) *http.ServeMux {
+func buildMux(apiH *api.API, hub *sse.Hub) http.Handler {
 	mux := http.NewServeMux()
 	// SSE: auth-gated AND host-pinned (DESIGN §7). RequireAuth admits the tailnet
 	// owner OR a valid session; RequireHost rejects DNS rebinding.
 	mux.Handle("/api/events", apiH.RequireAuth(apiH.RequireHost(hub)))
 	mux.Handle("/api/", apiH.Routes())
 	mux.Handle("/", http.FileServerFS(web.FS))
-	return mux
+	return securityHeaders(mux)
+}
+
+// securityHeaders adds defense-in-depth response headers to every response —
+// cheap hardening that matters most on the optional plain-HTTP host port. The CSP
+// keeps the SPA fully working (same-origin scripts/styles, inline styles set via
+// the DOM, data: SVGs) while blocking external/injected scripts, framing, and
+// base-uri hijacking. The SPA is written CSP-clean (no inline <script>); scripts
+// stay 'self'-only, which is the load-bearing XSS protection.
+func securityHeaders(next http.Handler) http.Handler {
+	const csp = "default-src 'self'; style-src 'self' 'unsafe-inline'; " +
+		"img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Content-Security-Policy", csp)
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Referrer-Policy", "same-origin")
+		next.ServeHTTP(w, r)
+	})
 }
 
 // allowedHosts builds the Host-header allowlist for DNS-rebinding defense: the

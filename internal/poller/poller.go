@@ -75,8 +75,9 @@ const (
 // HTTP-ish status hints the api maps onto response codes (read structurally, so
 // api stays decoupled from this concrete error type). See controlError.
 const (
-	statusBadRequest = 400
-	statusBadGateway = 502
+	statusBadRequest    = 400
+	statusUnprocessable = 422 // zone policy refusal (docs/design/zones.md)
+	statusBadGateway    = 502
 )
 
 // Poller owns the refresh loop and writes Snapshots into the Store.
@@ -218,9 +219,13 @@ func (p *Poller) SetExitNode(ctx context.Context, routerID, targetStableID strin
 		allowed, inAnyZone := p.allowedExitNodeSet(routerID)
 		if inAnyZone {
 			if _, ok := allowed[nv.StableID]; !ok {
-				return store.RouterView{}, preflightErr(
-					"exit node %q is not allowed for %q in its zone(s)",
-					displayName(nv), displayName(prevRV.Node))
+				// A zone-policy refusal is a 422 (the request is well-formed but
+				// violates the zone's allowed-exit-node set), per docs/design/zones.md.
+				return store.RouterView{}, &controlError{
+					status: statusUnprocessable,
+					msg: fmt.Sprintf("exit node %q is not allowed for %q in its zone(s)",
+						displayName(nv), displayName(prevRV.Node)),
+				}
 			}
 		}
 		target = &store.ExitNodeRef{StableID: nv.StableID, Name: nv.Name, IP: ip}
@@ -560,8 +565,14 @@ func (p *Poller) withRouter(addr string, mutate func(*store.RouterView)) (*store
 		}
 	}
 	return &store.Snapshot{
-		Nodes:     cur.Nodes,
-		Routers:   routers,
+		Nodes:   cur.Nodes,
+		Routers: routers,
+		// Carry the current resolved groups forward: SetExitNode never mutates zone
+		// definitions, and dropping them here would empty Snapshot.Groups on the
+		// pending+final broadcasts, collapsing the UI's zone tabs until the next
+		// full Refresh (~poll interval). cur.Groups is read-only, so reusing it
+		// keeps the immutable snapshot whole.
+		Groups:    cur.Groups,
 		NetmapAt:  cur.NetmapAt,
 		NetmapErr: cur.NetmapErr,
 		BuiltAt:   time.Now(),

@@ -147,10 +147,14 @@ func (a *API) Routes() http.Handler {
 	// Zone/group CRUD (DESIGN docs/design/zones.md). Same middleware as the data
 	// routes: RequireAuth (here) + RequireHost + RequireCSRF (outer). The writes
 	// thus require auth + a valid CSRF token + an allowed Host, like exit-node.
-	data.HandleFunc("GET /api/groups", a.handleListGroups)
-	data.HandleFunc("POST /api/groups", a.handleCreateGroup)
-	data.HandleFunc("PUT /api/groups/{id}", a.handleUpdateGroup)
-	data.HandleFunc("DELETE /api/groups/{id}", a.handleDeleteGroup)
+	// Registered only when a group store is wired (it's optional in narrow unit
+	// tests); otherwise the routes 404 instead of nil-panicking in the handlers.
+	if a.groups != nil {
+		data.HandleFunc("GET /api/groups", a.handleListGroups)
+		data.HandleFunc("POST /api/groups", a.handleCreateGroup)
+		data.HandleFunc("PUT /api/groups/{id}", a.handleUpdateGroup)
+		data.HandleFunc("DELETE /api/groups/{id}", a.handleDeleteGroup)
+	}
 
 	mux := http.NewServeMux()
 	// Bootstrap endpoints (no session required; still Host-pinned + CSRF-checked):
@@ -412,7 +416,7 @@ func (a *API) handleSetExitNode(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		ExitNode string `json:"exitNode"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
 		writeErrDetail(w, http.StatusBadRequest, "invalid request body", err.Error(), "")
 		return
 	}

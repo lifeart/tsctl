@@ -803,8 +803,8 @@
   // DRAG or by an accessible per-consumer menu; both funnel into the SAME confirm +
   // POST flow as the cards, and are never-optimistic + zone-enforced.
 
-  var UNGROUPED = " ungrouped"; // sentinel zone id for the implicit section
-  var DIRECT_KEY = " direct";   // key for the "Direct" drop target
+  var UNGROUPED = "__tsctl_ungrouped__"; // sentinel zone id for the implicit section
+  var DIRECT_KEY = "__tsctl_direct__";   // key for the "Direct" drop target
   var DRAG_THRESHOLD = 6;            // px of movement before a click becomes a drag
 
   function snapGroups() { var s = state.snapshot; return s && Array.isArray(s.groups) ? s.groups : []; }

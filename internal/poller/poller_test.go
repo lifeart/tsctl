@@ -515,7 +515,11 @@ func TestSetExitNode_ZoneEnforcement(t *testing.T) {
 		fg := &fakeGroups{list: []store.Group{{ID: "z", Name: "Work", Consumers: []string{"router1"}, AllowedExitNodes: []string{"exit1"}}}}
 		p := New(st, &fakeNM{}, rc, fg, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
 		_, err := p.SetExitNode(context.Background(), "router1", "exit2") // online+approved, but NOT in zone
-		assertPreflight(t, err)
+		// A zone-policy refusal is 422 (well-formed but violates the zone), not 400.
+		var hs interface{ HTTPStatus() int }
+		if !errors.As(err, &hs) || hs.HTTPStatus() != 422 {
+			t.Fatalf("zone refusal must be a 422 control error, got %v", err)
+		}
 		if !strings.Contains(err.Error(), "not allowed") {
 			t.Errorf("error should explain the zone refusal, got %q", err.Error())
 		}
@@ -659,5 +663,44 @@ func TestRun_IdleSuspension(t *testing.T) {
 	c2 := bc.count()
 	if c2 != c1 {
 		t.Errorf("polling did not suspend after linger: %d -> %d", c1, c2)
+	}
+}
+
+// TestSetExitNode_PreservesGroupsInBroadcast is the regression for withRouter
+// dropping Snapshot.Groups: a SetExitNode (pending + final) must keep the resolved
+// zones, or the UI's zone tabs collapse until the next full Refresh.
+func TestSetExitNode_PreservesGroupsInBroadcast(t *testing.T) {
+	const routerIP, exitIP = "100.64.0.10", "100.64.0.20"
+	st := store.New()
+	// Seed a snapshot as a prior Refresh would: nodes, routers, AND resolved groups.
+	st.Store(&store.Snapshot{
+		Nodes: []store.NodeView{
+			{StableID: "router1", TailscaleIPs: []string{routerIP}, Online: true, Type: store.NodeRouter},
+			{StableID: "exit1", TailscaleIPs: []string{exitIP}, Online: true, ExitNodeOption: true, Type: store.NodeExitNode},
+		},
+		Routers: []store.RouterView{
+			{Node: store.NodeView{StableID: "router1", TailscaleIPs: []string{routerIP}}, Reachable: true, State: store.RouterOK},
+		},
+		Groups: []store.GroupView{
+			{ID: "z", Name: "Work",
+				Consumers:        []store.GroupMember{{StableID: "router1"}},
+				AllowedExitNodes: []store.GroupMember{{StableID: "exit1"}}},
+		},
+	})
+	rc := &fakeRC{setRT: store.RouterRuntime{Online: true, Current: &store.ExitNodeRef{StableID: "exit1", IP: exitIP}}}
+	fg := &fakeGroups{list: []store.Group{{ID: "z", Name: "Work", Consumers: []string{"router1"}, AllowedExitNodes: []string{"exit1"}}}}
+	bc := newFakeBC()
+	p := New(st, &fakeNM{}, rc, fg, []string{routerIP}, bc, make(chan int), time.Second, nopLogf)
+
+	if _, err := p.SetExitNode(context.Background(), "router1", "exit1"); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	if bc.count() == 0 {
+		t.Fatal("expected pending + final broadcasts")
+	}
+	// withRouter produces both the stored and the broadcast snapshots; the final
+	// stored snapshot must still carry the resolved zones.
+	if got := len(st.Load().Groups); got != 1 {
+		t.Errorf("stored snapshot Groups = %d after SetExitNode, want 1 (must survive)", got)
 	}
 }
