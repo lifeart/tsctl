@@ -376,7 +376,15 @@ Two things are mandatory for a NAS deployment:
    the node's identity key; if it's lost, the node re-registers as a brand-new
    device on every restart (new IP, ACL churn). The compose file uses a named
    volume `tsctl-state`.
-2. **Authenticate headlessly** (no interactive login on a NAS — see below).
+2. **Make that volume writable by the container.** The image runs **nonroot**
+   (uid `65532`). If the volume or bind dir is **root-owned** — common on
+   Synology/DSM — tsnet fails at boot with `permission denied` on
+   `/var/lib/tsctl/…`. Fix it by **running the container as root** (`user: "0:0"`,
+   which the [Synology compose](deploy/docker-compose.synology.yml) does — the
+   container is the security boundary), **or** by making the dir writable by
+   `65532` (bind mount → `chown -R 65532:65532 <hostdir>`; named volume →
+   `docker run --rm -v tsctl-state:/s busybox chown -R 65532:65532 /s`).
+3. **Authenticate headlessly** (no interactive login on a NAS — see below).
 
 Then, with [`docker-compose.yml`](docker-compose.yml):
 
@@ -452,6 +460,24 @@ Pick one (in the [Tailscale admin console](https://login.tailscale.com/admin)):
 Don't forget the [Required ACL](#required-acl) and to enable Tailscale SSH on the
 routers (see [End-to-end verification](#end-to-end-verification)) — the NAS host
 only needs outbound internet; everything else rides the tailnet.
+
+## Troubleshooting
+
+tsctl logs to stderr and fails **loud** (no silent swallowing); with a restart
+policy it will loop on a fatal startup error. Match the log line:
+
+| Log line | Cause | Fix |
+|---|---|---|
+| `logpolicy.Config.Save … /var/lib/tsctl/…: permission denied` | The state volume isn't writable by the nonroot uid `65532` — NAS/DSM often creates it root-owned. | Run as root (`user: "0:0"`, as the Synology compose does) **or** `chown` the dir to `65532` — see [Run on a NAS](#run-on-a-nas-docker) step 2. |
+| `tsnet.Up: backend: invalid key: unable to validate API key` | `TS_AUTHKEY` is bad: an **API token** (`tskey-api-…`, can't enroll a node), a typo / stray character (e.g. a doubled `t`), expired, revoked, single-use already used, or from another tailnet. | Use a **`tskey-auth-…`** auth key or **`tskey-client-…`** OAuth secret (never `tskey-api-…`); paste it whole, no spaces/line-breaks; regenerate if expired. See [authenticating headlessly](#authenticating-tailscale-on-a-headless-nas). |
+| `tsnet.Up: backend: requested tags [tag:tsctl] are invalid or not permitted` | The tag can't be applied: `tag:tsctl` is **missing from the ACL `tagOwners`**, and/or the auth key **doesn't carry `tag:tsctl`**. | Add `tag:tsctl` (+ `tag:router`) to `tagOwners` (see [Required ACL](#required-acl)), **and** generate the auth key / OAuth client **with the `tag:tsctl` tag**. Both are required. |
+| `LocalBackend state is NeedsLogin` repeating with one of the above | Not enrolled yet; tsnet keeps retrying the bad `TS_AUTHKEY`. | Fix the key/tag error above — it enrolls once, then persists and stops needing the token. If it still loops after a known-good key, the state volume may hold stale partial state: clear `tsctl-state` and retry. |
+| UI on the host port shows a blank/blocked page; logs show a **403** | The anti-DNS-rebinding **Host check** rejected the address you browsed to. | Add that hostname/IP (without the port) to `TSCTL_ALLOWED_HOSTS` — see [Reaching the UI](#run-on-a-nas-docker). |
+| Router shows **"Control error"** (online, but tsctl can't drive it) | SSH to the router failed: wrong `ssh`/`ip-password` setup — bad password, host-key mismatch, missing `TSCTL_ROUTER_ADDRS` mapping, or the ACL/`tailscale set --ssh` not done. | Prove the path in isolation with [`tsctl spike <100.x>`](#tsctl-spike--prove-the-router-transport-on-your-real-network); the error it prints is the exact reason. |
+
+When in doubt, prove the two external dependencies separately before running the
+full server: **enrollment** (the token + tags + ACL — the node appears in your
+admin console tagged `tag:tsctl`) and the **router transport** (`tsctl spike`).
 
 ## Deploy (systemd)
 
