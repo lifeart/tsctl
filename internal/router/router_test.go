@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -204,7 +205,7 @@ func TestSetExitNode_Set(t *testing.T) {
 
 	want := []string{
 		"nohup sh -c 'sleep 60; [ -f /tmp/tsctl-keep-test-1 ] && exit 0; tailscale set --exit-node=' >/dev/null 2>&1 &",
-		"tailscale set --exit-node=100.64.0.5 --exit-node-allow-lan-access=true",
+		"tailscale set --exit-node=100.64.0.5",
 		"tailscale status --json",
 		": > /tmp/tsctl-keep-test-1",
 	}
@@ -262,7 +263,7 @@ func TestSetExitNode_FailedConfirmNoKeep(t *testing.T) {
 	// arm, apply, status -- and crucially NO keep command.
 	want := []string{
 		"nohup sh -c 'sleep 60; [ -f /tmp/tsctl-keep-test-3 ] && exit 0; tailscale set --exit-node=' >/dev/null 2>&1 &",
-		"tailscale set --exit-node=100.64.0.5 --exit-node-allow-lan-access=true",
+		"tailscale set --exit-node=100.64.0.5",
 		"tailscale status --json",
 	}
 	got := f.cmds()
@@ -367,5 +368,38 @@ func TestSerializedPerRouter(t *testing.T) {
 	defer sr.mu.Unlock()
 	if sr.maxSeen != 1 {
 		t.Errorf("max concurrent router commands = %d, want 1 (DESIGN §6: one in flight per router)", sr.maxSeen)
+	}
+}
+
+func boolPtr(b bool) *bool { return &b }
+
+// TestApplyCmd_ArgPreservation locks in that an exit-node change is a pure,
+// incremental `tailscale set --exit-node=...` -- it never emits `tailscale up`
+// (which would reset advertise-routes/accept-routes/--ssh/etc.) and only touches
+// --exit-node-allow-lan-access when the operator opts in (lanAccess != nil).
+func TestApplyCmd_ArgPreservation(t *testing.T) {
+	tests := []struct {
+		name      string
+		target    string
+		setting   bool
+		lanAccess *bool
+		want      string
+	}{
+		{"set, preserve (default)", "100.64.0.5", true, nil, "tailscale set --exit-node=100.64.0.5"},
+		{"set, force lan true", "100.64.0.5", true, boolPtr(true), "tailscale set --exit-node=100.64.0.5 --exit-node-allow-lan-access=true"},
+		{"set, force lan false", "100.64.0.5", true, boolPtr(false), "tailscale set --exit-node=100.64.0.5 --exit-node-allow-lan-access=false"},
+		{"clear, preserve", "", false, nil, "tailscale set --exit-node="},
+		{"clear ignores lanAccess", "", false, boolPtr(true), "tailscale set --exit-node="},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := applyCmd(tc.target, tc.setting, tc.lanAccess)
+			if got != tc.want {
+				t.Errorf("applyCmd = %q, want %q", got, tc.want)
+			}
+			if strings.Contains(got, "tailscale up") {
+				t.Errorf("applyCmd must never use `tailscale up` (resets prefs); got %q", got)
+			}
+		})
 	}
 }

@@ -83,7 +83,10 @@ window  := 60s (const)
 nohup sh -c 'sleep 60; [ -f <marker> ] && exit 0; tailscale set --exit-node=<prevArg>' >/dev/null 2>&1 &
 
 # 2. APPLY (one exec):
-tailscale set --exit-node=<targetArg> [--exit-node-allow-lan-access=true when setting, not clearing]
+tailscale set --exit-node=<targetArg>
+#   (post-Phase-B: --exit-node-allow-lan-access is PRESERVED by default and only
+#    appended when the operator opts in via -exit-node-lan-access=true|false;
+#    `set` is incremental so all other `tailscale up` prefs are preserved.)
 
 # 3. CONFIRM: re-read `tailscale status --json` (reuse Status logic); ok = reachable && actual exit node == target
 # 4. KEEP on success only (one exec): : > <marker>     # the sleeping revert sees the file and exits without reverting

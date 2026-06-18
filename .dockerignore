@@ -1,0 +1,17 @@
+# Keep the build context small + deterministic.
+/tsctl
+/dist/
+*.exe
+/tsnet-state/
+config.local.yaml
+*.authkey
+.env
+web/node_modules/
+web/dist/
+.git/
+.github/
+*.md
+deploy/
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,39 @@
+# tsctl on a NAS — Docker Compose (works with Synology Container Manager,
+# QNAP Container Station, Portainer, Unraid compose, TrueNAS, plain docker/podman).
+#
+# Auth (headless): tsctl joins the tailnet as a tagged node. Provide TS_AUTHKEY
+# ONCE for first enrollment — a tagged auth key, OR (recommended) an OAuth client
+# secret (tskey-client-...) whose client owns tag:tsctl and has the auth_keys
+# scope (OAuth secrets don't expire). After first run the node key persists in the
+# tsctl-state volume and TS_AUTHKEY is no longer needed — you can remove it.
+#
+# Networking: tsnet is userspace — NO cap_add, NO /dev/net/tun, NO host network.
+# The web UI is on the TAILNET: open http://tsctl/ (the -hostname) from any
+# tailnet device. There is intentionally NO published UI port.
+
+services:
+  tsctl:
+    image: ghcr.io/lifeart/tsctl:latest   # or build: . (see Dockerfile)
+    # build: .
+    container_name: tsctl
+    restart: unless-stopped
+    environment:
+      # --- one-time enrollment (remove after the node is registered) ---
+      TS_AUTHKEY: ${TS_AUTHKEY:?set TS_AUTHKEY for first enrollment (tag:tsctl auth key or OAuth client secret)}
+      # --- required ---
+      TSCTL_OWNER: ${TSCTL_OWNER:?your tailnet login email, e.g. you@example.com}
+      TSCTL_ROUTERS: ${TSCTL_ROUTERS:?comma-separated router 100.x IPv4s, e.g. 100.64.0.10,100.64.0.11}
+      # --- optional ---
+      TSCTL_HOSTNAME: tsctl
+      TSCTL_SSH_USER: root
+      # preserve|true|false — 'preserve' (default) never touches the router's
+      # --exit-node-allow-lan-access (or any other `tailscale up` setting).
+      TSCTL_EXIT_NODE_LAN_ACCESS: preserve
+    volumes:
+      - tsctl-state:/var/lib/tsctl        # PERSISTENT — holds the node key; do not lose it
+    # No ports: the UI is tailnet-only. No cap_add / devices: userspace netstack.
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  tsctl-state:

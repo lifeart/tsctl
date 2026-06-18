@@ -149,7 +149,7 @@ The **device's actual selection is the source of truth**; the UI never shows suc
 
 1. **Pre-flight:** refuse if target is offline or `ExitNodeOption==false` (unapproved), or if it would create a loop (target reached *through* this router). Record current exit node (`prev`).
 2. **Arm local revert on the router BEFORE applying** (backend can't revert if the link dies): `(sleep 60; tailscale set --exit-node=<prev-or-empty>) &` (or an `at`/cron one-shot). State → `pending`.
-3. **Apply:** `tailscale set --exit-node=<targetIP>` (set `--exit-node-allow-lan-access=true` where it works, but it's buggy on OpenWRT — don't rely on it; keep an out-of-band recovery path).
+3. **Apply:** `tailscale set --exit-node=<targetIP>`. `set` is **incremental** (unlike `up`, which resets unspecified prefs), so the router's advertise-routes, accept-routes, `--ssh`, accept-dns, hostname, advertise-tags, etc. are all **preserved** on the change *and* on the revert. The only non-exit-node pref tsctl can touch is `--exit-node-allow-lan-access`, and by default it is **preserved** too (not written); `-exit-node-lan-access=true|false` opts tsctl into managing it (it's buggy on OpenWRT — don't rely on it; keep an out-of-band recovery path).
 4. **Confirm:** re-read `status --json` over the tailnet; reconcile `actual`. Exit-node changes do NOT sever the tailnet/SSH control path (only internet egress is routed), so this read should succeed.
 5. On confirmed success → **cancel the scheduled revert** and require explicit user **"Keep"** within the window; else the router self-heals. On unknown/failed → keep last-confirmed `actual` + explicit error; rely on `set` idempotency to retry.
 

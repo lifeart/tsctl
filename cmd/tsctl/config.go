@@ -26,6 +26,12 @@ type Config struct {
 	Owner        string        // tailnet login allowed to control (RequireOwner, DESIGN §7)
 	AllowedHosts []string      // Host-header allowlist for CSRF/rebinding defense (DESIGN §7)
 	PollInterval time.Duration // refresh cadence while ≥1 client is connected (DESIGN §6)
+
+	// ExitNodeLANAccess controls the only non-exit-node pref tsctl ever writes.
+	// nil = PRESERVE the router's existing --exit-node-allow-lan-access (default);
+	// non-nil = tsctl sets it to this value when setting an exit node. Other
+	// `tailscale up` settings are always preserved (we use incremental `set`).
+	ExitNodeLANAccess *bool
 }
 
 // env returns the env var or a default.
@@ -56,9 +62,24 @@ func loadConfig(args []string) (*Config, error) {
 	fs.StringVar(&c.Owner, "owner", env("TSCTL_OWNER", ""), "tailnet login (email) allowed to control")
 	allowed := fs.String("allowed-hosts", env("TSCTL_ALLOWED_HOSTS", ""), "extra comma-separated Host values to allow (DNS-rebinding defense)")
 	fs.DurationVar(&c.PollInterval, "poll-interval", 30*time.Second, "refresh cadence while a client is connected")
+	lanAccess := fs.String("exit-node-lan-access", env("TSCTL_EXIT_NODE_LAN_ACCESS", "preserve"),
+		"manage --exit-node-allow-lan-access on the router: preserve|true|false (preserve keeps the router's existing setting)")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
+	}
+
+	switch strings.ToLower(strings.TrimSpace(*lanAccess)) {
+	case "", "preserve", "keep":
+		c.ExitNodeLANAccess = nil
+	case "true", "yes", "on", "1":
+		v := true
+		c.ExitNodeLANAccess = &v
+	case "false", "no", "off", "0":
+		v := false
+		c.ExitNodeLANAccess = &v
+	default:
+		return nil, fmt.Errorf("invalid -exit-node-lan-access %q: want preserve|true|false", *lanAccess)
 	}
 	for _, r := range strings.Split(*routers, ",") {
 		if r = strings.TrimSpace(r); r != "" {

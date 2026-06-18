@@ -139,7 +139,7 @@ func runServe(args []string, lg *log.Logger) error {
 	// --- wiring ---
 	st := store.New()
 	mapper := netmap.New(lc) // implements poller.Netmapper AND api.WhoIser
-	rc := router.New(srv.Dial, cfg.SSHUser, cfg.SSHTimeout)
+	rc := router.New(srv.Dial, cfg.SSHUser, cfg.SSHTimeout, cfg.ExitNodeLANAccess)
 	// hub.Transitions() drives the poller's idle suspension; api.EncodeSnapshot
 	// makes SSE frames identical to the REST Snapshot DTO (PHASE_B §3).
 	hub := sse.New(st, api.EncodeSnapshot)

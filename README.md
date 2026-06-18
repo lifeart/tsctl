@@ -50,9 +50,18 @@ export TS_AUTHKEY=tskey-auth-xxxxx
 
 Config is **flags + env only** (no YAML, no committed secrets). Each flag has an
 env equivalent: `TSCTL_HOSTNAME`, `TSCTL_STATE_DIR`, `TSCTL_LISTEN`,
-`TSCTL_HEALTH_ADDR`, `TSCTL_ROUTERS`, `TSCTL_SSH_USER`, `TSCTL_DEBUG`, and
+`TSCTL_HEALTH_ADDR`, `TSCTL_ROUTERS`, `TSCTL_SSH_USER`, `TSCTL_OWNER`,
+`TSCTL_ALLOWED_HOSTS`, `TSCTL_EXIT_NODE_LAN_ACCESS`, `TSCTL_DEBUG`, and
 `TS_AUTHKEY`. After first enrollment the node key lives in the state dir and the
 auth key is no longer needed — drop it.
+
+**Your router's other settings are preserved.** Changing an exit node runs an
+incremental `tailscale set --exit-node=…` on the router — never `tailscale up`
+(which would reset unspecified prefs). So advertise-routes, accept-routes,
+`--ssh`, accept-dns, hostname, advertise-tags, etc. survive both the change and
+the dead-man's-switch revert. The one exception is `--exit-node-allow-lan-access`:
+by default tsctl **preserves** it too (`TSCTL_EXIT_NODE_LAN_ACCESS=preserve`); set
+it to `true`/`false` only if you want tsctl to manage that single flag.
 
 Health check (loopback only, never exposed to the tailnet or LAN):
 
@@ -168,6 +177,76 @@ Do not claim e2e success without completing steps 3–5 against a real router.
   not fire merely because egress is broken while the selection looks correct.
 - **Planned:** an explicit-user "Keep" gate plus an egress-reachability probe
   before keeping (tracked as Sec-M4).
+
+## Run on a NAS (Docker)
+
+tsctl is a great NAS workload: `tsnet` does **userspace** networking, so the
+container needs **no `NET_ADMIN`, no `/dev/net/tun`, no host networking** — just
+outbound internet to reach Tailscale. The image is a ~24 MB static binary on
+distroless, running **nonroot**. Works on Synology Container Manager, QNAP
+Container Station, Unraid, TrueNAS, Portainer, or plain `docker`/`podman`.
+
+```sh
+docker build -t tsctl:latest .                 # or pull a published image
+```
+
+Two things are mandatory for a NAS deployment:
+
+1. **Persist the state directory.** Mount a volume at `/var/lib/tsctl`. It holds
+   the node's identity key; if it's lost, the node re-registers as a brand-new
+   device on every restart (new IP, ACL churn). The compose file uses a named
+   volume `tsctl-state`.
+2. **Authenticate headlessly** (no interactive login on a NAS — see below).
+
+Then, with [`docker-compose.yml`](docker-compose.yml):
+
+```sh
+export TS_AUTHKEY=tskey-client-XXXX            # see auth options below
+export TSCTL_OWNER=you@example.com             # only this tailnet login may control
+export TSCTL_ROUTERS=100.64.0.10,100.64.0.11   # your OpenWRT routers' 100.x IPv4s
+docker compose up -d
+docker compose logs -f tsctl                   # watch enrollment
+```
+
+**Reaching the UI:** there is **no published port** — the UI is served on the
+**tailnet**. From any device on your tailnet, open `http://tsctl/` (the
+`-hostname`, via MagicDNS) or the node's `100.x` IP. `/healthz` stays bound to
+loopback *inside* the container by design (it's a security boundary, not a NAS
+health endpoint); rely on the container restart policy + the Tailscale admin
+console for liveness.
+
+### Authenticating Tailscale on a headless NAS
+
+tsctl joins the tailnet as a **tagged** node (`tag:tsctl`). Tagged nodes can't be
+brought up by an ordinary interactive user login, so you give it a **token once**
+via `TS_AUTHKEY`. After first enrollment the node key lives in the `tsctl-state`
+volume and the token is no longer used — you can delete it from the environment.
+Tagged nodes have **key expiry disabled by default**, so it never needs re-auth.
+
+Pick one (in the [Tailscale admin console](https://login.tailscale.com/admin)):
+
+- **OAuth client secret — recommended for a NAS.** Settings → OAuth clients →
+  generate a client with the **`auth_keys`** scope and tag **`tag:tsctl`**. Use
+  its secret (`tskey-client-…`) as `TS_AUTHKEY`. OAuth client secrets **don't
+  expire**, so even a wiped state volume re-enrolls with no manual step.
+- **Tagged auth key — simplest.** Settings → Keys → Generate auth key; enable
+  **Pre-approved** (if device approval is on) and add the tag **`tag:tsctl`**. Use
+  the `tskey-auth-…` value as `TS_AUTHKEY`. Auth keys expire in ≤90 days, but
+  since it's only needed for the one-time enrollment that's fine.
+- **Interactive web login — possible, not ideal.** If you start tsctl with **no**
+  `TS_AUTHKEY`, tsnet prints an `https://login.tailscale.com/…` URL to its logs
+  (`docker compose logs tsctl`); open it in a browser and approve. Caveat: a user
+  login won't apply `tag:tsctl` unless you're a tag owner, so you'd then have to
+  tag the device in the console. The token paths above avoid that — prefer them.
+
+> Note on token types: `tskey-auth-…` (auth key) and `tskey-client-…` (OAuth
+> client secret) both work as `TS_AUTHKEY`. An **API access token**
+> (`tskey-api-…`) is for the REST API and will **not** enroll a node — don't use
+> it here. tsctl v1 needs no API token at all.
+
+Don't forget the [Required ACL](#required-acl) and to enable Tailscale SSH on the
+routers (see [End-to-end verification](#end-to-end-verification)) — the NAS host
+only needs outbound internet; everything else rides the tailnet.
 
 ## Deploy (systemd)
 

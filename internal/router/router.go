@@ -80,6 +80,13 @@ type Client struct {
 	runner    commandRunner // defaults to the real ssh runner built from dial
 	newMarker func() string // keep-marker path generator; settable for tests
 
+	// lanAccess controls the ONLY non-exit-node preference tsctl ever touches.
+	// nil (default) = PRESERVE: emit a bare `tailscale set --exit-node=...` so the
+	// router keeps whatever --exit-node-allow-lan-access it already has (and every
+	// other pref -- `set` is incremental, unlike `up`). Non-nil = tsctl manages it,
+	// appending --exit-node-allow-lan-access=<v> when SETTING an exit node.
+	lanAccess *bool
+
 	// Per-addr serialization (DESIGN §6: one command in flight per router). A
 	// keyed mutex -- NOT singleflight, which dedups concurrent identical work;
 	// here we need mutual exclusion so two SetExitNode calls to one router can't
@@ -90,8 +97,11 @@ type Client struct {
 }
 
 // New constructs a router Client. dial is tsnet.Server.Dial; user is "root".
-func New(dial DialFunc, user string, timeout time.Duration) *Client {
-	c := &Client{dial: dial, user: user, timeout: timeout, newMarker: defaultMarker, locks: make(map[string]*sync.Mutex)}
+// lanAccess is nil to PRESERVE the router's existing --exit-node-allow-lan-access
+// (the safe default -- tsctl then changes only --exit-node), or non-nil for tsctl
+// to manage that one flag when setting an exit node.
+func New(dial DialFunc, user string, timeout time.Duration, lanAccess *bool) *Client {
+	c := &Client{dial: dial, user: user, timeout: timeout, lanAccess: lanAccess, newMarker: defaultMarker, locks: make(map[string]*sync.Mutex)}
 	c.runner = sshRunnerFunc(c.runSSH)
 	return c
 }
@@ -175,7 +185,7 @@ func (c *Client) SetExitNode(ctx context.Context, addr string, target *store.Exi
 
 	// 2. APPLY (step 3). The marker is NOT written yet, so if anything below
 	// fails the armed revert fires and the router self-heals to prev.
-	if _, stderr, exit, err := c.runner.run(ctx, addr, applyCmd(targetArg, setting)); err != nil {
+	if _, stderr, exit, err := c.runner.run(ctx, addr, applyCmd(targetArg, setting, c.lanAccess)); err != nil {
 		return store.RouterRuntime{}, fmt.Errorf("router %s: apply exit-node: %w", addr, err)
 	} else if exit != 0 {
 		return store.RouterRuntime{}, &CommandError{Addr: addr, Cmd: "apply exit-node", StderrText: string(stderr), Exit: exit}
@@ -432,13 +442,19 @@ func armCmd(marker, prevArg string) string {
 		revertWindowSeconds, marker, prevArg)
 }
 
-// applyCmd sets (or clears) the exit node. --exit-node-allow-lan-access is added
+// applyCmd builds the incremental `tailscale set` that changes ONLY the exit node
+// (every other pref -- advertise-routes, accept-routes, --ssh, accept-dns,
+// hostname, advertise-tags -- is preserved because this is `set`, not `up`). The
+// optional --exit-node-allow-lan-access is appended ONLY when SETTING an exit node
+// AND the operator opted tsctl into managing it (lanAccess != nil); otherwise the
+// router's existing value is preserved. (old signature below was setting-only.)
 // only when SETTING, not when clearing (DESIGN §8 step 3).
-func applyCmd(targetArg string, setting bool) string {
-	if setting {
-		return fmt.Sprintf("tailscale set --exit-node=%s --exit-node-allow-lan-access=true", targetArg)
+func applyCmd(targetArg string, setting bool, lanAccess *bool) string {
+	cmd := "tailscale set --exit-node=" + targetArg
+	if setting && lanAccess != nil {
+		cmd += fmt.Sprintf(" --exit-node-allow-lan-access=%t", *lanAccess)
 	}
-	return fmt.Sprintf("tailscale set --exit-node=%s", targetArg)
+	return cmd
 }
 
 // keepCmd drops the keep-marker so the armed revert exits without reverting.
