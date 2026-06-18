@@ -113,6 +113,14 @@ type Poller struct {
 	// modify→Store; without this they clobber each other. Readers still Load()
 	// lock-free -- mu only guards writers, never the read path.
 	mu sync.Mutex
+
+	// setSeq is a per-router (keyed by addr) monotonic counter of SetExitNode ops,
+	// guarded by mu. The slow apply runs OUTSIDE mu, so two concurrent sets on the
+	// same router can finish out of order; a later set bumps the counter, and the
+	// earlier op's reconcile checks it and SKIPS publishing its now-stale captured
+	// result -- so the snapshot never shows a confirmed exit node that contradicts
+	// the device. The newest op owns the published state.
+	setSeq map[string]uint64
 }
 
 // New constructs a Poller. transitions is the SSE hub's Transitions() channel
@@ -137,6 +145,7 @@ func New(st *store.Store, nm Netmapper, rc RouterClient, groups GroupReader, rou
 		interval:    interval,
 		linger:      defaultLinger,
 		logf:        logf,
+		setSeq:      make(map[string]uint64),
 	}
 }
 
@@ -250,6 +259,8 @@ func (p *Poller) SetExitNode(ctx context.Context, routerID, targetStableID strin
 	// (M4) -- not StableID, which goes empty for a router missing from the netmap,
 	// which would make this a silent no-op that stores a blank RouterView.
 	p.mu.Lock()
+	p.setSeq[addr]++
+	mySeq := p.setSeq[addr] // this op's sequence; a later set bumps it past mine
 	pending, ok := p.withRouter(addr, func(rv *store.RouterView) {
 		rv.Desired = target
 		rv.State = store.RouterPending
@@ -290,6 +301,10 @@ func (p *Poller) SetExitNode(ctx context.Context, routerID, targetStableID strin
 
 	var updated store.RouterView
 	p.mu.Lock()
+	// If a newer SetExitNode on this router started while our slow apply ran, our
+	// captured result is stale -- do NOT publish it (it could show a confirmed exit
+	// node the device is no longer on). The newest op owns the published snapshot.
+	superseded := p.setSeq[addr] != mySeq
 	final, ok := p.withRouter(addr, func(rv *store.RouterView) {
 		switch {
 		case setErr == nil: // confirmed
@@ -335,7 +350,7 @@ func (p *Poller) SetExitNode(ctx context.Context, routerID, targetStableID strin
 		}
 		updated = *rv
 	})
-	if ok {
+	if ok && !superseded {
 		p.store.Store(final)
 	}
 	p.mu.Unlock()
@@ -352,7 +367,9 @@ func (p *Poller) SetExitNode(ctx context.Context, routerID, targetStableID strin
 			detail: fmt.Sprintf("router %q vanished from the snapshot before its result could be reconciled", routerID),
 		}
 	}
-	p.bc.Broadcast(final)
+	if !superseded {
+		p.bc.Broadcast(final) // a superseded op never publishes; the newer op owns it
+	}
 
 	switch {
 	case setErr == nil:
@@ -586,9 +603,15 @@ func (p *Poller) buildListedRouterView(addr string, nodes []store.NodeView, prev
 		rv.LastError = "node is offline"
 		return rv
 	}
-	// Contacted before (any real state, e.g. a failed/unconfirmed set) -> keep it,
-	// so the result + LastError survive across polls instead of flipping to unprobed.
-	if prevRV != nil && prevRV.State != "" && prevRV.State != store.RouterUnprobed {
+	// Online here. Carry forward ONLY an actual-contact result (a probe/set outcome:
+	// ok / unconfirmed / pending) so it survives across polls. Crucially, a carried
+	// RouterUnreachable is NOT kept: it came either from a previous offline poll or a
+	// transient failed contact, and since the fallback never re-dials it would stick
+	// FOREVER as a red "control error" with the picker disabled once the device comes
+	// back online (devices in the fallback set flap constantly). Reset it to unprobed
+	// so a flapped device recovers (picker re-enabled, re-probeable).
+	switch prevState(prevRV) {
+	case store.RouterOK, store.RouterUnconfirmed, store.RouterPending:
 		rv.State = prevRV.State
 		rv.Reachable = prevRV.Reachable
 		rv.LastError = prevRV.LastError
@@ -597,6 +620,14 @@ func (p *Poller) buildListedRouterView(addr string, nodes []store.NodeView, prev
 	rv.State = store.RouterUnprobed
 	rv.Reachable = false
 	return rv
+}
+
+// prevState returns prevRV.State, or "" if prevRV is nil.
+func prevState(prevRV *store.RouterView) store.RouterState {
+	if prevRV == nil {
+		return ""
+	}
+	return prevRV.State
 }
 
 // RefreshGroups rebuilds ONLY the Groups view of the current snapshot from the
@@ -853,6 +884,9 @@ func resolveMembers(ids []string, byID map[string]store.NodeView) []store.GroupM
 // holds even if the control node somehow lacks tag:tsctl.
 func autoDiscoverRouters(nodes []store.NodeView) (addrs []string, usedFallback bool) {
 	for _, n := range nodes {
+		if n.IsSelf || hasTag(n, tsctlTag) {
+			continue // never control a tsctl control node, even if it's tag:router too
+		}
 		if n.Type == store.NodeRouter {
 			if ip := primaryIP(n); ip != "" {
 				addrs = append(addrs, ip)

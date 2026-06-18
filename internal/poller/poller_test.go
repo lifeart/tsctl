@@ -267,6 +267,122 @@ func TestFallback_FailedSetStatePersistsAcrossPoll(t *testing.T) {
 	}
 }
 
+func TestAutoDiscover_ExcludesSelfFromManagedSet(t *testing.T) {
+	// A tsctl node double-tagged tag:router (+ IsSelf) must never be polled as a
+	// router -- the self-exclusion applies to the managed path, not just the fallback.
+	nodes := []store.NodeView{
+		{StableID: "r1", TailscaleIPs: []string{"100.64.0.10"}, Online: true, Type: store.NodeRouter},
+		{StableID: "self", TailscaleIPs: []string{"100.64.0.5"}, Online: true, IsSelf: true, Type: store.NodeRouter},
+	}
+	addrs, usedFallback := autoDiscoverRouters(nodes)
+	if usedFallback {
+		t.Fatal("tag:router present -> usedFallback must be false")
+	}
+	if len(addrs) != 1 || addrs[0] != "100.64.0.10" {
+		t.Errorf("managed set = %v, want only the real router (self excluded)", addrs)
+	}
+}
+
+func TestFallback_FlapOfflineThenOnlineRecoversToUnprobed(t *testing.T) {
+	// Regression for the review-fix over-correction: a fallback device that goes
+	// OFFLINE then back ONLINE must RECOVER to "unprobed" (picker re-enabled), not
+	// stay stuck "unreachable" forever (the fallback never re-dials). Fallback
+	// devices — phones/laptops — flap constantly, so a sticky control-error would be
+	// the common case.
+	piIP := "100.64.0.30"
+	nm := &fakeNM{nodes: []store.NodeView{
+		{StableID: "pi", TailscaleIPs: []string{piIP}, Online: false, Type: store.NodeGeneric},
+	}}
+	rc := &fakeRC{statusRT: store.RouterRuntime{Online: true}}
+	st := store.New()
+	p := New(st, nm, rc, nil, nil, newFakeBC(), make(chan int), time.Second, nopLogf)
+
+	if err := p.Refresh(context.Background()); err != nil {
+		t.Fatalf("poll1: %v", err)
+	}
+	if got := st.Load().Routers[0].State; got != store.RouterUnreachable {
+		t.Fatalf("offline poll: state=%q, want unreachable", got)
+	}
+	// Device flaps back online.
+	nm.nodes = []store.NodeView{{StableID: "pi", TailscaleIPs: []string{piIP}, Online: true, Type: store.NodeGeneric}}
+	if err := p.Refresh(context.Background()); err != nil {
+		t.Fatalf("poll2: %v", err)
+	}
+	if got := st.Load().Routers[0].State; got != store.RouterUnprobed {
+		t.Errorf("flap back online: state=%q, want unprobed (recovered, not stuck unreachable)", got)
+	}
+	if rc.statusCallCount() != 0 {
+		t.Errorf("fallback must not dial; Status calls=%d", rc.statusCallCount())
+	}
+}
+
+// seqRC is a RouterClient whose SetExitNode blocks per-target so a test can drive
+// a deterministic concurrent-set interleaving.
+type seqRC struct {
+	started chan string              // target IP, sent when SetExitNode is entered
+	gate    map[string]chan struct{} // per-target release
+}
+
+func (f *seqRC) Status(ctx context.Context, addr string) (store.RouterRuntime, error) {
+	return store.RouterRuntime{Online: true}, nil
+}
+func (f *seqRC) Probe(ctx context.Context, addr string) (string, error) { return "", nil }
+func (f *seqRC) SetExitNode(ctx context.Context, addr string, target, prev *store.ExitNodeRef) (store.RouterRuntime, error) {
+	ip := ""
+	if target != nil {
+		ip = target.IP
+	}
+	f.started <- ip
+	<-f.gate[ip]
+	return store.RouterRuntime{Online: true, Current: target}, nil
+}
+
+func TestSetExitNode_ConcurrentSameRouterNoFalseConfirm(t *testing.T) {
+	// M-1: two concurrent sets on the SAME router can finish out of order (the slow
+	// apply runs outside mu). The earlier op's stale reconcile must NOT publish a
+	// confirmed exit node the device is no longer on. The newest op owns the state.
+	const routerIP, exit1IP, exit2IP = "100.64.0.10", "100.64.0.20", "100.64.0.21"
+	st := store.New()
+	seedSnapshot2(st, routerIP, exit1IP, exit2IP)
+	rc := &seqRC{
+		started: make(chan string),
+		gate:    map[string]chan struct{}{exit1IP: make(chan struct{}), exit2IP: make(chan struct{})},
+	}
+	p := New(st, &fakeNM{}, rc, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+
+	type res struct {
+		rv  store.RouterView
+		err error
+	}
+	g1, g2 := make(chan res, 1), make(chan res, 1)
+
+	// G1(exit1) enters step 1 FIRST -> lower seq.
+	go func() { rv, err := p.SetExitNode(context.Background(), "router1", "exit1"); g1 <- res{rv, err} }()
+	if got := <-rc.started; got != exit1IP {
+		t.Fatalf("expected G1(exit1) to enter first, got %q", got)
+	}
+	// G2(exit2) enters step 1 SECOND -> higher seq, supersedes G1.
+	go func() { rv, err := p.SetExitNode(context.Background(), "router1", "exit2"); g2 <- res{rv, err} }()
+	if got := <-rc.started; got != exit2IP {
+		t.Fatalf("expected G2(exit2) second, got %q", got)
+	}
+
+	// Release G2 first: it confirms exit2 and publishes it.
+	close(rc.gate[exit2IP])
+	<-g2
+	// Then release G1: its captured (exit1) reconcile is now stale -> must be skipped.
+	close(rc.gate[exit1IP])
+	<-g1
+
+	rv := findRouterViewByStableID(st.Load(), "router1")
+	if rv == nil || rv.CurrentExitNode == nil {
+		t.Fatalf("router1 has no current exit node: %+v", rv)
+	}
+	if rv.CurrentExitNode.IP != exit2IP {
+		t.Errorf("snapshot shows exit %q, want exit2 %q — a stale concurrent set published a false-confirmed exit node", rv.CurrentExitNode.IP, exit2IP)
+	}
+}
+
 func TestRefreshGroups_RebuildsAndBroadcastsWithoutDial(t *testing.T) {
 	// Creating/editing a zone calls RefreshGroups: it must re-render Groups from the
 	// live store and broadcast IMMEDIATELY, without re-dialing any router.

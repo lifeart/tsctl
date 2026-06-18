@@ -502,6 +502,9 @@
     // Apply after the scripted latency, then broadcast a fresh frame (the SPA
     // reads the device's ACTUAL state from the returned RouterView + SSE).
     return delay(APPLY_MS, null).then(function () {
+      // A set CONTACTS the device, so it's no longer "unprobed" — mirrors the real
+      // backend, where SetExitNode reconciles a fallback device to a real state.
+      rt.unprobed = false;
       var resp;
       if (!targetID) {
         // Clear -> confirmed Direct.

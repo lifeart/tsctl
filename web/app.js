@@ -911,6 +911,10 @@
       toast("warn", "Sent, not confirmed", "The change was applied to " + routerName + " but couldn’t be confirmed. It will auto-revert if it can’t confirm.");
     } else if (st === "unreachable") {
       toast("err", routerName + " unreachable", rv.lastError || "The router could not be reached.");
+    } else {
+      // Any other post-set state (e.g. an unexpected "pending"/"unprobed"): never
+      // leave a 200 with no feedback. Surface something rather than a silent no-op.
+      toast("warn", "Change submitted", rv.lastError || ("Submitted to " + routerName + " — check its status."));
     }
   }
 

@@ -593,10 +593,15 @@ const (
 	statusCmd           = "tailscale status --json"
 	revertWindowSeconds = 60 // dead-man's-switch window
 
-	// probeCmd is the read-only diagnostic run by Probe: kernel/uname, uptime,
-	// load average, and total/available memory. Portable across busybox/OpenWRT;
-	// it reads only and changes no state.
-	probeCmd = "uname -snr; cat /proc/uptime; cat /proc/loadavg; awk '/^MemTotal:|^MemAvailable:/{print $1, $2, $3}' /proc/meminfo"
+	// probeCmd is the read-only diagnostic run by Probe: kernel/uname, uptime, load
+	// average, and total/available memory. Portable across busybox/OpenWRT; reads
+	// only, changes no state. It is BEST-EFFORT by design: the reads are independent
+	// and `2>&1` folds any per-stage error into the output, then a trailing `true`
+	// forces exit 0 -- so the probe's pass/fail reflects whether the SSH session RAN
+	// (the thing being tested), NOT whether the last stage (awk/meminfo) happened to
+	// succeed. A real SSH/auth/host-key failure still surfaces as a transport error
+	// (not an exit code), so it is still correctly reported as a failure.
+	probeCmd = "{ uname -snr; cat /proc/uptime; cat /proc/loadavg; awk '/^MemTotal:|^MemAvailable:/{print $1, $2, $3}' /proc/meminfo; } 2>&1; true"
 )
 
 // armCmd schedules a self-reverting timer that fires unless marker exists.
