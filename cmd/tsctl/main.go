@@ -11,12 +11,15 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -57,28 +60,78 @@ var (
 // demoListen is the plain loopback address `tsctl demo` serves on (no tsnet).
 const demoListen = "127.0.0.1:8089"
 
+// version is the build version, stamped via -ldflags "-X main.version=...".
+// Defaults to "dev" for `go run`/`go build` without the linker flag.
+var version = "dev"
+
 func main() {
 	lg := log.New(os.Stderr, "tsctl: ", log.LstdFlags|log.Lmsgprefix)
 
 	args := os.Args[1:]
-	if len(args) > 0 && args[0] == "spike" {
-		if len(args) < 2 {
+
+	// Top-level help / version, accepted both as a bare word and as a flag so
+	// `tsctl version`, `tsctl -version`, `tsctl help`, and `tsctl -h` all work.
+	if len(args) > 0 {
+		switch args[0] {
+		case "help", "-h", "-help", "--help":
+			printUsage(os.Stdout)
+			return
+		case "version", "-v", "-version", "--version":
+			fmt.Printf("tsctl %s (%s/%s)\n", version, runtime.GOOS, runtime.GOARCH)
+			return
+		}
+	}
+
+	// Subcommand dispatch. A leading BARE token (not a -flag) selects the command;
+	// flags-first or no args defaults to `serve`. An unrecognized leading token is
+	// a HARD error -- never silently ignored. (Before this, `tsctl serve -flags`
+	// dropped every flag because flag.Parse stops at the first non-flag arg, then
+	// failed with a confusing "owner must be set".)
+	cmd, rest := "serve", args
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		cmd, rest = args[0], args[1:]
+	}
+
+	switch cmd {
+	case "serve":
+		if err := runServe(rest, lg); err != nil {
+			if errors.Is(err, flag.ErrHelp) {
+				return // `serve -h` already printed flag usage; clean exit
+			}
+			lg.Fatalf("%v", err)
+		}
+	case "spike":
+		if len(rest) < 1 {
 			lg.Fatal("usage: tsctl spike <router-100.x-ipv4>")
 		}
-		if err := runSpike(args[1], lg); err != nil {
+		if err := runSpike(rest[0], lg); err != nil {
 			lg.Fatalf("spike: %v", err)
 		}
-		return
-	}
-	if len(args) > 0 && args[0] == "demo" {
+	case "demo":
 		if err := runDemo(lg); err != nil {
 			lg.Fatalf("demo: %v", err)
 		}
-		return
+	default:
+		fmt.Fprintf(os.Stderr, "tsctl: unknown command %q\n\n", cmd)
+		printUsage(os.Stderr)
+		os.Exit(2)
 	}
-	if err := runServe(args, lg); err != nil {
-		lg.Fatalf("%v", err)
-	}
+}
+
+// printUsage writes a concise command summary. Per-flag help for the server is
+// available via `tsctl serve -h` (the flag set prints its own defaults).
+func printUsage(w io.Writer) {
+	fmt.Fprintf(w, `tsctl %s -- Tailscale exit-node manager
+
+Usage:
+  tsctl [serve] [flags]      Run the server (default); see "tsctl serve -h" for flags
+  tsctl spike <router-ip>    Prove the SSH-over-tailnet path to a router
+  tsctl demo                 Offline UI preview on %s (no tsnet, no tailnet)
+  tsctl version              Print version and exit
+  tsctl help                 Print this help
+
+Config is flags + env (TSCTL_*, TS_AUTHKEY). See the README.
+`, version, demoListen)
 }
 
 // newTSNet builds the persistent, tagged, non-ephemeral tsnet node (DESIGN §2/§7).

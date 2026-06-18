@@ -33,6 +33,29 @@ Preview the web UI offline (no tsnet, no tailnet, no router) with scripted,
 time-varying fixtures — `./tsctl demo` serves the real SPA + API on
 <http://127.0.0.1:8089> (Ctrl-C to stop). What you see is what prod renders.
 
+`tsctl version` prints the build version (stamped at release time); `tsctl help`
+lists the subcommands. Unknown commands fail loudly (they are never silently
+ignored).
+
+### Releases
+
+[`scripts/release.sh`](scripts/release.sh) builds cross-compiled static binaries
+(`dist/tsctl-<ver>-<os>-<arch>` + `SHA256SUMS`) and a **multi-arch** container
+image named with a fully-qualified registry path — so podman never adds a
+`localhost/` prefix:
+
+```sh
+scripts/release.sh v0.1.0                  # binaries + local linux/amd64+arm64 image
+PUSH=1 scripts/release.sh v0.1.0           # also push to ghcr.io
+PLATFORMS=linux/amd64 scripts/release.sh   # amd64-only (e.g. an Intel NAS)
+```
+
+It works with podman (manifest) or docker buildx. The image cross-compiles via
+`$BUILDPLATFORM`, so an arm64 host builds linux/amd64 with no QEMU. CI
+(`.github/workflows/release.yml`) does the same automatically on a `v*` tag:
+attaches the binaries to a GitHub Release and pushes
+`ghcr.io/<owner>/tsctl:<tag>` + `:latest`.
+
 
 Run the server (serves the SPA + API over the tailnet, `/healthz` on loopback):
 
