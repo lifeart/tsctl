@@ -32,6 +32,7 @@ type NodeView struct {
 	ExitNodeOption bool      // advertised AND approved -> selectable as exit node
 	Tags           []string  // ACL tags
 	Type           NodeType  //
+	IsSelf         bool      // this is the tsctl node itself (Status.Self) -- internal, never a router/consumer
 }
 
 // ExitNodeRef identifies an exit node. IP is the 100.x IPv4 (DESIGN: select by
@@ -105,7 +106,7 @@ type RouterView struct {
 // directly for POST /api/routers/{id}/probe.
 type ProbeResult struct {
 	OK         bool      `json:"ok"`
-	DurationMs int64     `json:"durationMs"`
+	DurationMs int64     `json:"durationMs,omitempty"` // omitted when no dial occurred (offline) -> UI shows no "· N ms"
 	Output     string    `json:"output,omitempty"`
 	Error      string    `json:"error,omitempty"`
 	CheckedAt  time.Time `json:"checkedAt"`

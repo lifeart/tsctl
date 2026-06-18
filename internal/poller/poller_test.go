@@ -177,7 +177,9 @@ func TestRefresh_FallbackListsWithoutProbing(t *testing.T) {
 		{StableID: "phone", TailscaleIPs: []string{"100.64.0.30"}, Online: true, Type: store.NodeGeneric},
 		{StableID: "laptop", TailscaleIPs: []string{"100.64.0.31"}, Online: true, Type: store.NodeGeneric},
 		{StableID: "exit1", TailscaleIPs: []string{exitIP}, Online: true, ExitNodeOption: true, Type: store.NodeExitNode},
-		{StableID: "self", TailscaleIPs: []string{"100.64.0.5"}, Online: true, Tags: []string{"tag:tsctl"}, Type: store.NodeGeneric},
+		// The tsctl node: excluded STRUCTURALLY via IsSelf (not just tag:tsctl), so
+		// the fallback holds even if the control node somehow lacks the tag.
+		{StableID: "self", TailscaleIPs: []string{"100.64.0.5"}, Online: true, IsSelf: true, Type: store.NodeGeneric},
 	}}
 	rc := &fakeRC{statusRT: store.RouterRuntime{Online: true}}
 	st := store.New()
@@ -200,6 +202,68 @@ func TestRefresh_FallbackListsWithoutProbing(t *testing.T) {
 	}
 	if n := rc.statusCallCount(); n != 0 {
 		t.Errorf("fallback must NOT auto-SSH any device; Status calls = %d, want 0", n)
+	}
+}
+
+func TestFallback_OfflineShownUnreachableNotUnprobed(t *testing.T) {
+	// A fallback-listed device the netmap reports OFFLINE must render as
+	// "unreachable" (node is offline), never the neutral "not probed" — mirrors the
+	// managed path; otherwise the picker would stay enabled on a down device.
+	exitIP := "100.64.0.20"
+	nm := &fakeNM{nodes: []store.NodeView{
+		{StableID: "pi", TailscaleIPs: []string{"100.64.0.30"}, Online: false, Type: store.NodeGeneric},
+		{StableID: "exit1", TailscaleIPs: []string{exitIP}, Online: true, ExitNodeOption: true, Type: store.NodeExitNode},
+	}}
+	rc := &fakeRC{statusRT: store.RouterRuntime{Online: true}}
+	st := store.New()
+	p := New(st, nm, rc, nil, nil, newFakeBC(), make(chan int), time.Second, nopLogf)
+	if err := p.Refresh(context.Background()); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	snap := st.Load()
+	if len(snap.Routers) != 1 {
+		t.Fatalf("routers = %d, want 1", len(snap.Routers))
+	}
+	rv := snap.Routers[0]
+	if rv.State != store.RouterUnreachable || rv.LastError != "node is offline" {
+		t.Errorf("offline fallback device = {%q,%q}, want {unreachable, node is offline}", rv.State, rv.LastError)
+	}
+	if rc.statusCallCount() != 0 {
+		t.Errorf("offline fallback device must not be dialed, Status calls = %d", rc.statusCallCount())
+	}
+}
+
+func TestFallback_FailedSetStatePersistsAcrossPoll(t *testing.T) {
+	// Regression for the carry-forward gate: a fallback device whose prior set FAILED
+	// (unconfirmed/unreachable -> LastConfirmedAt stays zero) must KEEP that state +
+	// LastError across the next poll, not silently flip back to "not probed".
+	piIP := "100.64.0.30"
+	nm := &fakeNM{nodes: []store.NodeView{
+		{StableID: "pi", TailscaleIPs: []string{piIP}, Online: true, Type: store.NodeGeneric},
+	}}
+	rc := &fakeRC{statusRT: store.RouterRuntime{Online: true}}
+	st := store.New()
+	// Seed a snapshot as if a prior manual set came back unconfirmed (no LastConfirmedAt).
+	st.Store(&store.Snapshot{Routers: []store.RouterView{{
+		Node:      store.NodeView{StableID: "pi", TailscaleIPs: []string{piIP}, Online: true, Type: store.NodeGeneric},
+		State:     store.RouterUnconfirmed,
+		Desired:   &store.ExitNodeRef{StableID: "exit1", IP: "100.64.0.20"},
+		LastError: "sent, not confirmed",
+		// LastConfirmedAt intentionally zero (the set did NOT confirm).
+	}}})
+	p := New(st, nm, rc, nil, nil, newFakeBC(), make(chan int), time.Second, nopLogf)
+	if err := p.Refresh(context.Background()); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	rv := st.Load().Routers[0]
+	if rv.State != store.RouterUnconfirmed {
+		t.Errorf("failed-set state reset to %q, want it kept as unconfirmed", rv.State)
+	}
+	if rv.LastError != "sent, not confirmed" {
+		t.Errorf("LastError wiped (%q) — a failed set must not vanish across a poll", rv.LastError)
+	}
+	if rv.Desired == nil || rv.Desired.StableID != "exit1" {
+		t.Errorf("pending Desired lost across poll: %+v", rv.Desired)
 	}
 }
 

@@ -58,7 +58,9 @@ func buildInventory(st *ipnstate.Status) []store.NodeView {
 	}
 	nodes := make([]store.NodeView, 0, len(st.Peer)+1)
 	if st.Self != nil {
-		nodes = append(nodes, mapPeer(st.Self))
+		self := mapPeer(st.Self)
+		self.IsSelf = true // mark the tsctl node so the poller never lists itself as a router
+		nodes = append(nodes, self)
 	}
 	for _, p := range st.Peer {
 		if p == nil {

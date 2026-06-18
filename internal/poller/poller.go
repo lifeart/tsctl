@@ -434,8 +434,12 @@ func (p *Poller) Refresh(ctx context.Context) error {
 		p.mu.Lock()
 		snap, invErr := p.build(ctx)
 		p.store.Store(snap)
-		p.mu.Unlock()
+		// Broadcast UNDER mu so Store+Broadcast is atomic per writer: the hub's
+		// Broadcast is non-blocking (select+default), and this keeps the broadcast
+		// order equal to the store order (the hub coalesces to the latest, so an
+		// out-of-order older frame would otherwise win). Mirrors RefreshGroups.
 		p.bc.Broadcast(snap)
+		p.mu.Unlock()
 		return nil, invErr
 	})
 	return err
@@ -548,26 +552,46 @@ func (p *Poller) buildRouterView(ctx context.Context, addr string, nodes []store
 
 // buildListedRouterView builds a RouterView WITHOUT contacting the device. It is
 // used for the non-exit-node fallback set, which may be large: tsctl never
-// auto-SSHes it (no probe storm). A device that was previously probed or set by
-// hand (prev carries a LastConfirmedAt) keeps its last-known state; an untouched
-// device is RouterUnprobed -- a neutral "not probed yet" the UI renders with the
-// Test SSH action. SSH happens only on a manual probe or a SetExitNode.
+// auto-SSHes it (no probe storm). Precedence:
+//   - netmap reports it offline   -> RouterUnreachable "node is offline" (mirrors
+//     the managed path; never show a down device as "not probed");
+//   - it was contacted before (a prior probe/set left a real State)  -> keep that
+//     last-known state, including a failed/unconfirmed set + its LastError/Desired
+//     (do NOT reset it -- LastConfirmedAt is set only on SUCCESS, so gating on it
+//     would silently wipe failures across a poll);
+//   - otherwise -> RouterUnprobed, the neutral "not probed yet" with Test SSH.
+//
+// SSH happens only on a manual probe or a SetExitNode.
 func (p *Poller) buildListedRouterView(addr string, nodes []store.NodeView, prev *store.Snapshot) store.RouterView {
 	var rv store.RouterView
+	foundInNetmap := false
 	if nv, ok := findNodeByIP(nodes, addr); ok {
 		rv.Node = nv
+		foundInNetmap = true
 	} else {
 		rv.Node = store.NodeView{TailscaleIPs: []string{addr}, Type: store.NodeGeneric}
 	}
-	if prevRV := findRouterView(prev, addr); prevRV != nil && !prevRV.LastConfirmedAt.IsZero() {
-		// Already contacted by hand -- keep the last-known state, do not reset it.
+	prevRV := findRouterView(prev, addr)
+	if prevRV != nil {
+		// Carry last-confirmed selection/stats forward as stale context regardless.
 		rv.Desired = prevRV.Desired
 		rv.CurrentExitNode = prevRV.CurrentExitNode
 		rv.Stats = prevRV.Stats
+		rv.LastConfirmedAt = prevRV.LastConfirmedAt
+	}
+	// Offline wins: never render a netmap-offline device as "not probed".
+	if foundInNetmap && !rv.Node.Online {
+		rv.Reachable = false
+		rv.State = store.RouterUnreachable
+		rv.LastError = "node is offline"
+		return rv
+	}
+	// Contacted before (any real state, e.g. a failed/unconfirmed set) -> keep it,
+	// so the result + LastError survive across polls instead of flipping to unprobed.
+	if prevRV != nil && prevRV.State != "" && prevRV.State != store.RouterUnprobed {
 		rv.State = prevRV.State
 		rv.Reachable = prevRV.Reachable
 		rv.LastError = prevRV.LastError
-		rv.LastConfirmedAt = prevRV.LastConfirmedAt
 		return rv
 	}
 	rv.State = store.RouterUnprobed
@@ -582,9 +606,9 @@ func (p *Poller) buildListedRouterView(addr string, nodes []store.NodeView, prev
 // No-op until the first snapshot exists.
 func (p *Poller) RefreshGroups() {
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	prev := p.store.Load()
 	if prev == nil {
-		p.mu.Unlock()
 		return
 	}
 	snap := &store.Snapshot{
@@ -596,7 +620,8 @@ func (p *Poller) RefreshGroups() {
 		BuiltAt:   time.Now(),
 	}
 	p.store.Store(snap)
-	p.mu.Unlock()
+	// Broadcast under mu (non-blocking hub) so Store+Broadcast is atomic and frames
+	// stay in store order vs a concurrent poll (Refresh does the same).
 	p.bc.Broadcast(snap)
 }
 
@@ -821,9 +846,11 @@ func resolveMembers(ids []string, byID map[string]store.NodeView) []store.GroupM
 // autoDiscoverRouters picks the routers to control when none are configured.
 // First choice: every tag:router node (sorted) -> (those, usedFallback=false),
 // exactly as before. If NONE exist it falls back to every node that is NOT
-// exit-capable (!ExitNodeOption), is NOT the tsctl node itself (no tag:tsctl),
-// and has a primary IP (sorted) -> (those, usedFallback=true). The fallback lets
-// a simple single-operator tailnet control its routers without tagging them.
+// exit-capable (!ExitNodeOption) and is NOT a tsctl control node (IsSelf, or any
+// tag:tsctl peer), with a primary IP (sorted) -> (those, usedFallback=true). The
+// fallback lets a simple single-operator tailnet control its routers without
+// tagging them. Self-exclusion is structural (IsSelf), not tag-dependent, so it
+// holds even if the control node somehow lacks tag:tsctl.
 func autoDiscoverRouters(nodes []store.NodeView) (addrs []string, usedFallback bool) {
 	for _, n := range nodes {
 		if n.Type == store.NodeRouter {
@@ -842,7 +869,7 @@ func autoDiscoverRouters(nodes []store.NodeView) (addrs []string, usedFallback b
 		if n.ExitNodeOption { // never try to control an exit node
 			continue
 		}
-		if hasTag(n, tsctlTag) { // never try to control the tsctl node itself
+		if n.IsSelf || hasTag(n, tsctlTag) { // never try to control a tsctl control node
 			continue
 		}
 		if ip := primaryIP(n); ip != "" {

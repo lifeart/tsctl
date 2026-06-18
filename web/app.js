@@ -1165,7 +1165,7 @@
     else if (s.st === "pending") { subText = "Applying " + shortLabel(rv.desired) + countdownSuffix(item.sid); ariaConn = "applying " + shortLabel(rv.desired); }
     else if (s.st === "unconfirmed") { subText = "Sent to " + shortLabel(rv.desired) + " — not confirmed"; ariaConn = "sent to " + shortLabel(rv.desired) + ", not confirmed"; }
     else if (s.controlError) { subText = "Control error — can’t control"; ariaConn = "control error, tsctl can’t control this router"; }
-    else if (s.unprobed) { subText = "Not probed — Test SSH, or pick an exit node"; ariaConn = "not probed yet"; }
+    else if (s.unprobed) { subText = "Not probed — pick an exit node, or Test SSH in Devices"; ariaConn = "not probed yet"; }
     else if (!s.reachable) { subText = "Offline — control disabled"; ariaConn = "offline, control disabled"; }
     else if (s.cur) { subText = "→ " + shortLabel(s.cur) + (s.outOfZone ? " (out of zone)" : ""); ariaConn = "routing through " + shortLabel(s.cur) + (s.outOfZone ? ", out of zone" : ""); }
     else { subText = "Direct — no exit node"; ariaConn = "direct, no exit node"; }
