@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -367,8 +368,16 @@ func (p *Poller) build(ctx context.Context) (*store.Snapshot, error) {
 		}
 	}
 
-	routers := make([]store.RouterView, 0, len(p.routers))
-	for _, addr := range p.routers {
+	// Router set: an explicit configured list (p.routers) wins; otherwise
+	// auto-discover every tag:router node from the netmap (DESIGN: classifier marks
+	// them NodeRouter). Auto-discovery keeps the managed set in sync as routers are
+	// added/removed without reconfiguring tsctl.
+	addrs := p.routers
+	if len(addrs) == 0 {
+		addrs = autoDiscoverRouters(nodes)
+	}
+	routers := make([]store.RouterView, 0, len(addrs))
+	for _, addr := range addrs {
 		routers = append(routers, p.buildRouterView(ctx, addr, nodes, prev))
 	}
 
@@ -554,6 +563,21 @@ func sameExitNode(a, b *store.ExitNodeRef) bool {
 		return a.StableID == b.StableID
 	}
 	return a.IP == b.IP
+}
+
+// autoDiscoverRouters returns the 100.x IPv4s of every tag:router node in the
+// inventory (sorted for a stable order), used when no routers are configured.
+func autoDiscoverRouters(nodes []store.NodeView) []string {
+	var addrs []string
+	for _, n := range nodes {
+		if n.Type == store.NodeRouter {
+			if ip := primaryIP(n); ip != "" {
+				addrs = append(addrs, ip)
+			}
+		}
+	}
+	sort.Strings(addrs)
+	return addrs
 }
 
 // primaryIP returns the node's 100.x IPv4 (first IPv4, else first IP, else "").

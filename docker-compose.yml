@@ -22,9 +22,10 @@ services:
     environment:
       # --- one-time enrollment (remove after the node is registered) ---
       TS_AUTHKEY: ${TS_AUTHKEY:?set TS_AUTHKEY for first enrollment (tag:tsctl auth key or OAuth client secret)}
-      # --- required ---
+      # --- required (Both mode: tailnet owner + UI password) ---
       TSCTL_OWNER: ${TSCTL_OWNER:?your tailnet login email, e.g. you@example.com}
-      TSCTL_ROUTERS: ${TSCTL_ROUTERS:?comma-separated router 100.x IPv4s, e.g. 100.64.0.10,100.64.0.11}
+      # Optional: empty auto-discovers all tag:router nodes; set to pin a subset.
+      TSCTL_ROUTERS: ${TSCTL_ROUTERS:-}
       # --- host-port UI (reach the UI from your LAN, password-protected) ---
       # Listen on a host socket INSIDE the container (all interfaces); the ports:
       # mapping below publishes it to the NAS. Exposing the UI on a host port

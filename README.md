@@ -86,7 +86,8 @@ Everything required to bring tsctl up, in one place. A copy-paste template is in
      dir. (An API token `tskey-api-…` will **not** enroll a node.)
 2. **The owner login** (`TSCTL_OWNER`) — your exact tailnet email; the only
    identity allowed to view/control (everyone else is denied, fail-closed).
-3. **Router IPs** (`TSCTL_ROUTERS`) — the OpenWRT routers' `100.x` IPv4s.
+3. **Router IPs** (`TSCTL_ROUTERS`) — *optional.* Leave empty and tsctl
+   auto-discovers every `tag:router` node; set it only to pin an explicit subset.
 4. **The ACL** below (`tag:tsctl` → `tag:router`, ssh `accept`, `users:["root"]`).
 5. **Tailscale SSH enabled on each router** (`tailscale set --ssh`).
 
@@ -101,7 +102,7 @@ env equivalent.
 | `-owner` | `TSCTL_OWNER` | — | one of† | tailnet login allowed to control (tailnet auth path) |
 | `-ui-password` | `TSCTL_UI_PASSWORD` | — | one of† | shared password for the host-port/session auth path; **required** when `-http-listen` is set |
 | `-http-listen` | `TSCTL_HTTP_LISTEN` | — (off) | no | ALSO serve the UI+API on this host socket, e.g. `:8080` (separate from `/healthz`); requires `-ui-password` |
-| `-routers` | `TSCTL_ROUTERS` | — | **yes** | comma-separated router `100.x` IPv4s |
+| `-routers` | `TSCTL_ROUTERS` | — (auto) | no | comma-separated router `100.x` IPv4s; **empty = auto-discover all `tag:router` nodes** |
 | `-hostname` | `TSCTL_HOSTNAME` | `tsctl` | no | node hostname; the UI URL `http://<hostname>/` |
 | `-state-dir` | `TSCTL_STATE_DIR` | `./tsnet-state` (or systemd `STATE_DIRECTORY`) | no | node key store — **must persist** (treat as a private key) |
 | `-listen` | `TSCTL_LISTEN` | `:80` | no | tailnet-side listen address |

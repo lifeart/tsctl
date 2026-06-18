@@ -116,6 +116,40 @@ func TestRefresh_BuildsSnapshot(t *testing.T) {
 	}
 }
 
+func TestRefresh_AutoDiscoversRouters(t *testing.T) {
+	// No configured routers (nil) -> discover every tag:router node from the netmap.
+	r1, r2, exitIP := "100.64.0.10", "100.64.0.11", "100.64.0.20"
+	nm := &fakeNM{nodes: []store.NodeView{
+		{StableID: "rA", TailscaleIPs: []string{r2}, Online: true, Type: store.NodeRouter},
+		{StableID: "rB", TailscaleIPs: []string{r1}, Online: true, Type: store.NodeRouter},
+		{StableID: "exit1", TailscaleIPs: []string{exitIP}, Online: true, ExitNodeOption: true, Type: store.NodeExitNode},
+		{StableID: "laptop", TailscaleIPs: []string{"100.64.0.30"}, Online: true, Type: store.NodeGeneric},
+	}}
+	rc := &fakeRC{statusRT: store.RouterRuntime{Online: true}}
+	st := store.New()
+	p := New(st, nm, rc, nil /* auto-discover */, newFakeBC(), make(chan int), time.Second, nopLogf)
+
+	if err := p.Refresh(context.Background()); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	snap := st.Load()
+	if len(snap.Routers) != 2 {
+		t.Fatalf("auto-discovered routers = %d, want 2 (the tag:router nodes only)", len(snap.Routers))
+	}
+	// Sorted by IP for stability: 100.64.0.10 then 100.64.0.11.
+	if got := primaryIP(snap.Routers[0].Node); got != r1 {
+		t.Errorf("routers[0] IP = %q, want %q (sorted)", got, r1)
+	}
+	if got := primaryIP(snap.Routers[1].Node); got != r2 {
+		t.Errorf("routers[1] IP = %q, want %q (sorted)", got, r2)
+	}
+	for _, rv := range snap.Routers {
+		if rv.Node.Type != store.NodeRouter {
+			t.Errorf("auto-discovered a non-router: %+v", rv.Node)
+		}
+	}
+}
+
 func TestRefresh_NetmapErrSurfacedNotAborted(t *testing.T) {
 	nm := &fakeNM{err: errors.New("netmap down")}
 	rc := &fakeRC{statusErr: errors.New("ssh dial failed")}
