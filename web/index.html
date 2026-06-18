@@ -85,6 +85,52 @@
         <div class="skeleton skeleton-card"></div>
       </div>
 
+      <!-- View switch: the zone graph is the default view; the card list (routers
+           + devices) is the secondary "Devices" view. Two-tab segmented control. -->
+      <div id="viewbar" class="viewbar hidden" hidden>
+        <div class="segmented" role="tablist" aria-label="Choose a view">
+          <button id="tab-zones" class="seg is-selected" type="button" role="tab"
+            aria-selected="true" aria-controls="graph-section" tabindex="0">Zones</button>
+          <button id="tab-devices" class="seg" type="button" role="tab"
+            aria-selected="false" aria-controls="routers-section" tabindex="-1">Devices</button>
+        </div>
+      </div>
+
+      <!-- Zone graph (DEFAULT view): bipartite consumers ⟷ exit nodes with SVG
+           wires. Group selector (tabs) scopes the columns; "Ungrouped" catches the
+           rest. Rewire by drag OR by an accessible per-consumer menu. -->
+      <section class="section graph-section" id="graph-section" role="tabpanel"
+        aria-labelledby="tab-zones" hidden>
+        <div class="zone-bar">
+          <div id="zone-tabs" class="zone-tabs" role="tablist" aria-label="Zones"></div>
+          <div class="zone-actions">
+            <button id="zone-new" class="text-btn" type="button">New zone</button>
+            <button id="zone-edit" class="text-btn hidden" type="button" hidden>Edit</button>
+            <button id="zone-delete" class="text-btn zone-delete hidden" type="button" hidden>Delete</button>
+          </div>
+        </div>
+        <p id="graph-empty" class="empty hidden"></p>
+        <div id="graph-grid" class="graph-grid">
+          <div class="gcol gcol-consumers">
+            <div class="gcol-title">Consumers</div>
+            <div id="gcol-consumers" class="gcol-body"></div>
+            <p id="consumers-empty" class="gcol-empty hidden"></p>
+          </div>
+          <!-- Wires are drawn here, overlaying the gap. Each path carries an
+               aria-label; the SVG is a labelled group, not aria-hidden. -->
+          <svg id="wires" class="wires" role="group" aria-label="Exit-node connections"></svg>
+          <div class="gcol gcol-exits">
+            <div class="gcol-title">Exit nodes</div>
+            <div id="gcol-exits" class="gcol-body"></div>
+            <p id="exits-empty" class="gcol-empty hidden"></p>
+          </div>
+        </div>
+        <p id="graph-hint" class="graph-hint">
+          Drag a consumer onto an exit node, or select it and press Enter to choose.
+          “Direct” clears the exit node.
+        </p>
+      </section>
+
       <section class="section" id="routers-section" hidden>
         <h2 class="section-title">Routers</h2>
         <div id="routers" class="router-list"></div>

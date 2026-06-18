@@ -29,7 +29,7 @@
   // ---------------------------------------------------------------- state ---
   var state = {
     csrfToken: null,
-    snapshot: null,    // last full SSE Snapshot {nodes, routers, netmapAt, netmapErr, builtAt}
+    snapshot: null,    // last full SSE Snapshot {nodes, routers, groups, netmapAt, netmapErr, builtAt}
     nodesOnly: null,   // {nodes, builtAt, netmapErr} from GET /api/nodes
     gotSseFrame: false,
     connection: "connecting", // connecting | open | reconnecting | offline
@@ -53,11 +53,19 @@
     pollFallback: false,
     pollTimer: null,
     filter: { text: "", type: "all" },
+    view: "graph",        // "graph" (zone graph, default) | "cards" (router/device list)
+    selectedZone: null,   // selected zone id, or UNGROUPED, or null (= default)
+    graphDrag: null,      // active drag descriptor while rewiring by drag
   };
 
-  var nodeEls = {};   // stableID -> node card record
-  var routerEls = {}; // stableID -> router card record
+  var nodeEls = {};       // stableID -> node card record
+  var routerEls = {};     // stableID -> router card record
+  var consumerEls = {};   // stableID -> graph consumer-node record (left column)
+  var exitEls = {};       // key      -> graph exit-node record (right column)
+  var zoneTabEls = {};    // zone id  -> zone selector tab record
   var activeModal = null;
+  var activeMenu = null;  // open per-consumer rewire menu (keyboard/click path)
+  var rafPending = false; // resize redraw coalescing
 
   // --------------------------------------------------------------- helpers ---
   function $(sel) { return document.querySelector(sel); }
@@ -654,8 +662,18 @@
     // Reset the control to the ACTUAL selection immediately (never optimistic);
     // the change only takes effect after the user confirms.
     if (sel_safe(select) && select.value !== current) select.value = current;
-    if (value === current) return;
-    if (state.busyRouters[sid]) return;
+    confirmExitNodeChange(sid, value, select);
+  }
+
+  // Shared confirm + POST flow used by BOTH the card picker and the zone graph
+  // (drag + keyboard menu). Opens the EXISTING confirm dialog, then onPick (which
+  // is never-optimistic: it shows "Applying…" and reflects the device's actual
+  // state). value === "" clears the exit node (Direct).
+  function confirmExitNodeChange(sid, value, returnFocus) {
+    var rv = findRouterView(sid);
+    var current = rv && rv.currentExitNode ? rv.currentExitNode.stableID : "";
+    if (value === current) return;       // no change
+    if (state.busyRouters[sid]) return;  // a change is already in flight
 
     var routerName = (rv && rv.node && (rv.node.name || rv.node.hostname)) || sid;
     var targetLabelText = nodeLabelById(state.snapshot, value);
@@ -678,9 +696,9 @@
       body: body,
       confirmLabel: value === "" ? "Go direct" : "Change exit node",
       cancelLabel: "Cancel",
-      returnFocus: select,
+      returnFocus: returnFocus,
       onConfirm: function () { onPick(sid, value); },
-      onCancel: function () { /* selection already reset to actual */ },
+      onCancel: function () { /* never optimistic — nothing moved, nothing to undo */ },
     });
   }
 
@@ -776,6 +794,860 @@
         delete state.busyTarget[sid];
         render();
       });
+  }
+
+  // ============================================================= zone graph ===
+  // The DEFAULT view: a bipartite graph of consumers (left) ⟷ exit nodes (right),
+  // scoped by a selected zone (group) or the implicit "Ungrouped" set. Wires show
+  // each consumer's ACTUAL current exit node (never the chosen target). Rewire by
+  // DRAG or by an accessible per-consumer menu; both funnel into the SAME confirm +
+  // POST flow as the cards, and are never-optimistic + zone-enforced.
+
+  var UNGROUPED = " ungrouped"; // sentinel zone id for the implicit section
+  var DIRECT_KEY = " direct";   // key for the "Direct" drop target
+  var DRAG_THRESHOLD = 6;            // px of movement before a click becomes a drag
+
+  function snapGroups() { var s = state.snapshot; return s && Array.isArray(s.groups) ? s.groups : []; }
+  function snapRouters() { var s = state.snapshot; return s && Array.isArray(s.routers) ? s.routers : []; }
+  function snapNodes() { var s = state.snapshot; return s && Array.isArray(s.nodes) ? s.nodes : []; }
+  function isExitCapable(n) { return !!n && (n.exitNodeOption === true || n.type === "exit-node"); }
+
+  // Routers not present in ANY group's consumers (the implicit "Ungrouped" set).
+  function ungroupedRouters() {
+    var inGroup = {};
+    snapGroups().forEach(function (g) {
+      (g.consumers || []).forEach(function (m) { if (m && m.stableID) inGroup[m.stableID] = true; });
+    });
+    return snapRouters().filter(function (rv) { return rv.node && rv.node.stableID && !inGroup[rv.node.stableID]; });
+  }
+
+  // Ordered zone list for the selector: every group, then "Ungrouped" (shown when
+  // it has members, or when there are NO groups at all so there is always a tab).
+  function zoneList() {
+    var zones = snapGroups().map(function (g) { return { id: g.id, name: g.name || "(unnamed zone)", group: g }; });
+    if (ungroupedRouters().length > 0 || zones.length === 0) {
+      zones.push({ id: UNGROUPED, name: "Ungrouped", group: null });
+    }
+    return zones;
+  }
+
+  function resolveSelectedZone() {
+    var zones = zoneList();
+    if (!zones.length) return null;
+    for (var i = 0; i < zones.length; i++) if (zones[i].id === state.selectedZone) return zones[i];
+    // A stored selection that isn't present yet (e.g. a just-created zone awaiting
+    // the next snapshot): show the default but DON'T clobber it, so it auto-selects
+    // once it arrives. Only fall back to the default when nothing is stored.
+    if (state.selectedZone == null) state.selectedZone = zones[0].id; // first group, else Ungrouped
+    for (var j = 0; j < zones.length; j++) if (zones[j].id === state.selectedZone) return zones[j];
+    return zones[0];
+  }
+
+  // Resolve the selected zone into left (consumers) + right (exit nodes) columns,
+  // plus the allowed-target set. A present:false member renders greyed "missing".
+  function columnsFor(zone) {
+    var consumers, exits, allowed = {}, ungrouped = false;
+    if (!zone || zone.id === UNGROUPED) {
+      ungrouped = true;
+      consumers = ungroupedRouters().map(function (rv) {
+        return { key: rv.node.stableID, sid: rv.node.stableID, rv: rv, present: true };
+      });
+      exits = snapNodes().filter(isExitCapable).map(function (n) {
+        allowed[n.stableID] = true;
+        return { key: n.stableID, sid: n.stableID, node: n, present: true, allowed: true };
+      });
+    } else {
+      var g = zone.group;
+      consumers = (g.consumers || []).map(function (m) {
+        var rv = findRouterView(m.stableID);
+        return { key: m.stableID, sid: m.stableID, rv: rv, member: m, present: m.present === true && !!rv };
+      });
+      exits = (g.allowedExitNodes || []).map(function (m) {
+        var node = findNodeById(state.snapshot, m.stableID);
+        allowed[m.stableID] = true;
+        return { key: m.stableID, sid: m.stableID, node: node, member: m, present: m.present === true && !!node, allowed: true };
+      });
+    }
+    // A consumer's CURRENT exit node that isn't in the allowed column still renders,
+    // flagged "out of zone" (display only — never an allowed drop/menu target).
+    var have = {};
+    exits.forEach(function (e) { have[e.sid] = true; });
+    consumers.forEach(function (c) {
+      var cur = c.rv && c.rv.currentExitNode;
+      if (!cur || !cur.stableID || have[cur.stableID]) return;
+      have[cur.stableID] = true;
+      var node = findNodeById(state.snapshot, cur.stableID);
+      exits.push({ key: cur.stableID, sid: cur.stableID, node: node, ref: cur, present: !!node, allowed: false, outOfZone: true });
+    });
+    return { consumers: consumers, exits: exits, allowed: allowed, ungrouped: ungrouped };
+  }
+
+  // Derive the wire/visual state from the device's ACTUAL RouterView state (the
+  // same never-optimistic machine the cards use), plus whether its current exit
+  // node is out of the zone's allowed set.
+  function consumerStatus(c, allowed) {
+    var rv = c.rv;
+    if (!c.present || !rv) return { missing: true, wire: "off" };
+    var node = rv.node || {};
+    var online = node.online === true;
+    var reachable = rv.reachable !== false && online;
+    var st = rv.state || (online ? "ok" : "unreachable");
+    var localBusy = !!state.busyRouters[c.sid];
+    var cur = rv.currentExitNode;
+    var wire;
+    if (localBusy || st === "pending") wire = "pending";
+    else if (st === "unconfirmed") wire = "unconfirmed";
+    else if (!reachable || st === "unreachable") wire = "off";
+    else wire = "ok";
+    var outOfZone = !!(cur && cur.stableID && allowed && !allowed[cur.stableID]);
+    return { online: online, reachable: reachable, st: st, localBusy: localBusy, cur: cur, wire: wire, outOfZone: outOfZone };
+  }
+
+  function createConsumerNode(item) {
+    var sid = item.sid;
+    var root = el("div", "gnode gnode-consumer");
+    root.setAttribute("data-consumer", sid);
+    var head = el("div", "gnode-head");
+    var dot = dotIcon();
+    var name = el("span", "gnode-name");
+    var grip = el("span", "gnode-grip", "⋮⋮");
+    grip.setAttribute("aria-hidden", "true");
+    head.appendChild(dot);
+    head.appendChild(name);
+    head.appendChild(grip);
+    var sub = el("div", "gnode-sub");
+    var stBadge = el("span", "gnode-state");
+    root.appendChild(head);
+    root.appendChild(sub);
+    root.appendChild(stBadge);
+    var rec = { root: root, dot: dot, name: name, sub: sub, state: stBadge, sid: sid, interactive: false };
+    // Keyboard path (a11y): Enter/Space opens the picker menu. Pointer path:
+    // pointerdown may begin a drag, or (no movement) opens the same menu.
+    root.addEventListener("keydown", function (e) {
+      if (!rec.interactive) return;
+      if (e.key === "Enter" || e.key === " " || e.key === "Spacebar") {
+        e.preventDefault();
+        openZoneMenu(sid, root);
+      }
+    });
+    root.addEventListener("pointerdown", function (e) { onConsumerPointerDown(e, rec); });
+    return rec;
+  }
+
+  function updateConsumerNode(rec, item, allowed) {
+    var s = consumerStatus(item, allowed);
+    var rv = item.rv;
+    var node = (rv && rv.node) || {};
+    var nm = node.name || node.hostname || (item.member && item.member.name) || item.sid || "(router)";
+    setText(rec.name, nm);
+    rec.root.title = nm;
+
+    if (s.missing) {
+      rec.root.className = "gnode gnode-consumer is-missing";
+      rec.dot.setAttribute("class", "dot dot-off");
+      rec.dot.setAttribute("role", "img");
+      rec.dot.setAttribute("aria-label", "missing");
+      setText(rec.sub, "Not currently in the netmap");
+      setText(rec.state, "missing");
+      rec.state.className = "gnode-state state-unknown";
+      rec.interactive = false;
+      rec.root.removeAttribute("tabindex");
+      rec.root.removeAttribute("role");
+      rec.root.removeAttribute("aria-haspopup");
+      rec.root.setAttribute("aria-label", nm + ": not currently in the netmap");
+      return;
+    }
+
+    setDot(rec.dot, s.online);
+    var stMap = { ok: "connected", pending: "applying", unconfirmed: "unconfirmed", unreachable: "offline" };
+    setText(rec.state, stMap[s.st] || s.st);
+    rec.state.className = "gnode-state state-" + (stMap[s.st] ? s.st : "unknown");
+
+    var subText, ariaConn;
+    if (s.localBusy) { subText = "Applying…" + countdownSuffix(item.sid); ariaConn = "applying a change"; }
+    else if (s.st === "pending") { subText = "Applying " + shortLabel(rv.desired) + countdownSuffix(item.sid); ariaConn = "applying " + shortLabel(rv.desired); }
+    else if (s.st === "unconfirmed") { subText = "Sent to " + shortLabel(rv.desired) + " — not confirmed"; ariaConn = "sent to " + shortLabel(rv.desired) + ", not confirmed"; }
+    else if (!s.reachable) { subText = "Offline — control disabled"; ariaConn = "offline, control disabled"; }
+    else if (s.cur) { subText = "→ " + shortLabel(s.cur) + (s.outOfZone ? " (out of zone)" : ""); ariaConn = "routing through " + shortLabel(s.cur) + (s.outOfZone ? ", out of zone" : ""); }
+    else { subText = "Direct — no exit node"; ariaConn = "direct, no exit node"; }
+    setText(rec.sub, subText);
+
+    // Disabled while settling (busy/pending/unconfirmed) or offline — mirrors the
+    // card picker; the never-optimistic machine owns the transition.
+    var settling = s.localBusy || s.st === "pending" || s.st === "unconfirmed";
+    var interactive = s.reachable && !settling;
+    rec.interactive = interactive;
+    rec.root.className = "gnode gnode-consumer"
+      + (settling ? " is-busy" : "")
+      + (s.reachable ? "" : " is-off")
+      + (interactive ? " is-actionable" : "");
+    if (interactive) {
+      rec.root.setAttribute("tabindex", "0");
+      rec.root.setAttribute("role", "button");
+      rec.root.setAttribute("aria-haspopup", "menu");
+      rec.root.setAttribute("aria-label", nm + ", " + ariaConn + ". Activate to change its exit node.");
+    } else {
+      rec.root.removeAttribute("tabindex");
+      rec.root.removeAttribute("role");
+      rec.root.removeAttribute("aria-haspopup");
+      rec.root.setAttribute("aria-label", nm + ", " + ariaConn + ".");
+    }
+  }
+
+  function createExitNode() {
+    var root = el("div", "gnode gnode-exit");
+    var head = el("div", "gnode-head");
+    var dot = dotIcon();
+    var name = el("span", "gnode-name");
+    head.appendChild(dot);
+    head.appendChild(name);
+    var sub = el("div", "gnode-sub");
+    root.appendChild(head);
+    root.appendChild(sub);
+    return { root: root, dot: dot, name: name, sub: sub };
+  }
+
+  function updateExitNode(rec, item) {
+    var dot = rec.dot;
+    if (item.direct) {
+      rec.root.className = "gnode gnode-exit gnode-direct";
+      rec.root.setAttribute("data-drop", "");            // "" => clear (Direct)
+      dot.setAttribute("class", "dot hidden");
+      setText(rec.name, "Direct");
+      setText(rec.sub, "No exit node");
+      rec.root.setAttribute("aria-label", "Direct, no exit node. Drop a consumer here to clear its exit node.");
+      return;
+    }
+    var node = item.node, ref = item.ref, m = item.member;
+    var nm = (node && (node.name || node.hostname)) || (m && m.name) || (ref && (ref.name || ref.ip)) || item.sid;
+    setText(rec.name, nm);
+    rec.root.title = nm;
+    var cls = "gnode gnode-exit";
+    var bits = [];
+    if (!item.present) { cls += " is-missing"; bits.push("not in netmap"); dot.setAttribute("class", "dot dot-off"); }
+    else {
+      var online = node ? node.online === true : false;
+      setDot(dot, online);
+      bits.push(online ? "online" : "offline");
+      if (!online) cls += " is-off";
+    }
+    if (item.outOfZone) { cls += " is-outofzone"; bits.push("out of zone"); }
+    rec.root.className = cls;
+    var ip = (node && (node.tailscaleIPs || [])[0]) || (m && m.ip) || (ref && ref.ip) || "";
+    setText(rec.sub, (ip ? ip + " · " : "") + bits.join(" · "));
+    if (item.allowed) {
+      rec.root.setAttribute("data-drop", item.sid);
+      rec.root.setAttribute("aria-label", nm + ", exit node, " + bits.join(", ") + ". Drop a consumer here to route it through " + nm + ".");
+    } else {
+      rec.root.removeAttribute("data-drop");
+      rec.root.setAttribute("aria-label", nm + ", exit node, " + bits.join(", ") + ".");
+    }
+  }
+
+  function renderGraph() {
+    if (state.graphDrag && state.graphDrag.active) return; // never reconcile mid-drag
+
+    // Routers + groups come ONLY from the live snapshot (like the card view).
+    if (!state.gotSseFrame) {
+      showGraphMessage(state.pollFallback
+        ? "The zone graph needs the live stream, which is currently unavailable. Reconnecting…"
+        : "Loading zones…");
+      // Clear any stale columns so a reconnect repaints cleanly.
+      reconcile($("#gcol-consumers"), [], function (it) { return it.key; }, createConsumerNode, function () {}, consumerEls, true);
+      reconcile($("#gcol-exits"), [], function (it) { return it.key; }, createExitNode, updateExitNode, exitEls, true);
+      return;
+    }
+
+    var zones = zoneList();
+    renderZoneTabs(zones);
+    var zone = resolveSelectedZone();
+    renderZoneActions(zone);
+
+    show($("#graph-empty"), false);
+    $("#graph-grid").hidden = false;
+    $("#graph-hint").hidden = false;
+
+    var cols = columnsFor(zone);
+
+    // Right column: the "Direct" drop target first, then the zone's exit nodes.
+    var exitItems = [{ key: DIRECT_KEY, direct: true }].concat(cols.exits);
+    reconcile($("#gcol-exits"), exitItems, function (it) { return it.key; },
+      createExitNode, updateExitNode, exitEls, true);
+
+    reconcile($("#gcol-consumers"), cols.consumers, function (it) { return it.key; },
+      createConsumerNode, function (rec, it) { updateConsumerNode(rec, it, cols.allowed); }, consumerEls, true);
+
+    var cEmpty = $("#consumers-empty");
+    if (!cols.consumers.length) {
+      setText(cEmpty, cols.ungrouped ? "No ungrouped routers — every router is in a zone." : "No consumers in this zone yet. Use Edit to add some.");
+      show(cEmpty, true);
+    } else show(cEmpty, false);
+    var xEmpty = $("#exits-empty");
+    if (!cols.exits.length) {
+      setText(xEmpty, cols.ungrouped ? "No approved exit nodes in the tailnet." : "No allowed exit nodes in this zone yet. Use Edit to add some.");
+      show(xEmpty, true);
+    } else show(xEmpty, false);
+
+    drawWires(cols);
+  }
+
+  function showGraphMessage(msg) {
+    var e = $("#graph-empty");
+    setText(e, msg);
+    show(e, true);
+    $("#graph-grid").hidden = true;
+    $("#graph-hint").hidden = true;
+  }
+
+  // --- wires --------------------------------------------------------------
+  function drawWires(cols) {
+    var svg = $("#wires");
+    var grid = $("#graph-grid");
+    if (!svg || !grid) return;
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    var gridRect = grid.getBoundingClientRect();
+    cols.consumers.forEach(function (c) {
+      var s = consumerStatus(c, cols.allowed);
+      if (s.missing || !s.cur || !s.cur.stableID) return; // no current exit node => Direct => no wire
+      var consRec = consumerEls[c.key], exitRec = exitEls[s.cur.stableID];
+      if (!consRec || !exitRec) return;
+      var a = anchorOf(consRec.root, "right", gridRect);
+      var b = anchorOf(exitRec.root, "left", gridRect);
+      var path = svgEl("path", { d: wirePath(a, b), fill: "none", "class": "wire wire-" + s.wire });
+      path.setAttribute("role", "img");
+      var nm = (c.rv && c.rv.node && (c.rv.node.name || c.rv.node.hostname)) || c.sid;
+      path.setAttribute("aria-label", nm + " connected to " + shortLabel(s.cur) + " (" + wireLabel(s.wire) + ")");
+      svg.appendChild(path);
+    });
+    if (state.graphDrag && state.graphDrag.active) drawGhost();
+  }
+
+  function wireLabel(w) {
+    return w === "ok" ? "connected" : w === "pending" ? "applying" : w === "unconfirmed" ? "not confirmed" : "offline";
+  }
+  function anchorOf(elem, side, gridRect) {
+    var r = elem.getBoundingClientRect();
+    return {
+      x: (side === "right" ? r.right : r.left) - gridRect.left,
+      y: r.top + r.height / 2 - gridRect.top,
+    };
+  }
+  function wirePath(a, b) {
+    var dx = Math.max(36, Math.abs(b.x - a.x) / 2);
+    return "M " + a.x + " " + a.y + " C " + (a.x + dx) + " " + a.y + ", " + (b.x - dx) + " " + b.y + ", " + b.x + " " + b.y;
+  }
+  function drawWiresForCurrent() {
+    if (state.view !== "graph" || !state.gotSseFrame) return;
+    var zone = resolveSelectedZone();
+    if (zone) drawWires(columnsFor(zone));
+  }
+
+  // --- drag-to-rewire (pointer events; touch-friendly) --------------------
+  function onConsumerPointerDown(e, rec) {
+    if (!rec.interactive) return;
+    if (e.button != null && e.button !== 0) return; // primary button only
+    closeZoneMenu();
+    var grid = $("#graph-grid");
+    var gridRect = grid.getBoundingClientRect();
+    state.graphDrag = {
+      sid: rec.sid, root: rec.root, pointerId: e.pointerId,
+      startX: e.clientX, startY: e.clientY, gridRect: gridRect,
+      origin: anchorOf(rec.root, "right", gridRect),
+      cur: { x: e.clientX - gridRect.left, y: e.clientY - gridRect.top },
+      active: false, over: null,
+    };
+    try { rec.root.setPointerCapture(e.pointerId); } catch (err) { /* capture unsupported; document listeners still fire */ }
+    document.addEventListener("pointermove", onGraphPointerMove, true);
+    document.addEventListener("pointerup", onGraphPointerUp, true);
+    document.addEventListener("pointercancel", onGraphPointerUp, true);
+  }
+
+  function onGraphPointerMove(e) {
+    var d = state.graphDrag;
+    if (!d || e.pointerId !== d.pointerId) return;
+    if (!d.active) {
+      if (Math.abs(e.clientX - d.startX) < DRAG_THRESHOLD && Math.abs(e.clientY - d.startY) < DRAG_THRESHOLD) return;
+      d.active = true;
+      d.root.classList.add("is-dragging");
+      document.body.classList.add("graph-dragging");
+    }
+    e.preventDefault();
+    d.cur = { x: e.clientX - d.gridRect.left, y: e.clientY - d.gridRect.top };
+    var target = dropTargetAt(e.clientX, e.clientY);
+    if (target !== d.over) {
+      if (d.over) d.over.classList.remove("is-drop-hover");
+      d.over = target;
+      if (target) target.classList.add("is-drop-hover");
+    }
+    drawGhost();
+  }
+
+  function onGraphPointerUp(e) {
+    var d = state.graphDrag;
+    if (!d || e.pointerId !== d.pointerId) return;
+    document.removeEventListener("pointermove", onGraphPointerMove, true);
+    document.removeEventListener("pointerup", onGraphPointerUp, true);
+    document.removeEventListener("pointercancel", onGraphPointerUp, true);
+    try { d.root.releasePointerCapture(d.pointerId); } catch (err) { /* nothing to release */ }
+    d.root.classList.remove("is-dragging");
+    document.body.classList.remove("graph-dragging");
+    if (d.over) d.over.classList.remove("is-drop-hover");
+    var wasActive = d.active, target = d.over, sid = d.sid;
+    state.graphDrag = null;
+    removeGhost();
+
+    if (!wasActive) { // a tap/click, not a drag → open the accessible picker menu
+      var anchor = document.querySelector('[data-consumer="' + cssEscape(sid) + '"]');
+      openZoneMenu(sid, anchor || document.activeElement);
+      return;
+    }
+    if (e.type === "pointercancel" || !target) { drawWiresForCurrent(); return; }
+    // The right column IS the allowed set (UI guard) — any in-column drop is fine.
+    confirmExitNodeChange(sid, target.getAttribute("data-drop"), target);
+    drawWiresForCurrent();
+  }
+
+  function dropTargetAt(clientX, clientY) {
+    var node = document.elementFromPoint(clientX, clientY); // pointer-events:none SVG is skipped
+    while (node && node !== document.body) {
+      if (node.hasAttribute && node.hasAttribute("data-drop")) return node;
+      node = node.parentNode;
+    }
+    return null;
+  }
+  function drawGhost() {
+    var d = state.graphDrag, svg = $("#wires");
+    if (!d || !d.active || !svg) return;
+    removeGhost();
+    var path = svgEl("path", { d: wirePath(d.origin, d.cur), fill: "none", "class": "wire wire-ghost", "data-ghost": "1" });
+    path.setAttribute("aria-hidden", "true");
+    svg.appendChild(path);
+  }
+  function removeGhost() {
+    var svg = $("#wires");
+    if (!svg) return;
+    var g = svg.querySelector('[data-ghost="1"]');
+    if (g && g.parentNode) g.parentNode.removeChild(g);
+  }
+  function cssEscape(s) {
+    if (window.CSS && CSS.escape) return CSS.escape(s);
+    return String(s).replace(/["\\]/g, "\\$&");
+  }
+
+  // --- keyboard/click rewire menu (drag is NOT the only path — a11y) -------
+  function zoneMenuOptions(sid) {
+    var cols = columnsFor(resolveSelectedZone());
+    var rv = findRouterView(sid);
+    var curSid = rv && rv.currentExitNode ? rv.currentExitNode.stableID : "";
+    var opts = [{ value: "", label: "Direct (no exit node)", current: curSid === "", disabled: false }];
+    cols.exits.forEach(function (e) {
+      if (!e.allowed) return; // never offer a disallowed (out-of-zone) target — enforcement guard
+      var node = e.node;
+      var nm = (node && (node.name || node.hostname)) || (e.member && e.member.name) || e.sid;
+      var disabled = false, suffix = "";
+      if (!e.present) { disabled = true; suffix = " (missing)"; }
+      else if (!(node && node.online === true)) { suffix = " (offline)"; }
+      opts.push({ value: e.sid, label: nm + suffix, current: curSid === e.sid, disabled: disabled });
+    });
+    return opts;
+  }
+
+  function openZoneMenu(sid, anchorEl) {
+    closeZoneMenu();
+    var rv = findRouterView(sid);
+    if (!rv) return;
+    var routerName = (rv.node && (rv.node.name || rv.node.hostname)) || sid;
+    var menu = el("div", "zone-menu");
+    menu.setAttribute("role", "menu");
+    menu.setAttribute("aria-label", "Choose an exit node for " + routerName);
+    var items = [];
+    zoneMenuOptions(sid).forEach(function (o) {
+      var b = el("button", "zone-menu-item" + (o.current ? " is-current" : ""));
+      b.type = "button";
+      b.setAttribute("role", "menuitemradio");
+      b.setAttribute("aria-checked", o.current ? "true" : "false");
+      var label = el("span", "zone-menu-label", o.label);
+      b.appendChild(label);
+      if (o.current) { var ck = el("span", "zone-menu-check", "✓"); ck.setAttribute("aria-hidden", "true"); b.appendChild(ck); }
+      if (o.disabled) {
+        b.disabled = true;
+      } else {
+        b.addEventListener("click", function () { closeZoneMenu(); confirmExitNodeChange(sid, o.value, anchorEl); });
+        items.push(b);
+      }
+      menu.appendChild(b);
+    });
+    document.body.appendChild(menu);
+    positionMenu(menu, anchorEl);
+
+    function onKey(e) {
+      var idx = items.indexOf(document.activeElement);
+      if (e.key === "Escape") { e.preventDefault(); closeZoneMenu(); focusBack(anchorEl); }
+      else if (e.key === "ArrowDown") { e.preventDefault(); if (items.length) items[(idx + 1 + items.length) % items.length].focus(); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); if (items.length) items[(idx - 1 + items.length) % items.length].focus(); }
+      else if (e.key === "Home") { e.preventDefault(); if (items.length) items[0].focus(); }
+      else if (e.key === "End") { e.preventDefault(); if (items.length) items[items.length - 1].focus(); }
+      else if (e.key === "Tab") { e.preventDefault(); } // trap within the menu
+    }
+    function onDocDown(e) { if (!menu.contains(e.target)) closeZoneMenu(); }
+    menu.addEventListener("keydown", onKey);
+    document.addEventListener("pointerdown", onDocDown, true);
+    activeMenu = { el: menu, onDocDown: onDocDown };
+    if (items.length) items[0].focus();
+  }
+
+  function focusBack(elem) { if (elem && elem.focus) { try { elem.focus(); } catch (e) { /* element gone */ } } }
+
+  function positionMenu(menu, anchorEl) {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    var mr = menu.getBoundingClientRect();
+    var top = 12, left = 12;
+    if (anchorEl && anchorEl.getBoundingClientRect) {
+      var r = anchorEl.getBoundingClientRect();
+      left = r.right + 8;
+      if (left + mr.width > vw - 8) left = r.left - mr.width - 8;     // flip to the left
+      if (left < 8) left = Math.max(8, (vw - mr.width) / 2);          // last resort: center
+      top = Math.min(r.top, Math.max(8, vh - mr.height - 8));
+    }
+    menu.style.left = Math.round(left) + "px";
+    menu.style.top = Math.round(top) + "px";
+  }
+
+  function closeZoneMenu() {
+    if (!activeMenu) return;
+    document.removeEventListener("pointerdown", activeMenu.onDocDown, true);
+    if (activeMenu.el && activeMenu.el.parentNode) activeMenu.el.parentNode.removeChild(activeMenu.el);
+    activeMenu = null;
+  }
+
+  // --- zone selector tabs -------------------------------------------------
+  function renderZoneTabs(zones) {
+    var box = $("#zone-tabs");
+    if (!box) return;
+    reconcile(box, zones, function (z) { return z.id; }, function (z) {
+      var b = el("button", "zone-tab");
+      b.type = "button";
+      b.setAttribute("role", "tab");
+      var zid = z.id;
+      b.addEventListener("click", function () { selectZone(zid); });
+      b.addEventListener("keydown", function (e) { onZoneTabKey(e, zid); });
+      return { root: b, id: zid };
+    }, function (rec, z) {
+      setText(rec.root, z.name);
+      var sel = z.id === state.selectedZone;
+      rec.root.setAttribute("aria-selected", sel ? "true" : "false");
+      rec.root.setAttribute("tabindex", sel ? "0" : "-1");
+      rec.root.classList.toggle("is-selected", sel);
+    }, zoneTabEls, true);
+  }
+
+  function selectZone(id) {
+    if (state.selectedZone === id) return;
+    state.selectedZone = id;
+    closeZoneMenu();
+    render();
+  }
+
+  function onZoneTabKey(e, zid) {
+    var zones = zoneList();
+    var i = -1;
+    for (var k = 0; k < zones.length; k++) if (zones[k].id === zid) { i = k; break; }
+    if (i < 0) return;
+    var next;
+    if (e.key === "ArrowRight" || e.key === "ArrowDown") next = (i + 1) % zones.length;
+    else if (e.key === "ArrowLeft" || e.key === "ArrowUp") next = (i - 1 + zones.length) % zones.length;
+    else if (e.key === "Home") next = 0;
+    else if (e.key === "End") next = zones.length - 1;
+    else return;
+    e.preventDefault();
+    var nz = zones[next];
+    selectZone(nz.id);
+    var rec = zoneTabEls[nz.id];
+    if (rec && rec.root) rec.root.focus();
+  }
+
+  function renderZoneActions(zone) {
+    var isGroup = !!(zone && zone.id !== UNGROUPED && zone.group);
+    var editBtn = $("#zone-edit"), delBtn = $("#zone-delete");
+    if (editBtn) { show(editBtn, isGroup); editBtn.hidden = !isGroup; }
+    if (delBtn) { show(delBtn, isGroup); delBtn.hidden = !isGroup; }
+  }
+
+  // --- zone CRUD ----------------------------------------------------------
+  function groupErrText(res) {
+    var d = res && res.data;
+    if (d && (d.detail || d.error)) return d.detail || d.error;
+    return "HTTP " + (res ? res.status : "?");
+  }
+
+  // Authenticated, CSRF-protected JSON write (mirrors the exit-node POST flow):
+  // 401 → login overlay; 403 → refresh the CSRF token and retry once. Resolves to
+  // {ok, status, data, text}; resolves undefined when the login overlay took over.
+  function apiWrite(method, url, body, retried) {
+    return ensureCSRF().then(function () {
+      var opts = {
+        method: method,
+        headers: { "Accept": "application/json", "X-Tsctl-CSRF": state.csrfToken || "" },
+      };
+      if (body != null) {
+        opts.headers["Content-Type"] = "application/json";
+        opts.body = JSON.stringify(body);
+      }
+      return fetch(url, opts);
+    }).then(function (resp) {
+      return resp.text().then(function (text) {
+        var data = null;
+        try { data = text ? JSON.parse(text) : null; } catch (e) { data = null; }
+        if (resp.status === 401) { promptLogin(); return undefined; }
+        if (resp.status === 403 && !retried) { return fetchCSRF().then(function () { return apiWrite(method, url, body, true); }); }
+        return { ok: resp.ok, status: resp.status, data: data, text: text };
+      });
+    });
+  }
+
+  function confirmDeleteZone(group) {
+    var body = el("div");
+    body.appendChild(document.createTextNode("Delete the zone "));
+    body.appendChild(el("strong", null, group.name || "(unnamed)"));
+    body.appendChild(document.createTextNode("? Its consumers move to Ungrouped. No exit-node changes are made."));
+    openModal({
+      title: "Delete zone?",
+      body: body,
+      confirmLabel: "Delete zone",
+      cancelLabel: "Cancel",
+      onConfirm: function () { deleteZone(group.id); },
+    });
+  }
+
+  function deleteZone(id) {
+    apiWrite("DELETE", "/api/groups/" + encodeURIComponent(id), null)
+      .then(function (res) {
+        if (!res) return; // login overlay took over
+        if (res.ok || res.status === 204) {
+          if (state.selectedZone === id) state.selectedZone = null; // re-default next render
+          toast("ok", "Zone deleted", "");
+        } else if (res.status === 404) {
+          toast("warn", "Zone already gone", "It may have been deleted elsewhere.");
+        } else {
+          toast("err", "Couldn’t delete zone", groupErrText(res));
+        }
+      })
+      .catch(function (err) { toast("err", "Network error", String((err && err.message) || err)); });
+  }
+
+  // --- zone editor (create / rename / membership) -------------------------
+  function consumerPickItems(group) {
+    var present = {};
+    var items = snapRouters().map(function (rv) {
+      var sid = rv.node.stableID;
+      present[sid] = true;
+      var checked = false;
+      if (group) (group.consumers || []).forEach(function (m) { if (m.stableID === sid) checked = true; });
+      return { sid: sid, label: rv.node.name || rv.node.hostname || sid, sub: (rv.node.tailscaleIPs || [])[0] || "", checked: checked, missing: false };
+    });
+    if (group) (group.consumers || []).forEach(function (m) {
+      if (!present[m.stableID]) items.push({ sid: m.stableID, label: m.name || m.stableID, sub: "not in netmap", checked: true, missing: true });
+    });
+    return items;
+  }
+
+  function exitPickItems(group) {
+    var present = {};
+    var items = snapNodes().filter(isExitCapable).map(function (n) {
+      present[n.stableID] = true;
+      var checked = false;
+      if (group) (group.allowedExitNodes || []).forEach(function (m) { if (m.stableID === n.stableID) checked = true; });
+      return { sid: n.stableID, label: n.name || n.hostname || n.stableID, sub: ((n.tailscaleIPs || [])[0] || "") + (n.online ? "" : " · offline"), checked: checked, missing: false };
+    });
+    if (group) (group.allowedExitNodes || []).forEach(function (m) {
+      if (!present[m.stableID]) items.push({ sid: m.stableID, label: m.name || m.stableID, sub: "not in netmap", checked: true, missing: true });
+    });
+    return items;
+  }
+
+  function buildMemberPicker(title, items, idPrefix) {
+    var field = el("div", "editor-field");
+    field.appendChild(el("div", "editor-label", title));
+    var list = el("div", "member-list");
+    var inputs = [];
+    if (!items.length) list.appendChild(el("p", "member-empty", "None available."));
+    items.forEach(function (it, i) {
+      var row = el("label", "member-item" + (it.missing ? " is-missing" : ""));
+      var cb = el("input");
+      cb.type = "checkbox";
+      cb.className = "member-cb";
+      cb.checked = !!it.checked;
+      cb.value = it.sid;
+      cb.id = idPrefix + "-" + i;
+      var txt = el("span", "member-text");
+      txt.appendChild(el("span", "member-name", it.label + (it.missing ? " (missing)" : "")));
+      if (it.sub) txt.appendChild(el("span", "member-sub", it.sub));
+      row.appendChild(cb);
+      row.appendChild(txt);
+      list.appendChild(row);
+      inputs.push(cb);
+    });
+    field.appendChild(list);
+    return {
+      field: field,
+      selected: function () {
+        var out = [];
+        inputs.forEach(function (cb) { if (cb.checked) out.push(cb.value); });
+        return out;
+      },
+    };
+  }
+
+  function openEditor(group) {
+    closeZoneMenu();
+    var isNew = !group;
+    var prevFocus = document.activeElement;
+    var backdrop = el("div", "modal-backdrop");
+    var dialog = el("div", "modal editor");
+    dialog.setAttribute("role", "dialog");
+    dialog.setAttribute("aria-modal", "true");
+    var uid = "ed" + Date.now();
+
+    var titleEl = el("h2", "modal-title", isNew ? "New zone" : "Edit zone");
+    titleEl.id = uid + "-t";
+    dialog.setAttribute("aria-labelledby", titleEl.id);
+    dialog.appendChild(titleEl);
+
+    var bodyEl = el("div", "modal-body editor-body");
+    var nameField = el("div", "editor-field");
+    var nameLbl = el("label", "editor-label", "Zone name");
+    nameLbl.htmlFor = uid + "-name";
+    var nameInput = el("input", "editor-input");
+    nameInput.id = uid + "-name";
+    nameInput.type = "text";
+    nameInput.autocomplete = "off";
+    nameInput.spellcheck = false;
+    nameInput.value = group ? (group.name || "") : "";
+    nameInput.setAttribute("placeholder", "e.g. Work");
+    nameField.appendChild(nameLbl);
+    nameField.appendChild(nameInput);
+    bodyEl.appendChild(nameField);
+
+    var consBox = buildMemberPicker("Consumers (routers)", consumerPickItems(group), uid + "-c");
+    bodyEl.appendChild(consBox.field);
+    var exitBox = buildMemberPicker("Allowed exit nodes", exitPickItems(group), uid + "-e");
+    bodyEl.appendChild(exitBox.field);
+
+    var errEl = el("div", "editor-error hidden");
+    errEl.setAttribute("role", "alert");
+    bodyEl.appendChild(errEl);
+    dialog.appendChild(bodyEl);
+
+    var actions = el("div", "modal-actions editor-actions");
+    var delBtn = null;
+    if (!isNew) {
+      delBtn = el("button", "btn btn-danger editor-del", "Delete");
+      delBtn.type = "button";
+      actions.appendChild(delBtn);
+    }
+    actions.appendChild(el("div", "editor-spacer"));
+    var cancelBtn = el("button", "btn btn-secondary", "Cancel");
+    cancelBtn.type = "button";
+    var saveBtn = el("button", "btn btn-primary", isNew ? "Create zone" : "Save");
+    saveBtn.type = "button";
+    actions.appendChild(cancelBtn);
+    actions.appendChild(saveBtn);
+    dialog.appendChild(actions);
+
+    backdrop.appendChild(dialog);
+    document.body.appendChild(backdrop);
+
+    function closeEditor() {
+      if (activeModal === backdrop) activeModal = null;
+      if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop);
+    }
+    function done() { closeEditor(); focusBack(prevFocus); }
+    function showErr(msg) { setText(errEl, msg || ""); show(errEl, !!msg); }
+    function setBusy(b) { saveBtn.disabled = b; cancelBtn.disabled = b; if (delBtn) delBtn.disabled = b; }
+
+    cancelBtn.addEventListener("click", done);
+    backdrop.addEventListener("mousedown", function (e) { if (e.target === backdrop) done(); });
+    dialog.addEventListener("keydown", function (e) {
+      if (e.key === "Escape") { e.preventDefault(); done(); return; }
+      if (e.key === "Tab") {
+        var f = dialog.querySelectorAll('button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])');
+        if (!f.length) return;
+        var first = f[0], last = f[f.length - 1];
+        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+      }
+    });
+    if (delBtn) delBtn.addEventListener("click", function () { done(); confirmDeleteZone(group); });
+
+    saveBtn.addEventListener("click", function () {
+      var name = (nameInput.value || "").trim();
+      if (!name) { showErr("Please enter a zone name."); nameInput.focus(); return; }
+      var payload = { name: name, consumers: consBox.selected(), allowedExitNodes: exitBox.selected() };
+      setBusy(true);
+      showErr("");
+      var method = isNew ? "POST" : "PUT";
+      var url = isNew ? "/api/groups" : "/api/groups/" + encodeURIComponent(group.id);
+      apiWrite(method, url, payload).then(function (res) {
+        if (!res) return; // login overlay took over
+        if (res.ok) {
+          if (res.data && res.data.id) state.selectedZone = res.data.id; // auto-select on the next snapshot
+          toast("ok", isNew ? "Zone created" : "Zone saved", (res.data && res.data.name) || "");
+          done();
+          render();
+          return;
+        }
+        setBusy(false);
+        if (res.status === 404) showErr("This zone no longer exists (it may have been deleted).");
+        else showErr(groupErrText(res)); // 422 validation {error/detail}, 400, etc.
+      }).catch(function (err) {
+        setBusy(false);
+        showErr("Network error: " + ((err && err.message) || err));
+      });
+    });
+
+    activeModal = backdrop;
+    nameInput.focus();
+  }
+
+  // --- view toggle (graph <-> cards) --------------------------------------
+  function setView(view) {
+    if (view !== "graph" && view !== "cards") return;
+    if (state.view === view) return;
+    state.view = view;
+    closeZoneMenu();
+    render();
+  }
+  function renderViewToggle() {
+    var z = $("#tab-zones"), d = $("#tab-devices");
+    var graph = state.view === "graph";
+    if (z) { z.setAttribute("aria-selected", graph ? "true" : "false"); z.setAttribute("tabindex", graph ? "0" : "-1"); z.classList.toggle("is-selected", graph); }
+    if (d) { d.setAttribute("aria-selected", graph ? "false" : "true"); d.setAttribute("tabindex", graph ? "-1" : "0"); d.classList.toggle("is-selected", !graph); }
+  }
+
+  function wireGraph() {
+    var z = $("#tab-zones"), d = $("#tab-devices");
+    if (z) z.addEventListener("click", function () { setView("graph"); });
+    if (d) d.addEventListener("click", function () { setView("cards"); });
+    function segKey(e, other) {
+      if (e.key === "ArrowRight" || e.key === "ArrowLeft" || e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault(); other.focus(); other.click();
+      }
+    }
+    if (z && d) {
+      z.addEventListener("keydown", function (e) { segKey(e, d); });
+      d.addEventListener("keydown", function (e) { segKey(e, z); });
+    }
+    var nb = $("#zone-new"); if (nb) nb.addEventListener("click", function () { openEditor(null); });
+    var eb = $("#zone-edit"); if (eb) eb.addEventListener("click", function () { var zn = resolveSelectedZone(); if (zn && zn.group) openEditor(zn.group); });
+    var db = $("#zone-delete"); if (db) db.addEventListener("click", function () { var zn = resolveSelectedZone(); if (zn && zn.group) confirmDeleteZone(zn.group); });
+    // Wires depend on element positions — redraw on resize (coalesced; skipped mid-drag).
+    window.addEventListener("resize", function () {
+      if (state.view !== "graph") return;
+      if (state.graphDrag && state.graphDrag.active) return;
+      if (rafPending) return;
+      rafPending = true;
+      window.requestAnimationFrame(function () { rafPending = false; drawWiresForCurrent(); });
+    });
   }
 
   // --------------------------------------------------------------- render ---
@@ -1003,12 +1875,26 @@
 
     var hasData = state.gotSseFrame || !!state.nodesOnly;
     $("#loading").hidden = hasData;
-    $("#routers-section").hidden = !hasData;
-    $("#nodes-section").hidden = !hasData;
-    if (!hasData) return;
+    var viewbar = $("#viewbar");
+    if (viewbar) { show(viewbar, hasData); viewbar.hidden = !hasData; }
+    if (!hasData) {
+      $("#graph-section").hidden = true;
+      $("#routers-section").hidden = true;
+      $("#nodes-section").hidden = true;
+      return;
+    }
 
-    renderRouters();
-    renderNodes();
+    renderViewToggle();
+    var graphView = state.view === "graph";
+    $("#graph-section").hidden = !graphView;
+    $("#routers-section").hidden = graphView;
+    $("#nodes-section").hidden = graphView;
+    if (graphView) {
+      renderGraph();
+    } else {
+      renderRouters();
+      renderNodes();
+    }
   }
 
   // ----------------------------------------------------------- networking ---
@@ -1302,6 +2188,7 @@
   function init() {
     buildChips();
     wireControls();
+    wireGraph();
     render();
     fetchCSRF();
     fetchNodes();   // first paint (also the no-SSE fallback seed)
