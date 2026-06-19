@@ -84,3 +84,20 @@ the root password. Use `golang.org/x/crypto/ssh/knownhosts`:
 
 Default stays `tailscale-ssh`. Document loudly that `ip-password` trades
 ACL-governed identity for a flat secret and requires host-key verification.
+
+## Addendum: the `tailnet-password` sibling transport (implemented)
+
+A third transport reuses the same runSSH seam: dial the router's `100.x` over the
+tailnet (tsnet, like `tailscale-ssh`) but authenticate with the shared password
+(like `ip-password`). It reaches the router's own sshd/dropbear over WireGuard
+**without** `tailscale set --ssh` on the routers and **without** any LAN-endpoint
+map — `endpointFor` is `addr+":22"`, `dial` is `TailscaleDial`, `authMethods` is
+the shared `passwordAuthMethods`, and the host key is `InsecureIgnoreHostKey`
+(WireGuard authenticates the peer, so a known_hosts check adds nothing — same
+reasoning as `tailscale-ssh`). Because tsnet reaches the `100.x` directly, it works
+where a plain `net.Dialer` can't — notably a bridged container whose host has no
+route to `100.x`. Requires an ACL `tcp` grant to `:22` (the regular SSH port, not
+the Tailscale-SSH `ssh` action). The password remains a secret (`TSCTL_SSH_PASSWORD`
+/ `LoadCredential`), `validate()` fails closed without it, and no host-key mode or
+`-router-addrs` is needed. Recommended middle ground for "I want a password, not
+Tailscale SSH, and tsctl runs in a container."

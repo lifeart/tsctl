@@ -179,7 +179,7 @@ func loadConfig(args []string) (*Config, error) {
 	fs.BoolVar(&c.RequireKeep, "require-keep", requireKeepDef,
 		"require an explicit operator Keep within the revert window after a confirmed exit-node change (default false = auto-keep)")
 	fs.StringVar(&c.RouterTransport, "router-transport", env("TSCTL_ROUTER_TRANSPORT", "tailscale-ssh"),
-		"router command transport: tailscale-ssh (default) | ip-password (opt-in, host-key-verified, LAN-trusted)")
+		"router command transport: tailscale-ssh (default) | tailnet-password (password over the tailnet; no Tailscale SSH, no LAN map) | ip-password (password to a LAN endpoint, host-key-verified)")
 	fs.StringVar(&c.RouterHostKeyMode, "router-hostkey-mode", env("TSCTL_ROUTER_HOSTKEY_MODE", "tofu"),
 		"ip-password host-key verification: tofu (default) | strict | pin | insecure")
 	routerAddrs := fs.String("router-addrs", env("TSCTL_ROUTER_ADDRS", ""),
@@ -354,9 +354,9 @@ func (c *Config) validate() error {
 	// Reject unknown values for both. The host-key mode is validated regardless
 	// of transport so a typo never silently degrades verification.
 	switch c.RouterTransport {
-	case "tailscale-ssh", "ip-password":
+	case "tailscale-ssh", "ip-password", "tailnet-password":
 	default:
-		return fmt.Errorf("invalid -router-transport %q: want tailscale-ssh or ip-password", c.RouterTransport)
+		return fmt.Errorf("invalid -router-transport %q: want tailscale-ssh, tailnet-password, or ip-password", c.RouterTransport)
 	}
 	switch c.RouterHostKeyMode {
 	case "tofu", "strict", "pin", "insecure":
@@ -378,6 +378,14 @@ func (c *Config) validate() error {
 		// use-time (router.endpointFor fails loud per router), not here, because
 		// routers may be auto-discovered from the netmap and are unknown at config
 		// time. Document the mapping requirement (README) for ip-password users.
+	}
+	if c.RouterTransport == "tailnet-password" {
+		// Password SSH over the tailnet (tsnet) to the router's own sshd -- no LAN
+		// map, no Tailscale SSH. Require the password; host-key mode is irrelevant
+		// (WireGuard authenticates the peer, like tailscale-ssh).
+		if c.SSHPassword == "" {
+			return errors.New("router transport tailnet-password requires an SSH password: set TSCTL_SSH_PASSWORD or provide the systemd LoadCredential ssh_password (it is never a flag and never logged)")
+		}
 	}
 	return nil
 }

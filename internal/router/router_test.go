@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +13,35 @@ import (
 
 	"github.com/lifeart/tsctl/internal/store"
 )
+
+func TestNew_TailnetPasswordTransport(t *testing.T) {
+	dial := func(ctx context.Context, network, address string) (net.Conn, error) {
+		return nil, errors.New("not dialed in this test")
+	}
+	// Happy path: needs a tsnet dial func + a password, and crucially NO RouterAddrs
+	// map (it dials the router's 100.x over the tailnet, like tailscale-ssh).
+	c, err := New(Options{Transport: "tailnet-password", TailscaleDial: dial, Password: "pw", KeyboardInteractive: true})
+	if err != nil {
+		t.Fatalf("New(tailnet-password): %v", err)
+	}
+	ep, err := c.endpointFor("100.64.0.1")
+	if err != nil || ep != "100.64.0.1:22" {
+		t.Errorf("endpointFor = %q, %v; want 100.64.0.1:22 (the tailnet 100.x, no LAN map)", ep, err)
+	}
+	if c.authMethods == nil {
+		t.Error("tailnet-password must authenticate with a password (authMethods is nil)")
+	}
+	if c.dial == nil {
+		t.Error("tailnet-password must dial over tsnet (dial is nil)")
+	}
+	// Fail-closed: a missing password or dial func is a construction error.
+	if _, err := New(Options{Transport: "tailnet-password", TailscaleDial: dial}); err == nil {
+		t.Error("tailnet-password without a password must fail")
+	}
+	if _, err := New(Options{Transport: "tailnet-password", Password: "pw"}); err == nil {
+		t.Error("tailnet-password without a dial func must fail")
+	}
+}
 
 // hs matches the LastHandshake baked into the testdata fixtures (gen/main.go).
 var hs = time.Date(2026, 6, 17, 12, 0, 0, 0, time.UTC)

@@ -53,9 +53,16 @@ services:
       # TSCTL_OWNER: "you@example.com"
       # Pin specific routers; leave unset to auto-discover every tag:router node:
       # TSCTL_ROUTERS: "100.64.0.10,100.64.0.11"
-      # Router transport: default "tailscale-ssh"; "ip-password" reaches routers by
-      # LAN IP+password (see README "Router transport" — needs TSCTL_ROUTER_ADDRS +
-      # TSCTL_SSH_PASSWORD and host-key verification).
+      # Router transport: default "tailscale-ssh" (needs `tailscale set --ssh` on the
+      # routers + the ACL `ssh` rule). If you'd rather use a PASSWORD and NOT enable
+      # Tailscale SSH, use "tailnet-password" — it reaches each router's 100.x over
+      # the tailnet (tsnet) with a password, so it needs NO LAN map and works from
+      # this bridged container (whose host can't route to 100.x directly). Set a
+      # router root password (dropbear) + an ACL `tcp :22` grant:
+      # TSCTL_ROUTER_TRANSPORT: "tailnet-password"
+      # TSCTL_SSH_PASSWORD: "..."     # better: a Docker secret -> ssh_password
+      # ("ip-password" instead reaches routers by LAN IP+password — needs
+      # TSCTL_ROUTER_ADDRS=100.x=host[:port] + host-key verification; see README.)
 
     ports:
       - "8087:8087"          # host:container — the UI is at http://<nas>:8087/

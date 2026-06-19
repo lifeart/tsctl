@@ -167,10 +167,10 @@ env equivalent.
 | `-listen` | `TSCTL_LISTEN` | `:80` | no | tailnet-side listen address |
 | `-healthz` | `TSCTL_HEALTH_ADDR` | `127.0.0.1:8088` | no | loopback-only health endpoint |
 | `-ssh-user` | `TSCTL_SSH_USER` | `root` | no | router SSH login |
-| `-router-transport` | `TSCTL_ROUTER_TRANSPORT` | `tailscale-ssh` | no | router command transport: `tailscale-ssh` (default) \| `ip-password` (opt-in; see [Router transport](#router-transport)) |
+| `-router-transport` | `TSCTL_ROUTER_TRANSPORT` | `tailscale-ssh` | no | router command transport: `tailscale-ssh` (default) \| `tailnet-password` \| `ip-password` (opt-in; see [Router transport](#router-transport)) |
 | `-router-hostkey-mode` | `TSCTL_ROUTER_HOSTKEY_MODE` | `tofu` | no | ip-password host-key verification: `tofu`\|`strict`\|`pin`\|`insecure` |
 | `-router-addrs` | `TSCTL_ROUTER_ADDRS` | — | for `ip-password` | `100.x=host[:port]` LAN-endpoint map; the `100.x` stays the router identity (unmapped routers fail loudly) |
-| *(secret)* | `TSCTL_SSH_PASSWORD` | — | for `ip-password` | router SSH password; env or systemd `LoadCredential`/Docker secret `ssh_password` — **never a flag, never logged** |
+| *(secret)* | `TSCTL_SSH_PASSWORD` | — | for `ip-password` / `tailnet-password` | router SSH password; env or systemd `LoadCredential`/Docker secret `ssh_password` — **never a flag, never logged** |
 | `-exit-node-lan-access` | `TSCTL_EXIT_NODE_LAN_ACCESS` | `preserve` | no | manage `--exit-node-allow-lan-access`: `preserve`\|`true`\|`false` |
 | `-allowed-hosts` | `TSCTL_ALLOWED_HOSTS` | — | no | extra Host values to allow (rebinding defense); hostname/MagicDNS/`100.x` auto-trusted |
 | `-poll-interval` | `TSCTL_POLL_INTERVAL` | `30s` | no | refresh cadence while a client is connected |
@@ -203,6 +203,22 @@ How tsctl reaches a router to read/set its exit node. The default is
 the tailnet with `none` auth, gated by the [ACL](#required-acl). There is no
 router-side password, and the host key is implicitly trusted because WireGuard
 already authenticates the peer.
+
+The opt-in **`tailnet-password`** transport
+(`TSCTL_ROUTER_TRANSPORT=tailnet-password` + `TSCTL_SSH_PASSWORD`) keeps dialing
+the router's **`100.x` over the tailnet** (via tsctl's own tsnet node, exactly
+like `tailscale-ssh`) but authenticates with a **password** to the router's own
+sshd/dropbear. This is the option to reach for when you want password auth and
+**don't** want to enable Tailscale SSH on the routers: there is **no LAN-endpoint
+map** and **no `tailscale set --ssh`** needed. Because tsnet reaches the `100.x`
+directly, it works from any network position — notably a **bridged Docker
+container** (e.g. on a NAS) whose host can't route to `100.x` with a plain dialer.
+The host key is implicitly trusted (WireGuard authenticates the peer, as for
+`tailscale-ssh`); the password just authenticates *tsctl* to the router and travels
+inside the encrypted tunnel. It needs an ACL **`tcp` grant to `:22`** on the
+routers (the regular port — *not* the Tailscale-SSH `ssh` action), and a router
+**root password set** (`passwd`; dropbear rejects empty passwords). Same secret
+handling as below.
 
 The opt-in **`ip-password`** transport (`TSCTL_ROUTER_TRANSPORT=ip-password`)
 instead SSHes to the router's **LAN IP** with a shared password — useful to skip

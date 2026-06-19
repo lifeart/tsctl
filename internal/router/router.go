@@ -4,17 +4,23 @@
 // run one command with x/crypto/ssh, capture stdout+stderr+exit code, and close.
 // No long-lived *ssh.Client.
 //
-// Two transports plug into the SAME runSSH seam (see Options/New):
+// Three transports plug into the SAME runSSH seam (see Options/New):
 //   - tailscale-ssh (DEFAULT): dial over the tailnet (tsnet.Server.Dial), `none`
 //     auth -- the ACL grants tagged src action:accept -- and an InsecureIgnore
 //     host key (safe: WireGuard authenticates the peer; DESIGN §7).
+//   - tailnet-password (opt-in): dial the router's 100.x over the tailnet (tsnet,
+//     like tailscale-ssh) but authenticate with a PASSWORD (like ip-password) --
+//     reaches the router's own sshd/dropbear over WireGuard WITHOUT enabling
+//     Tailscale SSH and WITHOUT any LAN map. InsecureIgnore host key (WireGuard
+//     authenticates the peer). Needs an ACL `tcp :22` grant (not the `ssh` action).
 //   - ip-password (opt-in): dial the router's LAN endpoint with a plain
 //     net.Dialer, authenticate with a password (+ keyboard-interactive dropbear
 //     fallback), and VERIFY the host key via known_hosts (see hostkey.go).
 //
 // The 100.x IPv4 stays the canonical router identity everywhere (poller, exitArg,
 // store keys, Status/SetExitNode addr arg). Only the ip-password transport maps
-// that identity to a LAN dial target, and ONLY at the runSSH boundary.
+// that identity to a LAN dial target, and ONLY at the runSSH boundary; the tailnet
+// transports dial the 100.x directly.
 //
 // ParseStatus is a PURE function (DESIGN §4): golden-fixture tested,
 // version-tolerant. *Client implements poller.RouterClient.
@@ -204,33 +210,62 @@ func New(opts Options) (*Client, error) {
 			}
 			return ensurePort(ep), nil
 		}
-		auth := []ssh.AuthMethod{ssh.Password(opts.Password)}
-		if opts.KeyboardInteractive {
-			pw := opts.Password
-			// Older dropbear may advertise keyboard-interactive instead of password:
-			// answer every challenge with the same password.
-			auth = append(auth, ssh.KeyboardInteractive(
-				func(name, instruction string, questions []string, echos []bool) ([]string, error) {
-					answers := make([]string, len(questions))
-					for i := range answers {
-						answers[i] = pw
-					}
-					return answers, nil
-				}))
-		}
-		c.authMethods = auth
+		c.authMethods = passwordAuthMethods(opts)
 		hk, err := hostKeyCallback(opts.HostKeyMode, opts.KnownHostsPath)
 		if err != nil {
 			return nil, err
 		}
 		c.hostKey = hk
 
+	case "tailnet-password":
+		// Dial the router's 100.x over the tailnet (tsnet, like tailscale-ssh) but
+		// authenticate with a PASSWORD (like ip-password) -- i.e. reach the router's
+		// OWN sshd/dropbear over WireGuard WITHOUT enabling Tailscale SSH on it, and
+		// WITHOUT any LAN endpoint mapping. tsnet reaches the 100.x directly, so this
+		// works from any network position (e.g. a bridged container whose host can't
+		// route to 100.x). Requires the auth key's node to be able to open SSH to the
+		// router on the tailnet (an ACL `tcp :22` grant, NOT the `ssh` action).
+		if opts.TailscaleDial == nil {
+			return nil, errors.New("router: tailnet-password transport requires a dial func (tsnet.Server.Dial)")
+		}
+		if opts.Password == "" {
+			return nil, errors.New("router: tailnet-password transport requires a password")
+		}
+		c.dial = opts.TailscaleDial
+		c.endpointFor = func(addr string) (string, error) { return net.JoinHostPort(addr, "22"), nil }
+		c.authMethods = passwordAuthMethods(opts)
+		// InsecureIgnoreHostKey is DELIBERATE (as for tailscale-ssh): tsnet.Dial only
+		// reaches the WireGuard-authenticated peer, so the SSH host key adds nothing
+		// over WireGuard's peer authentication. The password authenticates US to the
+		// router and is sent over the encrypted tunnel.
+		c.hostKey = ssh.InsecureIgnoreHostKey()
+
 	default:
-		return nil, fmt.Errorf("router: unknown transport %q (want tailscale-ssh or ip-password)", opts.Transport)
+		return nil, fmt.Errorf("router: unknown transport %q (want tailscale-ssh, tailnet-password, or ip-password)", opts.Transport)
 	}
 
 	c.runner = sshRunnerFunc(c.runSSH)
 	return c, nil
+}
+
+// passwordAuthMethods builds SSH password auth for the password transports
+// (ip-password, tailnet-password). It includes a keyboard-interactive fallback
+// (answering every challenge with the same password) for older dropbear builds
+// that advertise keyboard-interactive instead of `password`.
+func passwordAuthMethods(opts Options) []ssh.AuthMethod {
+	auth := []ssh.AuthMethod{ssh.Password(opts.Password)}
+	if opts.KeyboardInteractive {
+		pw := opts.Password
+		auth = append(auth, ssh.KeyboardInteractive(
+			func(name, instruction string, questions []string, echos []bool) ([]string, error) {
+				answers := make([]string, len(questions))
+				for i := range answers {
+					answers[i] = pw
+				}
+				return answers, nil
+			}))
+	}
+	return auth
 }
 
 // ensurePort appends the default SSH port to a LAN endpoint that has none. It

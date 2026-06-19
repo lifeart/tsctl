@@ -421,12 +421,12 @@ func allowedHosts(ctx context.Context, cfg *Config, lc *local.Client, lg *log.Lo
 	return hosts
 }
 
-// routerOptions builds router.Options from cfg. tailscaleDial is
-// tsnet.Server.Dial for the tailscale-ssh transport (pass nil for ip-password,
-// which dials the router's LAN endpoint with its own net.Dialer). Keyboard-
-// interactive is enabled so older dropbear builds that advertise it instead of
-// the password method still authenticate; it is ignored by the tailscale-ssh
-// (`none` auth) transport.
+// routerOptions builds router.Options from cfg. tailscaleDial (tsnet.Server.Dial)
+// is used by the tailscale-ssh and tailnet-password transports (both reach the
+// router's 100.x over the tailnet); ip-password ignores it and dials the router's
+// LAN endpoint with its own net.Dialer. Keyboard-interactive is enabled so older
+// dropbear builds that advertise it instead of the password method still
+// authenticate; it is ignored by the tailscale-ssh (`none` auth) transport.
 func routerOptions(cfg *Config, tailscaleDial router.DialFunc) router.Options {
 	return router.Options{
 		Transport:           cfg.RouterTransport,
