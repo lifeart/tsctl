@@ -126,3 +126,55 @@ func (c *Client) KeepExitNode(ctx, addr, marker string) error
 Stage 1: egress probe (always reported; additive; lower risk).
 Stage 2: explicit-Keep gate behind `-require-keep` (default off).
 Each stage gets its own concurrency/seam review gate before commit.
+
+## Status & residual known limitations
+
+**Shipped.** Stage 1 (egress probe) and stage 2 (explicit-Keep gate, opt-in via
+`-require-keep`, default **off**) are implemented. With `-require-keep` off the
+path is byte-for-byte the v1 auto-keep behavior. The dead-man's-switch (defer the
+keep, hold a marker, an in-memory per-router `pendingKeep` gate) is concurrency-
+sensitive and went through **three adversarial review gates**, which found and
+fixed seven `-race`-invisible bugs (false-confirm via the poll, orphaned/leaked
+revert timers on supersede — sequential and concurrent, fallback false-confirm and
+stranding, a failed-supersede leak). Each fix is pinned by a regression test proven
+to fail without it. Mechanisms that keep it correct:
+
+- **`setSeq`** (bumped at step 1) supersedes a stale reconcile; **`setGen`** (bumped
+  at step 1 AND step 3, and on Keep) lets a concurrent poll detect a set that
+  started OR confirmed during its dial and keep the published view (not its stale
+  read). The poll OVERLAYS awaiting-keep on a live-pending router so a plain Status
+  read can't clear the gate.
+- Every `ApplyExitNode(autoKeep=false)` marker is eventually written-by-Keep,
+  written-by-disarm (a superseded/replaced op disarms its own + the prior marker),
+  or fired. The `pendingKeep` map is in-memory by design: a restart loses it → the
+  router auto-reverts (fail-safe).
+
+**Residual limitations (accepted; opt-in path only; all err toward the safe
+revert direction):**
+
+1. **Apply-order vs `setSeq`-order skew (PRE-EXISTING, shared with the default
+   v1/auto-keep path — not introduced by this feature).** Two concurrent
+   SetExitNode calls to the *same* router order their published result by `setSeq`
+   (the step-1 `mu` order) but the device's last write is ordered by the per-router
+   SSH lock; a preemption between releasing `mu` and acquiring that lock can reverse
+   them, so the snapshot can momentarily show exit W while the device is on exit L.
+   Self-heals within one poll for managed (dialed) routers; persists until the gate
+   fires for fallback routers. Requires two concurrent operators/API calls on one
+   router — the single-card UI prevents it by disabling the picker while a change is
+   pending.
+2. **Best-effort disarm failure.** If the SSH write that disarms a superseded op's
+   orphaned revert timer fails, the timer fires and reverts the (newer) selection.
+   Logged, never silent; errs toward reverting.
+3. **Vanished-but-confirmed router.** A confirmed set whose router drops out of the
+   snapshot before reconcile now disarms its own timer (so the selection is kept)
+   rather than letting the timer revert it — a minor weakening of "no keep without
+   explicit confirmation" in that rare race.
+4. **Broadcast-after-unlock reordering** (pre-existing): `SetExitNode`/`Keep`
+   broadcast outside `mu`, so a frame can briefly arrive out of order vs the poll's
+   under-`mu` broadcast; benign — the hub is latest-wins and clients resync on
+   reconnect.
+
+These are tracked, not blocking: the feature is opt-in and the default path is
+unaffected. Item 1, being pre-existing, would be the candidate for a future
+base-product fix (serialize the whole arm→apply→confirm per router, or order the
+applies by `setSeq`).
