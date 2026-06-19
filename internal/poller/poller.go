@@ -496,39 +496,48 @@ func (p *Poller) SetExitNode(ctx context.Context, routerID, targetStableID strin
 		}
 		updated = *rv
 	})
-	var disarmMarker string // a prior awaiting-keep sleeper this op orphaned (Finding A)
+	// Markers whose router-side revert timer must be DISARMED (its keep-marker
+	// written so the sleeping `tailscale set --exit-node=<prev>` exits) after we
+	// release mu -- each `ApplyExitNode(autoKeep=false)` armed an INDEPENDENT timer,
+	// so any armed-but-not-the-active-gate marker would otherwise fire ~RevertWindow
+	// later and clobber the live selection. Best-effort; KeepExitNode is idempotent
+	// (`: > marker`) and takes the per-addr lock fresh (we hold no lock here).
+	var disarm []string
 	if ok && !superseded {
-		// Record / clear the explicit-Keep gate under the SAME mu as the store (and
-		// the setSeq/setGen guard) so the pending entry, the snapshot, and the
-		// supersede check stay mutually consistent. A superseded op (handled by the
-		// outer guard) records NOTHING -- the newest op owns the router's gate.
-		//
-		// If a CONFIRMED change replaces a prior awaiting-keep entry, that prior set's
-		// router-side revert timer is now orphaned (its marker would never be written),
-		// and would later revert the device away from THIS new selection -- even if it
-		// gets Kept. Capture its marker so we can disarm it (write it) below. (Only on
-		// a confirmed outcome: a failed op leaves the prior gate to its own fate.)
-		if prior, had := p.pendingKeep[addr]; had && setErr == nil && prior.marker != "" && prior.marker != marker {
-			disarmMarker = prior.marker
-		}
-		if setErr == nil && !autoKeep {
+		// This op is the one being published. Record/clear the gate under the SAME mu
+		// as the store + setSeq/setGen guard so they stay mutually consistent.
+		switch {
+		case setErr == nil && !autoKeep:
+			// Confirmed awaiting-keep SET: this op's marker becomes the active gate. If
+			// it REPLACES a prior awaiting-keep entry, that prior timer is now orphaned.
+			if prior, had := p.pendingKeep[addr]; had && prior.marker != "" && prior.marker != marker {
+				disarm = append(disarm, prior.marker)
+			}
 			p.pendingKeep[addr] = keepEntry{marker: marker, revertAt: armAt.Add(p.revertWindow), seq: mySeq}
-		} else {
-			// Auto-keep, a confirmed clear, or any failure: no gate is pending for this
-			// router -- drop any stale entry a prior set left.
+		case setErr == nil:
+			// Confirmed auto-keep or CLEAR: no gate for this op. Disarm + drop any prior
+			// awaiting-keep entry (the device is now on the new selection / Direct).
+			if prior, had := p.pendingKeep[addr]; had && prior.marker != "" {
+				disarm = append(disarm, prior.marker)
+			}
 			delete(p.pendingKeep, addr)
+		default:
+			// FAILURE: leave any PRIOR op's entry untouched -- it's that op's gate; a
+			// later set's disarm or the poll-overlay expiry cleans it. Deleting it here
+			// would orphan its armed timer (untracked). This op's OWN failed-apply timer
+			// correctly reverts to prev (the dead-man's-switch) and carries no marker.
 		}
 		p.store.Store(final)
+	} else if marker != "" {
+		// SUPERSEDED, or the router vanished from the snapshot: this op is NOT being
+		// published, but ApplyExitNode already armed its timer (marker != ""). Disarm
+		// it so it can't fire and revert the device away from whichever op DID win.
+		disarm = append(disarm, marker)
 	}
 	p.mu.Unlock()
-	if disarmMarker != "" {
-		// Disarm the superseded set's orphaned revert by writing its keep-marker, so
-		// its sleeping `tailscale set --exit-node=<old prev>` exits instead of firing
-		// ~RevertWindow later and clobbering the selection we just (re)pointed. The
-		// per-addr lock inside KeepExitNode is taken fresh (this op already released
-		// it), so no nesting; best-effort -- a failure just leaves the orphan as before.
-		if err := p.rc.KeepExitNode(ctx, addr, disarmMarker); err != nil {
-			p.logf("poller: disarm superseded keep %s: %v", addr, err)
+	for _, m := range disarm {
+		if err := p.rc.KeepExitNode(ctx, addr, m); err != nil {
+			p.logf("poller: disarm orphaned keep %s: %v", addr, err)
 		}
 	}
 	if !ok {
@@ -598,9 +607,30 @@ func (p *Poller) Keep(ctx context.Context, routerID string) (store.RouterView, e
 		return store.RouterView{}, &controlError{status: statusConflict, msg: "no exit-node change is awaiting confirmation"}
 	case time.Now().After(entry.revertAt):
 		// The dead-man's-switch has already fired on the router; the in-memory entry is
-		// stale. Drop it and tell the operator the truth.
+		// stale. Drop it AND reconcile the snapshot: a fallback (never re-dialed) router
+		// would otherwise stay stuck in awaiting-keep forever (picker + Keep both dead),
+		// since the poll-overlay's expiry cleanup is gated on the now-deleted entry.
+		// Drop it to "unprobed" (the reverted-to selection is unknown without a dial)
+		// and broadcast, then tell the operator the truth. (A managed router self-heals
+		// on its next dial anyway; the withRouter guard only touches a still-awaiting view.)
 		delete(p.pendingKeep, addr)
+		p.setGen[addr]++
+		reverted, rok := p.withRouter(addr, func(rv *store.RouterView) {
+			if rv.State == store.RouterAwaitingKeep {
+				rv.State = store.RouterUnprobed
+				rv.RevertAt = time.Time{}
+				rv.CurrentExitNode = nil
+				rv.Desired = nil
+				rv.Reachable = false
+			}
+		})
+		if rok {
+			p.store.Store(reverted)
+		}
 		p.mu.Unlock()
+		if rok {
+			p.bc.Broadcast(reverted)
+		}
 		return store.RouterView{}, &controlError{status: statusConflict, msg: "the revert window elapsed; the router has reverted"}
 	case entry.seq != p.setSeq[addr]:
 		// A newer SetExitNode bumped setSeq past this entry; that op owns the router.

@@ -692,6 +692,161 @@ func TestRefresh_FallbackAwaitingKeepExpiresToUnprobed(t *testing.T) {
 	}
 }
 
+// gateKeepRC gates ApplyExitNode per target IP so a test can drive two CONCURRENT
+// sets to a deterministic supersede interleaving; records disarmed markers.
+type gateKeepRC struct {
+	mu       sync.Mutex
+	entered  chan string
+	release  map[string]chan struct{}
+	markerOf map[string]string
+	disarmed []string
+}
+
+func (f *gateKeepRC) Status(ctx context.Context, addr string) (store.RouterRuntime, error) {
+	return store.RouterRuntime{Online: true}, nil
+}
+func (f *gateKeepRC) Probe(ctx context.Context, addr string) (string, error) { return "", nil }
+func (f *gateKeepRC) EgressProbe(ctx context.Context, addr, url string) (bool, string, error) {
+	return true, "", nil
+}
+func (f *gateKeepRC) ApplyExitNode(ctx context.Context, addr string, target, prev *store.ExitNodeRef, autoKeep bool) (store.RouterRuntime, string, error) {
+	ip := ""
+	if target != nil {
+		ip = target.IP
+	}
+	f.entered <- ip
+	<-f.release[ip]
+	m := ""
+	if !autoKeep {
+		m = f.markerOf[ip]
+	}
+	return store.RouterRuntime{Online: true, Current: target}, m, nil
+}
+func (f *gateKeepRC) KeepExitNode(ctx context.Context, addr, marker string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.disarmed = append(f.disarmed, marker)
+	return nil
+}
+
+func TestKeepGate_ConcurrentSupersedeDisarmsLoser(t *testing.T) {
+	// Finding 1 (concurrent subcase): two same-router sets both pass step 1 before
+	// either reconciles. The SUPERSEDED one skips its record block, so its OWN armed
+	// revert (MB) must still be disarmed -- else it orphans and later clobbers the
+	// winner's (possibly Kept) selection.
+	const routerIP, e1, e2 = "100.64.0.10", "100.64.0.20", "100.64.0.21"
+	st := store.New()
+	seedSnapshot2(st, routerIP, e1, e2)
+	rc := &gateKeepRC{
+		entered:  make(chan string),
+		release:  map[string]chan struct{}{e1: make(chan struct{}), e2: make(chan struct{})},
+		markerOf: map[string]string{e1: "MB", e2: "MC"},
+	}
+	p := New(st, &fakeNM{}, rc, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+	p.ConfigureKeep(true)
+
+	bDone, cDone := make(chan struct{}), make(chan struct{})
+	go func() { p.SetExitNode(context.Background(), "router1", "exit1"); close(bDone) }() // setB: mySeq=1
+	if got := <-rc.entered; got != e1 {
+		t.Fatalf("expected setB(exit1) to enter first, got %q", got)
+	}
+	go func() { p.SetExitNode(context.Background(), "router1", "exit2"); close(cDone) }() // setC: mySeq=2 (supersedes B)
+	if got := <-rc.entered; got != e2 {
+		t.Fatalf("expected setC(exit2) second, got %q", got)
+	}
+	// Release B first: it reconciles, finds itself superseded, must disarm its own MB.
+	close(rc.release[e1])
+	<-bDone
+	// Then C: reconciles, records MC as the active gate.
+	close(rc.release[e2])
+	<-cDone
+
+	rc.mu.Lock()
+	d := append([]string(nil), rc.disarmed...)
+	rc.mu.Unlock()
+	foundMB := false
+	for _, m := range d {
+		if m == "MB" {
+			foundMB = true
+		}
+		if m == "MC" {
+			t.Errorf("the active gate MC must NOT be disarmed (got %v)", d)
+		}
+	}
+	if !foundMB {
+		t.Errorf("concurrent supersede must disarm the loser's own marker MB, got %v", d)
+	}
+}
+
+func TestKeep_ElapsedReconcilesFallbackToUnprobed(t *testing.T) {
+	// Finding 2: a Keep that arrives just past the window must not just 409+delete --
+	// it must reconcile the snapshot (a never-dialed fallback router would otherwise
+	// stay stuck awaiting-keep forever, picker+Keep both dead).
+	const piIP, exitIP = "100.64.0.30", "100.64.0.20"
+	st := store.New()
+	st.Store(&store.Snapshot{Routers: []store.RouterView{{
+		Node:            store.NodeView{StableID: "pi", TailscaleIPs: []string{piIP}, Online: true, Type: store.NodeGeneric},
+		CurrentExitNode: &store.ExitNodeRef{StableID: "exit1", IP: exitIP},
+		State:           store.RouterAwaitingKeep,
+		RevertAt:        time.Now().Add(-time.Minute),
+	}}})
+	bc := newFakeBC()
+	p := New(st, &fakeNM{}, &fakeRC{}, nil, nil, bc, make(chan int), time.Second, nopLogf)
+	p.ConfigureKeep(true)
+	p.mu.Lock()
+	p.pendingKeep[piIP] = keepEntry{marker: "M1", revertAt: time.Now().Add(-time.Minute), seq: 0}
+	p.mu.Unlock()
+
+	_, err := p.Keep(context.Background(), "pi")
+	if err == nil {
+		t.Fatal("Keep past the window must 409")
+	}
+	got := findRouterViewByStableID(st.Load(), "pi")
+	if got.State != store.RouterUnprobed || got.CurrentExitNode != nil {
+		t.Errorf("elapsed Keep must reconcile to unprobed+cleared, got state=%q current=%+v", got.State, got.CurrentExitNode)
+	}
+	bc.mu.Lock()
+	broadcasts := len(bc.snaps)
+	bc.mu.Unlock()
+	if broadcasts == 0 {
+		t.Error("elapsed Keep must broadcast the reconciled snapshot")
+	}
+}
+
+func TestSetExitNode_FailedSupersedeLeavesPriorEntry(t *testing.T) {
+	// Finding 3: a FAILED set must NOT delete a prior op's awaiting-keep entry (that
+	// would orphan the prior armed revert untracked). Leave it for a later set's
+	// disarm / the poll-overlay expiry.
+	const routerIP, exitIP = "100.64.0.10", "100.64.0.20"
+	st := store.New()
+	seedSnapshot(st, routerIP, exitIP, true, true)
+	rc := &fakeRC{setRT: store.RouterRuntime{Online: true, Current: &store.ExitNodeRef{StableID: "exit1", IP: exitIP}}, applyMarker: "M1"}
+	p := New(st, &fakeNM{}, rc, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+	p.ConfigureKeep(true)
+
+	if _, err := p.SetExitNode(context.Background(), "router1", "exit1"); err != nil {
+		t.Fatalf("set1: %v", err)
+	}
+	p.mu.Lock()
+	e, ok := p.pendingKeep[routerIP]
+	p.mu.Unlock()
+	if !ok || e.marker != "M1" {
+		t.Fatalf("set1 should have recorded entry M1, got %+v ok=%v", e, ok)
+	}
+	// set2 FAILS (transport error, not a CommandError).
+	rc.setErr = errors.New("boom")
+	rc.applyMarker = ""
+	if _, err := p.SetExitNode(context.Background(), "router1", "exit2"); err == nil {
+		t.Fatal("set2 should fail")
+	}
+	p.mu.Lock()
+	e2, ok2 := p.pendingKeep[routerIP]
+	p.mu.Unlock()
+	if !ok2 || e2.marker != "M1" {
+		t.Errorf("a failed superseding set must LEAVE the prior entry M1, got %+v ok=%v", e2, ok2)
+	}
+}
+
 func TestRefreshGroups_RebuildsAndBroadcastsWithoutDial(t *testing.T) {
 	// Creating/editing a zone calls RefreshGroups: it must re-render Groups from the
 	// live store and broadcast IMMEDIATELY, without re-dialing any router.
