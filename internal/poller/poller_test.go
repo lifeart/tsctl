@@ -331,6 +331,76 @@ func TestRefresh_SlowStatusDoesNotBlockSetExitNodeNorClobberIt(t *testing.T) {
 	}
 }
 
+// orchRC lets a test orchestrate the exact interleaving of a SetExitNode apply and
+// a poll's Status dial via per-call gates.
+type orchRC struct {
+	applyEntered chan struct{}
+	applyGate    chan struct{}
+	dialEntered  chan struct{}
+	dialGate     chan struct{}
+	target       *store.ExitNodeRef
+}
+
+func (f *orchRC) Status(ctx context.Context, addr string) (store.RouterRuntime, error) {
+	f.dialEntered <- struct{}{}
+	<-f.dialGate
+	return store.RouterRuntime{Online: true}, nil // STALE read: device still on Direct
+}
+func (f *orchRC) SetExitNode(ctx context.Context, addr string, target, prev *store.ExitNodeRef) (store.RouterRuntime, error) {
+	f.applyEntered <- struct{}{}
+	<-f.applyGate
+	return store.RouterRuntime{Online: true, Current: f.target}, nil // confirms the target
+}
+func (f *orchRC) Probe(ctx context.Context, addr string) (string, error) { return "", nil }
+
+func TestRefresh_SetConfirmingDuringDialNotClobbered(t *testing.T) {
+	// Regression for the L-3 review's item-1 false-confirm: a SetExitNode whose step 1
+	// lands BEFORE the poll captures its guard generation, but which CONFIRMS (step 3)
+	// during the poll's stale dial, must NOT be clobbered by the poll's stale read.
+	// setSeq alone misses this (unchanged since step 1); setGen (bumped at step 3 too)
+	// catches it.
+	const routerIP, exitIP = "100.64.0.10", "100.64.0.20"
+	st := store.New()
+	seedSnapshot(st, routerIP, exitIP, true, true)
+	rc := &orchRC{
+		applyEntered: make(chan struct{}), applyGate: make(chan struct{}),
+		dialEntered: make(chan struct{}), dialGate: make(chan struct{}),
+		target: &store.ExitNodeRef{StableID: "exit1", IP: exitIP},
+	}
+	nm := &fakeNM{nodes: []store.NodeView{
+		{StableID: "router1", TailscaleIPs: []string{routerIP}, Online: true, Type: store.NodeRouter},
+		{StableID: "exit1", TailscaleIPs: []string{exitIP}, Online: true, ExitNodeOption: true, Type: store.NodeExitNode},
+	}}
+	p := New(st, nm, rc, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+
+	// Set: completes step 1 (seq+gen bump, pending stored) then blocks in apply.
+	setDone := make(chan error, 1)
+	go func() { _, err := p.SetExitNode(context.Background(), "router1", "exit1"); setDone <- err }()
+	<-rc.applyEntered
+
+	// Poll starts AFTER the set's step 1, so it captures the post-step-1 generation;
+	// it blocks mid-dial (its stale read pending).
+	pollDone := make(chan error, 1)
+	go func() { pollDone <- p.Refresh(context.Background()) }()
+	<-rc.dialEntered
+
+	// Let the set CONFIRM (step 3 stores exit1, bumps setGen) BEFORE the poll merges.
+	close(rc.applyGate)
+	if err := <-setDone; err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	// Release the poll's stale dial; it proceeds to its merge.
+	close(rc.dialGate)
+	if err := <-pollDone; err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+
+	rv := findRouterViewByStableID(st.Load(), "router1")
+	if rv == nil || rv.CurrentExitNode == nil || rv.CurrentExitNode.IP != exitIP {
+		t.Errorf("poll clobbered a set that confirmed during its dial (false-confirm): router1 = %+v, want exit %q", rv, exitIP)
+	}
+}
+
 func TestAutoDiscover_ExcludesSelfFromManagedSet(t *testing.T) {
 	// A tsctl node double-tagged tag:router (+ IsSelf) must never be polled as a
 	// router -- the self-exclusion applies to the managed path, not just the fallback.

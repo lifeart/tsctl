@@ -114,13 +114,19 @@ type Poller struct {
 	// lock-free -- mu only guards writers, never the read path.
 	mu sync.Mutex
 
-	// setSeq is a per-router (keyed by addr) monotonic counter of SetExitNode ops,
-	// guarded by mu. The slow apply runs OUTSIDE mu, so two concurrent sets on the
-	// same router can finish out of order; a later set bumps the counter, and the
-	// earlier op's reconcile checks it and SKIPS publishing its now-stale captured
-	// result -- so the snapshot never shows a confirmed exit node that contradicts
-	// the device. The newest op owns the published state.
+	// setSeq is a per-router (keyed by addr) monotonic counter bumped at SetExitNode
+	// STEP 1 only. mySeq is captured at step 1 and re-checked at step 3 to SUPERSEDE
+	// an older op's reconcile when a newer set has started (so the snapshot never
+	// shows a confirmed exit node that contradicts the device). All under mu.
 	setSeq map[string]uint64
+	// setGen is bumped at BOTH SetExitNode step 1 AND step 3 -- i.e. on any set
+	// activity (pending store and reconcile). refreshOnce captures it before its
+	// slow dials and keeps the published view (not its own stale dial read) for any
+	// router whose setGen changed during the dial window. setSeq alone is
+	// insufficient: a set that STARTED before the capture but CONFIRMS during the
+	// dial leaves setSeq unchanged, so without the step-3 bump the poll would clobber
+	// the confirmed set with a stale read (a false-confirm). Guarded by mu.
+	setGen map[string]uint64
 }
 
 // New constructs a Poller. transitions is the SSE hub's Transitions() channel
@@ -146,6 +152,7 @@ func New(st *store.Store, nm Netmapper, rc RouterClient, groups GroupReader, rou
 		linger:      defaultLinger,
 		logf:        logf,
 		setSeq:      make(map[string]uint64),
+		setGen:      make(map[string]uint64),
 	}
 }
 
@@ -260,6 +267,7 @@ func (p *Poller) SetExitNode(ctx context.Context, routerID, targetStableID strin
 	// which would make this a silent no-op that stores a blank RouterView.
 	p.mu.Lock()
 	p.setSeq[addr]++
+	p.setGen[addr]++        // step-1 set activity (poll-guard generation)
 	mySeq := p.setSeq[addr] // this op's sequence; a later set bumps it past mine
 	pending, ok := p.withRouter(addr, func(rv *store.RouterView) {
 		rv.Desired = target
@@ -305,6 +313,9 @@ func (p *Poller) SetExitNode(ctx context.Context, routerID, targetStableID strin
 
 	var updated store.RouterView
 	p.mu.Lock()
+	p.setGen[addr]++ // step-3 set activity: lets a concurrent poll detect a set that
+	// CONFIRMED during its dial window (setSeq is unchanged since step 1, so the
+	// poll's setGen guard -- not setSeq -- is what catches this).
 	// If a newer SetExitNode on this router started while our slow apply ran, our
 	// captured result is stale -- do NOT publish it (it could show a confirmed exit
 	// node the device is no longer on). The newest op owns the published snapshot.
@@ -459,13 +470,15 @@ func (p *Poller) Refresh(ctx context.Context) error {
 // up to the timeout) from blocking SetExitNode / RefreshGroups, which need mu only
 // briefly (L-3).
 //
-// Atomicity vs a concurrent SetExitNode (M3): we snapshot each router's setSeq
-// BEFORE the dials; at the locked merge, if a router's setSeq changed, a
-// SetExitNode ran for it during our now-stale dial, so we KEEP the currently
-// published view for that router instead of clobbering it with our stale read
-// (the same per-router sequence that guards the SetExitNode reconcile). Inventory
-// failure -> NetmapErr + keep last-good nodes; a per-router dial failure -> that
-// RouterView unreachable (never aborts the whole snapshot).
+// Atomicity vs a concurrent SetExitNode (M3): we snapshot each router's setGen
+// BEFORE the dials; at the locked merge, if a router's setGen changed, a
+// SetExitNode touched it during our now-stale dial (started OR confirmed), so we
+// KEEP the currently published view for that router instead of clobbering it with
+// our stale read. setGen (bumped at SetExitNode step 1 AND step 3) is used rather
+// than setSeq (step 1 only) precisely so a set that started before our capture but
+// confirmed during the dial is still caught -- otherwise the poll would publish a
+// false-confirm. Inventory failure -> NetmapErr + keep last-good nodes; a
+// per-router dial failure -> that RouterView unreachable (never aborts the snapshot).
 func (p *Poller) refreshOnce(ctx context.Context) error {
 	now := time.Now()
 	prev := p.store.Load()
@@ -501,12 +514,14 @@ func (p *Poller) refreshOnce(ctx context.Context) error {
 		}
 	}
 
-	// Snapshot each router's setSeq BEFORE the slow dials, so the merge can detect a
-	// SetExitNode that intervened during them.
-	seqAt := make(map[string]uint64, len(addrs))
+	// Snapshot each router's setGen BEFORE the slow dials, so the merge can detect a
+	// SetExitNode that touched it during them -- including one that STARTED before
+	// this capture but CONFIRMS during the dial (setGen bumps at both step 1 and
+	// step 3; setSeq alone would miss that and let the poll clobber the confirmed set).
+	genAt := make(map[string]uint64, len(addrs))
 	p.mu.Lock()
 	for _, addr := range addrs {
-		seqAt[addr] = p.setSeq[addr]
+		genAt[addr] = p.setGen[addr]
 	}
 	p.mu.Unlock()
 
@@ -526,10 +541,10 @@ func (p *Poller) refreshOnce(ctx context.Context) error {
 	defer p.mu.Unlock()
 	cur := p.store.Load()
 	for i, addr := range addrs {
-		if p.setSeq[addr] != seqAt[addr] {
-			// A SetExitNode ran for this router while we were dialing: its reconcile
-			// owns the published state. Keep the current view; don't clobber it with
-			// our stale read.
+		if p.setGen[addr] != genAt[addr] {
+			// A SetExitNode touched this router while we were dialing (started OR
+			// confirmed during the window): its reconcile owns the published state.
+			// Keep the current view; don't clobber it with our possibly-stale read.
 			if curRV := findRouterView(cur, addr); curRV != nil {
 				routers[i] = *curRV
 			}
