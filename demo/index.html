@@ -151,6 +151,8 @@
         <div class="zone-bar">
           <div id="zone-tabs" class="zone-tabs" role="tablist" aria-label="Zones"></div>
           <div class="zone-actions">
+            <button id="zone-probe-all" class="text-btn hidden" type="button" hidden
+              title="SSH each online device in this zone to resolve its current exit node">Test SSH all</button>
             <button id="zone-new" class="text-btn" type="button">New zone</button>
             <button id="zone-edit" class="text-btn hidden" type="button" hidden>Edit</button>
             <button id="zone-delete" class="text-btn zone-delete hidden" type="button" hidden>Delete</button>
@@ -179,15 +181,9 @@
       </section>
 
       <section class="section" id="routers-section" hidden>
-        <h2 class="section-title">Routers</h2>
-        <div id="routers" class="router-list"></div>
-        <p id="routers-empty" class="empty hidden"></p>
-      </section>
-
-      <section class="section" id="nodes-section" hidden>
         <div class="section-head">
-          <h2 class="section-title">Devices</h2>
-          <span id="nodes-count" class="section-count" aria-live="off"></span>
+          <h2 class="section-title">Routers</h2>
+          <span id="routers-count" class="section-count" aria-live="off"></span>
         </div>
         <div id="nodes-tools" class="tools hidden">
           <div class="search-wrap">
@@ -199,13 +195,22 @@
               id="node-search"
               class="search-input"
               type="search"
-              placeholder="Filter devices…"
+              placeholder="Filter devices by name, host, IP…"
               aria-label="Filter devices by name, host, IP, or type"
               autocomplete="off"
               spellcheck="false"
             />
           </div>
           <div id="filter-chips" class="chips" role="group" aria-label="Filter devices by type"></div>
+        </div>
+        <div id="routers" class="router-list"></div>
+        <p id="routers-empty" class="empty hidden"></p>
+      </section>
+
+      <section class="section" id="nodes-section" hidden>
+        <div class="section-head">
+          <h2 class="section-title">Devices</h2>
+          <span id="nodes-count" class="section-count" aria-live="off"></span>
         </div>
         <div id="nodes" class="list-group"></div>
         <p id="nodes-empty" class="empty hidden"></p>

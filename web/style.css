@@ -376,6 +376,7 @@ body {
   padding: 0.75rem 1rem;
 }
 .node.is-filtered { display: none; }
+.router.is-filtered { display: none; }
 .list-group > .node:not(.is-filtered) ~ .node:not(.is-filtered)::before {
   content: "";
   position: absolute;
@@ -1033,7 +1034,7 @@ body {
   position: relative;
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 2.5rem;
+  gap: 4rem; /* the wires live in this gap -- give them room so curves aren't cramped */
   align-items: start;
 }
 .graph-grid[hidden] { display: none; }

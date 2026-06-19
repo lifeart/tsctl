@@ -857,7 +857,8 @@
   function runProbe(sid) {
     // apiWrite mirrors the exit-node POST path exactly: CSRF header, 401 →
     // promptLogin (resolves undefined), 403 → refresh token + retry once. No body.
-    apiWrite("POST", "/api/routers/" + encodeURIComponent(sid) + "/probe", null)
+    // Returns the promise so a bulk "Test SSH all" can sequence + cap concurrency.
+    return apiWrite("POST", "/api/routers/" + encodeURIComponent(sid) + "/probe", null)
       .then(function (res) {
         if (!res) { delete state.probes[sid]; return; } // 401 → login overlay took over
         if (res.status === 404) {
@@ -1557,8 +1558,15 @@
     };
   }
   function wirePath(a, b) {
-    var dx = Math.max(36, Math.abs(b.x - a.x) / 2);
-    return "M " + a.x + " " + a.y + " C " + (a.x + dx) + " " + a.y + ", " + (b.x - dx) + " " + b.y + ", " + b.x + " " + b.y;
+    // Horizontal-tangent cubic. The control-point horizontal offset MUST stay <=
+    // half the column gap, otherwise the two control points cross in x (control 1
+    // ends up right of control 2) and the curve doubles back into an ugly hook --
+    // which happened with the old `max(36, gap/2)` floor on a narrow (~40px) gap.
+    // Cap at the half-gap (clean S even when columns are tight) and at 80px so a wide
+    // gap doesn't balloon. Round to whole pixels for crisp strokes.
+    var dx = Math.min(Math.abs(b.x - a.x) / 2, 80);
+    var ax = Math.round(a.x), ay = Math.round(a.y), bx = Math.round(b.x), by = Math.round(b.y);
+    return "M " + ax + " " + ay + " C " + Math.round(ax + dx) + " " + ay + ", " + Math.round(bx - dx) + " " + by + ", " + bx + " " + by;
   }
   function drawWiresForCurrent() {
     if (state.view !== "graph" || !state.gotSseFrame) return;
@@ -1813,6 +1821,68 @@
     var editBtn = $("#zone-edit"), delBtn = $("#zone-delete");
     if (editBtn) { show(editBtn, isGroup); editBtn.hidden = !isGroup; }
     if (delBtn) { show(delBtn, isGroup); delBtn.hidden = !isGroup; }
+
+    // "Test SSH all": probe every ONLINE consumer in this zone (manual, never
+    // automatic). Shown only when there's at least one online consumer to probe.
+    var btn = $("#zone-probe-all");
+    if (btn) {
+      var n = probeableConsumers(zone).length;
+      var running = !!(state.probeAll && state.probeAll.running);
+      var has = n > 0 || running;
+      show(btn, has); btn.hidden = !has;
+      btn.disabled = running || n === 0;
+      if (running) setText(btn, "Probing " + state.probeAll.done + "/" + state.probeAll.total + "…");
+      else setText(btn, "Test SSH all" + (n ? " (" + n + ")" : ""));
+    }
+  }
+
+  // The online, controllable, not-already-probing consumers of a zone -- the set a
+  // bulk "Test SSH all" would contact. Offline/never-reachable devices are skipped
+  // (they'd only time out).
+  function probeableConsumers(zone) {
+    var cols = columnsFor(zone);
+    return (cols.consumers || []).filter(function (c) {
+      var node = c.rv && c.rv.node;
+      if (!node || node.online !== true) return false;
+      var p = state.probes[c.sid];
+      return !(p && p.busy);
+    });
+  }
+
+  // Manual bulk probe of a zone's online consumers, concurrency-capped so it never
+  // becomes an SSH storm. Each device's result lands on its own card (state.probes).
+  function probeZone(zone) {
+    if (state.probeAll && state.probeAll.running) return;
+    var queue = probeableConsumers(zone).map(function (c) { return c.sid; });
+    if (!queue.length) return;
+    var go = function () {
+      queue.forEach(function (sid) { state.probes[sid] = { busy: true }; });
+      state.probeAll = { total: queue.length, done: 0, running: true };
+      render();
+      var CONC = 3, i = 0;
+      function next() {
+        if (i >= queue.length) return Promise.resolve();
+        var sid = queue[i++];
+        return runProbe(sid).then(function () {
+          if (state.probeAll) state.probeAll.done++;
+          render();
+          return next();
+        });
+      }
+      var workers = [];
+      for (var w = 0; w < Math.min(CONC, queue.length); w++) workers.push(next());
+      Promise.all(workers).then(function () {
+        if (state.probeAll) state.probeAll.running = false;
+        render();
+      });
+    };
+    // A curated zone is small; the catch-all "Ungrouped" can be large -- confirm
+    // before SSHing a big batch (honors the "probing is manual, deliberate" rule).
+    if (queue.length > 12) {
+      var body = el("div");
+      body.appendChild(document.createTextNode("Test SSH to " + queue.length + " online devices in this zone? tsctl will connect to each to resolve its current exit node."));
+      openModal({ title: "Test SSH all?", body: body, confirmLabel: "Test SSH all", confirmBusyLabel: "Starting…", cancelLabel: "Cancel", onConfirm: function () { go(); } });
+    } else { go(); }
   }
 
   // --- zone CRUD ----------------------------------------------------------
@@ -2091,6 +2161,7 @@
       z.addEventListener("keydown", function (e) { segKey(e, d); });
       d.addEventListener("keydown", function (e) { segKey(e, z); });
     }
+    var pa = $("#zone-probe-all"); if (pa) pa.addEventListener("click", function () { var zn = resolveSelectedZone(); if (zn) probeZone(zn); });
     var nb = $("#zone-new"); if (nb) nb.addEventListener("click", function () { openEditor(null); });
     var eb = $("#zone-edit"); if (eb) eb.addEventListener("click", function () { var zn = resolveSelectedZone(); if (zn && zn.group) openEditor(zn.group); });
     var db = $("#zone-delete"); if (db) db.addEventListener("click", function () { var zn = resolveSelectedZone(); if (zn && zn.group) confirmDeleteZone(zn.group); });
@@ -2192,8 +2263,22 @@
     }
     var snap = state.snapshot;
     var routers = snap && Array.isArray(snap.routers) ? snap.routers : [];
+    var visible = 0;
     reconcile($("#routers"), routers, routerKey, createRouterCard,
-      function (rec, rv) { updateRouterCard(rec, rv, snap); }, routerEls, false);
+      function (rec, rv) {
+        updateRouterCard(rec, rv, snap);
+        // Text filter (the type chips are for the all-devices list, not the router
+        // cards). Match name/host/IP AND the current/desired exit node, so you can
+        // filter by where a device is routing too.
+        var ok = routerTextMatch(rv);
+        rec.root.classList.toggle("is-filtered", !ok);
+        if (ok) visible++;
+      }, routerEls, false);
+    // Show the filter once there are enough router cards to be worth scanning.
+    if (routers.length > SEARCH_THRESHOLD) show($("#nodes-tools"), true);
+    var anyText = state.filter.text.trim() !== "";
+    setText($("#routers-count"), routers.length === 0 ? ""
+      : (anyText ? visible + " of " + routers.length : routers.length + (routers.length === 1 ? " router" : " routers")));
     // Prune transient DISPLAY state for routers no longer in the snapshot, so a
     // reused stableID never renders a stale probe result / error / countdown
     // against a fresh card. (busyRouters/busyTarget are NOT pruned here: they are
@@ -2219,6 +2304,9 @@
       emptyEl.textContent = "";
       emptyEl.appendChild(msg);
       show(emptyEl, true);
+    } else if (visible === 0) {
+      setText(emptyEl, "No routers match “" + state.filter.text.trim() + "”.");
+      show(emptyEl, true);
     } else { show(emptyEl, false); }
   }
   function routerKey(rv) { return (rv.node && rv.node.stableID) || JSON.stringify(rv.node || {}); }
@@ -2233,6 +2321,19 @@
     if (!q) return true;
     var hay = [n.name, n.hostname, n.os, n.type].concat(n.tailscaleIPs || []).join(" ").toLowerCase();
     return hay.indexOf(q) !== -1;
+  }
+
+  // Text-only match for the router cards (the type chips are for the all-devices
+  // list). Includes the current/desired exit node so you can filter by routing too.
+  function routerTextMatch(rv) {
+    var q = state.filter.text.trim().toLowerCase();
+    if (!q) return true;
+    var n = rv.node || {};
+    var cur = rv.currentExitNode, des = rv.desired;
+    var hay = [n.name, n.hostname, n.os].concat(n.tailscaleIPs || []);
+    if (cur) hay = hay.concat([cur.name, cur.ip]);
+    if (des) hay = hay.concat([des.name, des.ip]);
+    return hay.join(" ").toLowerCase().indexOf(q) !== -1;
   }
 
   function renderNodes() {
@@ -2254,7 +2355,9 @@
     });
 
     var anyFilter = state.filter.type !== "all" || state.filter.text.trim() !== "";
-    show($("#nodes-tools"), total > SEARCH_THRESHOLD);
+    // The filter is shared with the router cards above; only ever SHOW it here (never
+    // hide — renderRouters may have shown it for a large router list).
+    if (total > SEARCH_THRESHOLD) show($("#nodes-tools"), true);
     setText($("#nodes-count"), total === 0 ? "" : (anyFilter ? visible + " of " + total : total + (total === 1 ? " device" : " devices")));
 
     var emptyEl = $("#nodes-empty");
@@ -2645,7 +2748,8 @@
     }
     var search = $("#node-search");
     if (search) {
-      search.addEventListener("input", function () { state.filter.text = search.value || ""; renderNodes(); });
+      // One filter drives BOTH the router cards (primary) and the all-devices list.
+      search.addEventListener("input", function () { state.filter.text = search.value || ""; renderRouters(); renderNodes(); });
     }
     // Login overlay: submit the password (CSRF-protected) on form submit.
     var loginForm = $("#login-form");
