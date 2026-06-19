@@ -30,6 +30,7 @@
   // ----------------------------------------------------------- timings -----
   var APPLY_MS = 1200;     // scripted SetExitNode latency (UI shows "Applying…")
   var PREFLIGHT_MS = 140;  // a pre-flight rejection resolves quickly
+  var GROUP_MS = 450;      // zone create/save/delete latency (UI shows "Saving…"/"Deleting…")
   var PROBE_MIN_MS = 600;  // artificial SSH-probe latency floor (UI shows "Probing…")
   var PROBE_VAR_MS = 300;  // + up to this much jitter (~600-900ms total)
   var OPEN_MS = 120;       // EventSource "connect" delay (well under the 8s watchdog)
@@ -610,9 +611,11 @@
       var nc = normalizeGroup(body, "");
       if (!nc.ok) return Promise.resolve(json(nc.status, nc.body));
       var created = { id: newGroupID(), name: nc.group.name, consumers: nc.group.consumers, allowedExitNodes: nc.group.allowedExitNodes };
-      groups.push(created);
-      broadcast(buildSnapshot());
-      return Promise.resolve(json(201, rawGroupDTO(created)));
+      return delay(GROUP_MS, null).then(function () {
+        groups.push(created);
+        broadcast(buildSnapshot());
+        return json(201, rawGroupDTO(created));
+      });
     }
     var gm = path.match(/^\/api\/groups\/([^/]+)$/);
     if (gm) {
@@ -622,15 +625,19 @@
         if (idx === -1) return Promise.resolve(json(404, errBody("group not found", "no group with id " + gid, "")));
         var nu = normalizeGroup(body, gid);
         if (!nu.ok) return Promise.resolve(json(nu.status, nu.body));
-        groups[idx] = { id: gid, name: nu.group.name, consumers: nu.group.consumers, allowedExitNodes: nu.group.allowedExitNodes };
-        broadcast(buildSnapshot());
-        return Promise.resolve(json(200, rawGroupDTO(groups[idx])));
+        return delay(GROUP_MS, null).then(function () {
+          groups[idx] = { id: gid, name: nu.group.name, consumers: nu.group.consumers, allowedExitNodes: nu.group.allowedExitNodes };
+          broadcast(buildSnapshot());
+          return json(200, rawGroupDTO(groups[idx]));
+        });
       }
       if (method === "DELETE") {
         if (idx === -1) return Promise.resolve(json(404, errBody("group not found", "no group with id " + gid, "")));
-        groups.splice(idx, 1);
-        broadcast(buildSnapshot());
-        return Promise.resolve(noContent());
+        return delay(GROUP_MS, null).then(function () {
+          groups.splice(idx, 1);
+          broadcast(buildSnapshot());
+          return noContent();
+        });
       }
     }
 

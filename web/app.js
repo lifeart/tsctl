@@ -311,11 +311,25 @@
       if (prevFocus && prevFocus.focus) { try { prevFocus.focus(); } catch (e) { /* element gone */ } }
       if (cb) cb();
     }
-    cancelBtn.addEventListener("click", function () { finish(opts.onCancel); });
-    confirmBtn.addEventListener("click", function () { finish(opts.onConfirm); });
-    backdrop.addEventListener("mousedown", function (e) { if (e.target === backdrop) finish(opts.onCancel); });
+    var modalBusy = false;
+    function dismiss() { if (!modalBusy) finish(opts.onCancel); }
+    cancelBtn.addEventListener("click", dismiss);
+    confirmBtn.addEventListener("click", function () {
+      if (modalBusy) return;
+      if (!opts.confirmBusyLabel) { finish(opts.onConfirm); return; }
+      // Busy-confirm: keep the dialog open showing progress until onConfirm settles,
+      // so a slow action isn't a frozen/closed modal with no feedback. Cancel/Esc/
+      // backdrop are inert while busy.
+      modalBusy = true;
+      confirmBtn.disabled = true;
+      cancelBtn.disabled = true;
+      setText(confirmBtn, opts.confirmBusyLabel);
+      Promise.resolve().then(function () { return opts.onConfirm && opts.onConfirm(); })
+        .then(function () { finish(); }, function () { finish(); });
+    });
+    backdrop.addEventListener("mousedown", function (e) { if (e.target === backdrop) dismiss(); });
     dialog.addEventListener("keydown", function (e) {
-      if (e.key === "Escape") { e.preventDefault(); finish(opts.onCancel); return; }
+      if (e.key === "Escape") { e.preventDefault(); dismiss(); return; }
       if (e.key === "Tab") {
         var f = dialog.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])');
         if (!f.length) return;
@@ -1652,13 +1666,16 @@
       title: "Delete zone?",
       body: body,
       confirmLabel: "Delete zone",
+      confirmBusyLabel: "Deleting…",
       cancelLabel: "Cancel",
-      onConfirm: function () { deleteZone(group.id); },
+      onConfirm: function () { return deleteZone(group.id); },
     });
   }
 
+  // Returns the request promise so the confirm modal can show a busy state until
+  // it settles (it never rejects -- errors are toasted and swallowed into resolve).
   function deleteZone(id) {
-    apiWrite("DELETE", "/api/groups/" + encodeURIComponent(id), null)
+    return apiWrite("DELETE", "/api/groups/" + encodeURIComponent(id), null)
       .then(function (res) {
         if (!res) return; // login overlay took over
         if (res.ok || res.status === 204) {
@@ -1801,7 +1818,11 @@
     }
     function done() { closeEditor(); focusBack(prevFocus); }
     function showErr(msg) { setText(errEl, msg || ""); show(errEl, !!msg); }
-    function setBusy(b) { saveBtn.disabled = b; cancelBtn.disabled = b; if (delBtn) delBtn.disabled = b; }
+    function setBusy(b) {
+      saveBtn.disabled = b; cancelBtn.disabled = b; if (delBtn) delBtn.disabled = b;
+      // Show the in-flight state on the button, not just a disabled control.
+      setText(saveBtn, b ? (isNew ? "Creating…" : "Saving…") : (isNew ? "Create zone" : "Save"));
+    }
 
     cancelBtn.addEventListener("click", done);
     backdrop.addEventListener("mousedown", function (e) { if (e.target === backdrop) done(); });
