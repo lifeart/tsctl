@@ -817,10 +817,14 @@ func TestSetExitNode_FailedSupersedeLeavesPriorEntry(t *testing.T) {
 	// Finding 3: a FAILED set must NOT delete a prior op's awaiting-keep entry (that
 	// would orphan the prior armed revert untracked). Leave it for a later set's
 	// disarm / the poll-overlay expiry.
-	const routerIP, exitIP = "100.64.0.10", "100.64.0.20"
+	// NOTE: seed BOTH exit nodes -- set2 targets exit2, which must exist in the
+	// inventory so it passes preflight and actually reaches ApplyExitNode (where it
+	// fails). Seeding only exit1 makes set2 fail at preflight (unknown exit node),
+	// never exercising the failure branch F3 changed (the test would be vacuous).
+	const routerIP, exit1IP, exit2IP = "100.64.0.10", "100.64.0.20", "100.64.0.21"
 	st := store.New()
-	seedSnapshot(st, routerIP, exitIP, true, true)
-	rc := &fakeRC{setRT: store.RouterRuntime{Online: true, Current: &store.ExitNodeRef{StableID: "exit1", IP: exitIP}}, applyMarker: "M1"}
+	seedSnapshot2(st, routerIP, exit1IP, exit2IP)
+	rc := &fakeRC{setRT: store.RouterRuntime{Online: true, Current: &store.ExitNodeRef{StableID: "exit1", IP: exit1IP}}, applyMarker: "M1"}
 	p := New(st, &fakeNM{}, rc, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
 	p.ConfigureKeep(true)
 
@@ -833,7 +837,9 @@ func TestSetExitNode_FailedSupersedeLeavesPriorEntry(t *testing.T) {
 	if !ok || e.marker != "M1" {
 		t.Fatalf("set1 should have recorded entry M1, got %+v ok=%v", e, ok)
 	}
-	// set2 FAILS (transport error, not a CommandError).
+	// set2 FAILS as a transport error (Online:false so it's the unreachable path, not
+	// the applied-but-unconfirmed non-error path; not a CommandError).
+	rc.setRT = store.RouterRuntime{Online: false}
 	rc.setErr = errors.New("boom")
 	rc.applyMarker = ""
 	if _, err := p.SetExitNode(context.Background(), "router1", "exit2"); err == nil {
