@@ -960,6 +960,14 @@ body {
   border-radius: 8px;
 }
 .exit-select:focus-visible { outline-offset: 1px; }
+/* Pill-shaped controls keep their rounded outline on focus — the generic 8px
+   radius above would otherwise square off their corners while focused. */
+.chip:focus-visible,
+.seg:focus-visible,
+.zone-tab:focus-visible,
+.text-btn:focus-visible,
+.icon-btn:focus-visible,
+.probe-btn:focus-visible { border-radius: var(--radius-pill); }
 
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
@@ -1095,7 +1103,7 @@ body {
 .gnode.is-control-error .gnode-name { color: var(--text); }
 /* Unprobed (fallback-listed, not yet contacted): dashed edge = "unknown, not a
    failure". The device is interactive (set on demand) so the name stays readable. */
-.gnode.is-unprobed { border: 1px dashed var(--border); }
+.gnode.is-unprobed { border: 1px dashed var(--separator); }
 .gnode.is-unprobed .gnode-name { color: var(--text); }
 .gnode.is-drop-hover { outline: 2px solid var(--accent); outline-offset: 2px; background: var(--accent-tint); }
 .gnode-head { display: flex; align-items: center; gap: 0.45rem; min-width: 0; }

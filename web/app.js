@@ -18,13 +18,18 @@
   var POLL_FALLBACK_MS = 5000; // GET /api/nodes cadence while SSE is unavailable
   var SEARCH_THRESHOLD = 6;   // show the device filter when more than this many
 
+  // Quick-filter chips. These filter the PRIMARY router/device cards by STATUS
+  // (the dimension that actually matters for triage). "Needs attention" folds the
+  // unprobed | unconfirmed | control-error | awaiting-keep | (online-)unreachable
+  // states; "Offline" is a device the netmap reports down. The same scheme is
+  // applied to the secondary all-devices list so chips filter whatever's on screen.
   var CHIPS = [
     { id: "all", label: "All" },
     { id: "online", label: "Online" },
-    { id: "router", label: "Routers" },
-    { id: "exit", label: "Exit nodes" },
-    { id: "generic", label: "Other" },
+    { id: "attention", label: "Needs attention" },
+    { id: "offline", label: "Offline" },
   ];
+  var CHIP_IDS = { all: true, online: true, attention: true, offline: true };
 
   // ---------------------------------------------------------------- state ---
   var state = {
@@ -41,6 +46,7 @@
     loginError: "",     // last login failure message (e.g. "Incorrect password.")
     loginDisabled: false, // server has no UI password (login returns 404) — tailnet-only
     sessionActive: false, // signed in via password → show the "Sign out" affordance
+    logoutBusy: false, // guard against a double-click firing two /api/logout POSTs
     busyRouters: {},   // stableID -> true while a POST is in flight
     busyTarget: {},    // stableID -> the value picked while busy
     keepBusy: {},      // stableID -> true while a POST /keep (Keep button) is in flight
@@ -55,7 +61,7 @@
     openWatchdog: null,
     pollFallback: false,
     pollTimer: null,
-    filter: { text: "", type: "all" },
+    filter: { text: "", status: "all" }, // status chip: all|online|attention|offline
     view: "graph",        // "graph" (zone graph, default) | "cards" (router/device list)
     selectedZone: null,   // selected zone id, or UNGROUPED, or null (= default)
     pendingZoneId: null,  // a just-created zone id awaiting its first snapshot (don't reset)
@@ -1474,8 +1480,16 @@
     }
 
     var zones = zoneList();
-    renderZoneTabs(zones);
+    // Resolve (and heal a stale/unknown/deep-linked id) BEFORE painting the tabs, so
+    // the tablist always has exactly one selected, keyboard-focusable tab. Painting
+    // first (S2) left every tab aria-selected="false" + tabindex="-1" for a frame
+    // when state.selectedZone didn't match any zone.
     var zone = resolveSelectedZone();
+    renderZoneTabs(zones);
+    // Keep the URL in step with the ACTUALLY-shown zone. resolveSelectedZone may
+    // have healed a stale/unknown id from the hash back to the default; mirror that
+    // (replaceState, so it never adds history). No-op when already in sync.
+    writeHash(false);
     renderZoneActions(zone);
 
     show($("#graph-empty"), false);
@@ -1795,6 +1809,7 @@
     if (state.selectedZone === id) return;
     state.selectedZone = id;
     closeZoneMenu();
+    writeHash(false); // a refinement within Zones -> reflect it without flooding history
     render();
   }
 
@@ -2139,7 +2154,8 @@
     if (state.view === view) return;
     state.view = view;
     closeZoneMenu();
-    render();
+    writeHash(true);  // a real navigation -> back returns to the previous view
+    render();         // renderGraph then replaceState-normalizes to the shown zone
   }
   function renderViewToggle() {
     var z = $("#tab-zones"), d = $("#tab-devices");
@@ -2173,6 +2189,88 @@
       rafPending = true;
       window.requestAnimationFrame(function () { rafPending = false; drawWiresForCurrent(); });
     });
+  }
+
+  // ----------------------------------------------------- URL deep-linking ---
+  // State lives in the hash so it works on GitHub Pages with no server routing:
+  //   #/zones                  Zones view, default zone
+  //   #/zones/<zoneId>         Zones view, a specific zone ("ungrouped" sentinel)
+  //   #/devices                Devices view
+  //   #/devices?filter=<chip>  Devices view with a status chip preselected
+  // Never put sensitive data here (no tokens, no free-text query) — just view +
+  // zone + chip. Unknown/stale zone ids degrade to the default (resolveSelectedZone
+  // heals them); unknown chips degrade to "all".
+  function computeHash() {
+    if (state.view === "cards") {
+      var f = state.filter.status;
+      return "#/devices" + (f && f !== "all" ? "?filter=" + encodeURIComponent(f) : "");
+    }
+    var z = state.selectedZone;
+    if (z == null) return "#/zones";
+    return "#/zones/" + (z === UNGROUPED ? "ungrouped" : encodeURIComponent(z));
+  }
+  function parseHash(raw) {
+    var h = String(raw || "").replace(/^#/, "");
+    var query = "", qi = h.indexOf("?");
+    if (qi >= 0) { query = h.slice(qi + 1); h = h.slice(0, qi); }
+    var parts = h.split("/").filter(Boolean);
+    var out = { view: null, zoneToken: null, filter: null };
+    if (parts[0] === "zones") {
+      out.view = "graph";
+      if (parts.length > 1) {
+        try { out.zoneToken = decodeURIComponent(parts.slice(1).join("/")); }
+        catch (e) { out.zoneToken = parts.slice(1).join("/"); } // malformed escape -> raw
+      }
+    } else if (parts[0] === "devices") {
+      out.view = "cards";
+      query.split("&").forEach(function (kv) {
+        if (!kv) return;
+        var eq = kv.indexOf("="), k = eq >= 0 ? kv.slice(0, eq) : kv, v = eq >= 0 ? kv.slice(eq + 1) : "";
+        if (k === "filter") { try { out.filter = decodeURIComponent(v); } catch (e) { out.filter = v; } }
+      });
+    }
+    return out;
+  }
+  // Apply the current location.hash to state. Returns true if it named a view we
+  // recognise (so callers know whether to re-render); false leaves state untouched.
+  function applyHashToState() {
+    var p = parseHash(location.hash);
+    if (!p.view) return false;
+    state.view = p.view;
+    if (p.view === "graph") {
+      // null => default selection (resolveSelectedZone picks); a token => that zone.
+      state.selectedZone = p.zoneToken == null ? null
+        : (p.zoneToken === "ungrouped" ? UNGROUPED : p.zoneToken);
+    } else {
+      state.filter.status = (p.filter && CHIP_IDS[p.filter]) ? p.filter : "all";
+      syncChipsPressed();
+    }
+    return true;
+  }
+  // Write the desired hash. push=true adds a history entry (real navigation, e.g.
+  // a view switch); otherwise replaceState refines the current one. Skips a no-op.
+  function writeHash(push) {
+    var target = computeHash();
+    if ((location.hash || "") === target) return;
+    try {
+      if (push) history.pushState(null, "", target);
+      else history.replaceState(null, "", target);
+    } catch (e) {
+      // Sandboxed/file:// contexts can reject the History API. Fall back to the
+      // hash directly so the URL still reflects state (fires hashchange -> route,
+      // which is idempotent). Not silent: the URL change IS the feedback.
+      location.hash = target;
+    }
+  }
+  // Back/forward + manual hash edits: re-derive state from the URL and repaint.
+  function onHashNav() { if (applyHashToState()) render(); }
+  function initRouting() {
+    applyHashToState();                 // restore view/zone/chip from the URL
+    writeHash(false);                   // canonicalise (e.g. bare load -> #/zones)
+    // hashchange alone covers history nav for hash-based routing; binding popstate
+    // too made Back/Forward fire onHashNav twice (a redundant re-render). Our own
+    // pushState/replaceState don't fire hashchange, so we never miss an update.
+    window.addEventListener("hashchange", onHashNav);
   }
 
   // --------------------------------------------------------------- render ---
@@ -2267,33 +2365,20 @@
     reconcile($("#routers"), routers, routerKey, createRouterCard,
       function (rec, rv) {
         updateRouterCard(rec, rv, snap);
-        // Text filter (the type chips are for the all-devices list, not the router
-        // cards). Match name/host/IP AND the current/desired exit node, so you can
-        // filter by where a device is routing too.
-        var ok = routerTextMatch(rv);
+        // Status chip + text query together (routerMatch). Text matches name/host/
+        // IP AND the current/desired exit node, so you can filter by where a device
+        // is routing too; the chip narrows by online / needs-attention / offline.
+        var ok = routerMatch(rv);
         rec.root.classList.toggle("is-filtered", !ok);
         if (ok) visible++;
       }, routerEls, false);
     // Show the filter once there are enough router cards to be worth scanning.
     if (routers.length > SEARCH_THRESHOLD) show($("#nodes-tools"), true);
-    var anyText = state.filter.text.trim() !== "";
+    var anyFilter = state.filter.status !== "all" || state.filter.text.trim() !== "";
     setText($("#routers-count"), routers.length === 0 ? ""
-      : (anyText ? visible + " of " + routers.length : routers.length + (routers.length === 1 ? " router" : " routers")));
-    // Prune transient DISPLAY state for routers no longer in the snapshot, so a
-    // reused stableID never renders a stale probe result / error / countdown
-    // against a fresh card. (busyRouters/busyTarget are NOT pruned here: they are
-    // the in-flight POST guard and are cleared by the POST itself; dropping them on
-    // a momentarily-absent frame could re-enable the picker mid-request.)
-    var live = {};
-    for (var li = 0; li < routers.length; li++) {
-      var lsid = routers[li].node && routers[li].node.stableID;
-      if (lsid) live[lsid] = true;
-    }
-    [state.probes, state.actionErrors, state.pendingSince, state.keepErrors].forEach(function (m) {
-      for (var k in m) {
-        if (Object.prototype.hasOwnProperty.call(m, k) && !live[k]) delete m[k];
-      }
-    });
+      : (anyFilter ? visible + " of " + routers.length : routers.length + (routers.length === 1 ? " router" : " routers")));
+    // (Transient-state pruning now runs in render() for ALL views -- see
+    // pruneTransientState; it used to live here and so leaked in the graph view.)
     if (routers.length === 0) {
       var msg = el("span");
       msg.appendChild(document.createTextNode("No routers configured. Start tsctl with "));
@@ -2305,26 +2390,53 @@
       emptyEl.appendChild(msg);
       show(emptyEl, true);
     } else if (visible === 0) {
-      setText(emptyEl, "No routers match “" + state.filter.text.trim() + "”.");
+      var qt = state.filter.text.trim();
+      setText(emptyEl, qt ? "No routers match “" + qt + "”." : "No routers match this filter.");
       show(emptyEl, true);
     } else { show(emptyEl, false); }
   }
   function routerKey(rv) { return (rv.node && rv.node.stableID) || JSON.stringify(rv.node || {}); }
 
+  // --- status classification (shared by the chips, both lists) -------------
+  // Collapse a router's never-optimistic state machine into one of three buckets
+  // the chips filter on. "attention" = something the operator should look at
+  // (unprobed / unconfirmed / awaiting-keep / control-error / online-but-
+  // unreachable); "offline" = the device is down; "online" = up and either
+  // settled or mid-apply (pending).
+  function routerStatus(rv) {
+    var node = rv.node || {};
+    var online = node.online === true;
+    if (!online) return "offline";
+    var st = rv.state || "ok";
+    var unprobed = st === "unprobed";
+    var controlError = rv.reachable === false && !unprobed; // online but uncontrollable
+    if (unprobed || controlError
+      || st === "unconfirmed" || st === "awaiting-keep" || st === "unreachable") return "attention";
+    return "online"; // ok / pending
+  }
+  // A plain device's bucket: offline if down; otherwise inherit its router-view
+  // attention state when it is a controllable router, else online.
+  function nodeStatus(n) {
+    if (n.online !== true) return "offline";
+    var rv = findRouterView(n.stableID);
+    if (rv && routerStatus(rv) === "attention") return "attention";
+    return "online";
+  }
+  function statusMatch(status) {
+    var f = state.filter.status;
+    return f === "all" || f === status;
+  }
+
   function matchesFilter(n) {
-    var f = state.filter;
-    if (f.type === "online" && n.online !== true) return false;
-    if (f.type === "router" && n.type !== "router") return false;
-    if (f.type === "exit" && n.exitNodeOption !== true) return false;
-    if (f.type === "generic" && n.type !== "generic") return false;
-    var q = f.text.trim().toLowerCase();
+    if (!statusMatch(nodeStatus(n))) return false;
+    var q = state.filter.text.trim().toLowerCase();
     if (!q) return true;
     var hay = [n.name, n.hostname, n.os, n.type].concat(n.tailscaleIPs || []).join(" ").toLowerCase();
     return hay.indexOf(q) !== -1;
   }
 
-  // Text-only match for the router cards (the type chips are for the all-devices
-  // list). Includes the current/desired exit node so you can filter by routing too.
+  // Text match for a router card. Includes the current/desired exit node so you
+  // can filter by where a device is routing too.
   function routerTextMatch(rv) {
     var q = state.filter.text.trim().toLowerCase();
     if (!q) return true;
@@ -2335,6 +2447,8 @@
     if (des) hay = hay.concat([des.name, des.ip]);
     return hay.join(" ").toLowerCase().indexOf(q) !== -1;
   }
+  // Full match for a router card: the status chip AND the text query together.
+  function routerMatch(rv) { return statusMatch(routerStatus(rv)) && routerTextMatch(rv); }
 
   function renderNodes() {
     var nodes = currentNodes().slice();
@@ -2354,7 +2468,7 @@
       if (ok) visible++;
     });
 
-    var anyFilter = state.filter.type !== "all" || state.filter.text.trim() !== "";
+    var anyFilter = state.filter.status !== "all" || state.filter.text.trim() !== "";
     // The filter is shared with the router cards above; only ever SHOW it here (never
     // hide — renderRouters may have shown it for a large router list).
     if (total > SEARCH_THRESHOLD) show($("#nodes-tools"), true);
@@ -2472,6 +2586,7 @@
       return;
     }
 
+    pruneTransientState(); // reclaim per-router transient maps in EVERY view (S3)
     renderViewToggle();
     var graphView = state.view === "graph";
     $("#graph-section").hidden = !graphView;
@@ -2482,6 +2597,45 @@
     } else {
       renderRouters();
       renderNodes();
+    }
+  }
+
+  // Reclaim transient per-router DISPLAY state (probe results, action errors,
+  // pending countdowns, keep errors) for stableIDs no longer in the live snapshot,
+  // so a reused/renamed id never shows a stale result. Runs in EVERY view (S3) --
+  // the default graph view never calls renderRouters, where this used to live, so
+  // these maps leaked there (e.g. after "Test SSH all"). busyRouters/busyTarget are
+  // deliberately NOT pruned: they are the in-flight POST guard, cleared by the POST
+  // itself; dropping them on a momentarily-absent frame could re-enable the picker
+  // mid-request. Bails when there is no live router set (e.g. mid-reconnect) so it
+  // never wipes in-flight state during a gap.
+  function pruneTransientState() {
+    var snap = state.snapshot;
+    if (!snap || !Array.isArray(snap.routers)) return;
+    var live = {}, pendingNow = {};
+    for (var i = 0; i < snap.routers.length; i++) {
+      var rv = snap.routers[i];
+      var sid = rv.node && rv.node.stableID;
+      if (!sid) continue;
+      live[sid] = true;
+      if (rv.state === "pending" || rv.state === "unconfirmed") pendingNow[sid] = true;
+    }
+    // Probe results / action errors / keep errors: drop once the router is gone.
+    [state.probes, state.actionErrors, state.keepErrors].forEach(function (m) {
+      for (var k in m) {
+        if (Object.prototype.hasOwnProperty.call(m, k) && !live[k]) delete m[k];
+      }
+    });
+    // pendingSince (the "applying…" countdown anchor): drop when the router is gone
+    // OR no longer pending -- but KEEP it while a local POST is in flight (the
+    // optimistic window, before the pending frame arrives) so the countdown holds.
+    // This is what makes a stale anchor impossible in the graph view too, where
+    // updateRouterCard (which used to be the only place that cleared it) never runs.
+    for (var p in state.pendingSince) {
+      if (Object.prototype.hasOwnProperty.call(state.pendingSince, p) &&
+          !pendingNow[p] && !state.busyRouters[p]) {
+        delete state.pendingSince[p];
+      }
     }
   }
 
@@ -2574,13 +2728,16 @@
 
   // After a successful login: hide the overlay and re-bootstrap the data flow.
   function resumeAfterLogin() {
+    state.reconnectDelay = RECONNECT_MIN; // fresh backoff after a successful login
     render();
     fetchNodes();   // first paint with the new session
-    connectSSE();   // re-open the live stream
+    connectSSE();   // re-open the live stream (cancels any stale reconnect; see S1)
   }
 
   // "Sign out": clear the server session, then fall back to the login overlay.
   function doLogout() {
+    if (state.logoutBusy) return; // guard a double-click from firing two POSTs
+    state.logoutBusy = true;
     ensureCSRF()
       .then(function () {
         return fetch("/api/logout", {
@@ -2597,7 +2754,8 @@
       })
       .catch(function (err) {
         toast("err", "Sign out failed", String((err && err.message) || err));
-      });
+      })
+      .then(function () { state.logoutBusy = false; });
   }
 
   function fetchCSRF() {
@@ -2667,6 +2825,13 @@
 
   function connectSSE() {
     if (blocked()) return;
+    // Defensive (S1): never run two streams at once. A login-resume can call this
+    // while a reconnect-backoff timer set BEFORE the 401 is still armed; without
+    // this, that stale timer later fires and opens a second EventSource, orphaning
+    // the first (leak + every frame processed twice). Cancel any pending reconnect
+    // and close any existing stream before opening a fresh one.
+    if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null; }
+    if (state.es) { try { state.es.close(); } catch (e) { /* already closed */ } state.es = null; }
     var es;
     try { es = new EventSource("/api/events"); }
     catch (e) { state.connection = "reconnecting"; renderConn(); scheduleReconnect(); return; }
@@ -2724,16 +2889,27 @@
     CHIPS.forEach(function (c) {
       var b = el("button", "chip", c.label);
       b.type = "button";
-      b.setAttribute("aria-pressed", c.id === state.filter.type ? "true" : "false");
+      b.setAttribute("data-chip", c.id);
+      b.setAttribute("aria-pressed", c.id === state.filter.status ? "true" : "false");
       b.addEventListener("click", function () {
-        state.filter.type = c.id;
-        var all = box.querySelectorAll(".chip");
-        for (var i = 0; i < all.length; i++) all[i].setAttribute("aria-pressed", "false");
-        b.setAttribute("aria-pressed", "true");
-        renderNodes();
+        state.filter.status = c.id;
+        syncChipsPressed();
+        writeHash(false);   // reflect the chip on the /devices route (deep-linkable)
+        renderRouters();    // chips filter the PRIMARY router cards…
+        renderNodes();      // …and the secondary all-devices list, together
       });
       box.appendChild(b);
     });
+  }
+  // Keep the chips' pressed state in sync with state.filter.status (used by the
+  // click handler and when the status is restored from the URL on load / nav).
+  function syncChipsPressed() {
+    var box = $("#filter-chips");
+    if (!box) return;
+    var all = box.querySelectorAll(".chip");
+    for (var i = 0; i < all.length; i++) {
+      all[i].setAttribute("aria-pressed", all[i].getAttribute("data-chip") === state.filter.status ? "true" : "false");
+    }
   }
 
   function wireControls() {
@@ -2785,7 +2961,8 @@
 
   // ------------------------------------------------------------------ init ---
   function init() {
-    buildChips();
+    initRouting();   // restore view/zone/chip from the hash BEFORE first paint
+    buildChips();    // chips read state.filter.status (possibly set by the hash)
     wireControls();
     wireGraph();
     render();
