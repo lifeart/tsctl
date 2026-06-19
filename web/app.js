@@ -880,6 +880,10 @@
         if (resp.status === 403 && !retried) {
           return fetchCSRF().then(function () { return doPostExitNode(sid, value, true); });
         }
+        // A 403 that PERSISTS after a token refresh is a genuine Host/CSRF (DNS-
+        // rebinding) block, not a stale token -> show the authoritative full-screen
+        // forbidden view (consistent with the GET/SSE paths), not a generic toast.
+        if (resp.status === 403) { handleAuthFailure(403, data); return; }
         if (!resp.ok) {
           var info = (data && (data.error || data.detail || data.stderr)) ? data
             : { error: "HTTP " + resp.status, detail: text || "" };
@@ -1979,6 +1983,21 @@
     var routers = snap && Array.isArray(snap.routers) ? snap.routers : [];
     reconcile($("#routers"), routers, routerKey, createRouterCard,
       function (rec, rv) { updateRouterCard(rec, rv, snap); }, routerEls, false);
+    // Prune transient DISPLAY state for routers no longer in the snapshot, so a
+    // reused stableID never renders a stale probe result / error / countdown
+    // against a fresh card. (busyRouters/busyTarget are NOT pruned here: they are
+    // the in-flight POST guard and are cleared by the POST itself; dropping them on
+    // a momentarily-absent frame could re-enable the picker mid-request.)
+    var live = {};
+    for (var li = 0; li < routers.length; li++) {
+      var lsid = routers[li].node && routers[li].node.stableID;
+      if (lsid) live[lsid] = true;
+    }
+    [state.probes, state.actionErrors, state.pendingSince].forEach(function (m) {
+      for (var k in m) {
+        if (Object.prototype.hasOwnProperty.call(m, k) && !live[k]) delete m[k];
+      }
+    });
     if (routers.length === 0) {
       var msg = el("span");
       msg.appendChild(document.createTextNode("No routers configured. Start tsctl with "));

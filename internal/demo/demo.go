@@ -225,6 +225,13 @@ func (w *World) Status(ctx context.Context, addr string) (store.RouterRuntime, e
 // errors like a failed dial; an online one returns canned busybox-style output.
 // (Required wiring: poller.RouterClient gained Probe, which *World must satisfy.)
 func (w *World) Probe(ctx context.Context, addr string) (string, error) {
+	// Simulate a small SSH round-trip (before taking any lock) so a successful demo
+	// "Test SSH" shows a realistic "· N ms" rather than 0ms (which omitempty drops).
+	select {
+	case <-time.After(120 * time.Millisecond):
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
 	unlock := w.lockAddr(addr)
 	defer unlock()
 

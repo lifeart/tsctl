@@ -279,7 +279,11 @@ func (p *Poller) SetExitNode(ctx context.Context, routerID, targetStableID strin
 
 	// Dead-man's-switch on the router (arm → apply → confirm → keep). Run OUTSIDE
 	// mu: it can take the whole revert window, and must not block the poll loop.
-	rt, setErr := p.rc.SetExitNode(ctx, addr, target, prev)
+	// Hand the router layer its OWN copy of target -- `target` is simultaneously
+	// published in the pending snapshot's Desired, so sharing the pointer with the
+	// router (as we already avoid for `prev`) would be a torn-read footgun for a
+	// lock-free reader if any RouterClient ever mutated it.
+	rt, setErr := p.rc.SetExitNode(ctx, addr, copyExitRef(target), prev)
 	now := time.Now()
 
 	// Distinguish a DEFINITIVE command failure (the arm/apply command RAN and

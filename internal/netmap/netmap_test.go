@@ -161,6 +161,14 @@ func TestBuildInventoryMapping(t *testing.T) {
 	if gotSelf.Type != store.NodeGeneric {
 		t.Errorf("self Type = %q, want %q", gotSelf.Type, store.NodeGeneric)
 	}
+	// IsSelf marks ONLY the tsctl node (Status.Self); peers must be false. The
+	// poller's auto-discovery fallback relies on this to never list tsctl itself.
+	if !gotSelf.IsSelf {
+		t.Errorf("self IsSelf = false, want true")
+	}
+	if byID["router-0003"].IsSelf {
+		t.Errorf("peer router-0003 IsSelf = true, want false (only Self is IsSelf)")
+	}
 	if len(gotSelf.TailscaleIPs) != 2 || gotSelf.TailscaleIPs[0] != "100.64.0.1" {
 		t.Errorf("self TailscaleIPs = %v, want [100.64.0.1 fd7a::1]", gotSelf.TailscaleIPs)
 	}
