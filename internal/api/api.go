@@ -637,6 +637,11 @@ type RouterViewDTO struct {
 	Reachable       bool            `json:"reachable"`
 	LastError       string          `json:"lastError"`
 	LastConfirmedAt string          `json:"lastConfirmedAt"`
+	// Egress probe result (docs/design/keep-egress.md). egressOk is omitted when
+	// nil (not checked / Direct); a non-nil pointer to false still serializes (✗).
+	EgressOK        *bool  `json:"egressOk,omitempty"`
+	EgressDetail    string `json:"egressDetail,omitempty"`
+	EgressCheckedAt string `json:"egressCheckedAt,omitempty"`
 }
 
 // GroupDTO is the RAW wire shape of a store.Group (the /api/groups CRUD body).
@@ -734,6 +739,9 @@ func routerViewDTO(rv store.RouterView) RouterViewDTO {
 		Reachable:       rv.Reachable,
 		LastError:       rv.LastError,
 		LastConfirmedAt: rfc3339(rv.LastConfirmedAt),
+		EgressOK:        rv.EgressOK,
+		EgressDetail:    rv.EgressDetail,
+		EgressCheckedAt: rfc3339(rv.EgressCheckedAt),
 	}
 }
 

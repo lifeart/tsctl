@@ -364,6 +364,138 @@ func TestProbe_CommandError(t *testing.T) {
 	}
 }
 
+// --- egress probe (docs/design/keep-egress.md, stage 1) ----------------------
+
+func TestEgressProbe_ExitZeroIsOK(t *testing.T) {
+	const url = "http://captive.tailscale.com/generate_204"
+	f := &fakeRunner{respond: func(cmd string) ([]byte, []byte, int, error) {
+		// uclient-fetch succeeded; the group exited 0; echo prints the marker.
+		return []byte("tsctl_egress_exit=0\n"), nil, 0, nil
+	}}
+	c := newFakeClient(f, "")
+
+	ok, _, err := c.EgressProbe(context.Background(), "100.64.0.1", url)
+	if err != nil {
+		t.Fatalf("EgressProbe: %v", err)
+	}
+	if !ok {
+		t.Error("ok = false, want true for exit 0")
+	}
+	// Exactly the egress command, against the right addr.
+	if got := f.cmds(); !eqStrings(got, []string{egressCmd(url)}) {
+		t.Errorf("commands = %v, want [%q]", got, egressCmd(url))
+	}
+	if f.calls[0].addr != "100.64.0.1" {
+		t.Errorf("addr = %q, want 100.64.0.1", f.calls[0].addr)
+	}
+}
+
+func TestEgressProbe_NonZeroIsResultNotError(t *testing.T) {
+	f := &fakeRunner{respond: func(cmd string) ([]byte, []byte, int, error) {
+		// Both fetchers failed; the marker carries a non-zero exit. The fetch's
+		// own message is folded into stdout by the command's 2>&1.
+		return []byte("wget: download timed out\ntsctl_egress_exit=1\n"), nil, 0, nil
+	}}
+	c := newFakeClient(f, "")
+
+	ok, detail, err := c.EgressProbe(context.Background(), "100.64.0.1", "http://example.com/")
+	if err != nil {
+		t.Fatalf("a non-zero egress exit must be a RESULT, not a Go error: %v", err)
+	}
+	if ok {
+		t.Error("ok = true, want false for a non-zero exit")
+	}
+	if detail != "wget: download timed out" {
+		t.Errorf("detail = %q, want the output minus the marker line", detail)
+	}
+}
+
+func TestEgressProbe_TransportErrorIsError(t *testing.T) {
+	f := &fakeRunner{respond: func(cmd string) ([]byte, []byte, int, error) {
+		return nil, nil, 0, errors.New("dial: connection refused")
+	}}
+	c := newFakeClient(f, "")
+
+	ok, _, err := c.EgressProbe(context.Background(), "100.64.0.1", "http://example.com/")
+	if err == nil {
+		t.Fatal("expected a transport error to surface as a Go error")
+	}
+	if ok {
+		t.Error("ok must be false on a transport error")
+	}
+}
+
+func TestEgressProbe_RejectsBadURLBeforeDial(t *testing.T) {
+	f := &fakeRunner{}
+	c := newFakeClient(f, "")
+
+	if _, _, err := c.EgressProbe(context.Background(), "100.64.0.1", "http://x/$(id)"); err == nil {
+		t.Fatal("expected an error for a metacharacter URL")
+	}
+	if len(f.calls) != 0 {
+		t.Errorf("no command must run when the url is rejected; got %v", f.cmds())
+	}
+}
+
+func TestValidateEgressURL(t *testing.T) {
+	good := []string{
+		"http://captive.tailscale.com/generate_204",
+		"https://example.com/path?x=1",
+		"https://1.2.3.4:8443/health",
+	}
+	for _, u := range good {
+		if err := ValidateEgressURL(u); err != nil {
+			t.Errorf("ValidateEgressURL(%q) = %v, want nil", u, err)
+		}
+	}
+
+	bad := map[string]string{
+		"ftp://example.com/":   "non-http scheme",
+		"example.com":          "no scheme",
+		"http://x/$(rm -rf /)": "shell substitution chars",
+		"http://x/a;b":         "semicolon",
+		"http://x/a|b":         "pipe",
+		"http://x/a&b":         "ampersand",
+		"http://x/a b":         "space",
+		"http://x/\tb":         "tab",
+		"http://x/a\nb":        "newline",
+		"http://x/`id`":        "backtick",
+		"http://x/\"q\"":       "double quote",
+		"http://x/'q'":         "single quote",
+		"http://x/a\\b":        "backslash",
+		"http://x/<a>":         "angle brackets",
+	}
+	for u, why := range bad {
+		if err := ValidateEgressURL(u); err == nil {
+			t.Errorf("ValidateEgressURL(%q) = nil, want an error (%s)", u, why)
+		}
+	}
+}
+
+func TestParseEgressExit(t *testing.T) {
+	tests := []struct {
+		name       string
+		out        string
+		wantExit   int
+		wantDetail string
+		wantParsed bool
+	}{
+		{"clean zero", "tsctl_egress_exit=0\n", 0, "", true},
+		{"with detail", "boom\ntsctl_egress_exit=7\n", 7, "boom", true},
+		{"no marker", "garbage output", 0, "", false},
+		{"non-numeric", "tsctl_egress_exit=x\n", 0, "", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			exit, detail, parsed := parseEgressExit(tc.out)
+			if parsed != tc.wantParsed || exit != tc.wantExit || detail != tc.wantDetail {
+				t.Errorf("parseEgressExit(%q) = (%d, %q, %v), want (%d, %q, %v)",
+					tc.out, exit, detail, parsed, tc.wantExit, tc.wantDetail, tc.wantParsed)
+			}
+		})
+	}
+}
+
 // serialRunner records the maximum number of run() calls in flight at once so a
 // test can prove the per-router lock keeps it at 1 (DESIGN §6).
 type serialRunner struct {

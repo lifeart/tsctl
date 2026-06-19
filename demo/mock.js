@@ -15,7 +15,11 @@
 //   PUT    /api/groups/{id}                -> update (200 raw Group | 404 | 422)
 //   DELETE /api/groups/{id}                -> 204 | 404
 //   POST   /api/routers/{id}/exit-node     -> scripted ok / unconfirmed / broken /
-//                                             zone-enforcement reject / clear
+//                                             zone-enforcement reject / clear. A
+//                                             CONFIRMED set adds internet-egress
+//                                             fields to the RouterView (egressOk/
+//                                             egressDetail/egressCheckedAt; stage-1
+//                                             keep-egress — office-router reports ✗).
 //   POST   /api/routers/{id}/probe         -> SSH probe: 200 {ok,durationMs,output|
 //                                             error,checkedAt} (online OK / control-
 //                                             error / offline) | 404 unknown id
@@ -119,17 +123,44 @@
   //   rx/tx/hs     : exit-node peer counters + last handshake (Date|null)
   //   controlError : online in the netmap but tsctl can't control it (reachable:false)
   //   lastError    : surfaced control/transport error ("" = healthy)
+  //   egressOk     : internet-egress probe result, set ONLY after a confirmed SET to
+  //                  an exit node (true|false; null = Direct / not probed) — stage-1
+  //                  keep-egress. routerViewDTO emits egressOk/egressDetail/
+  //                  egressCheckedAt only while it's non-null + an exit node is set.
+  //   egressDetail : probe output / error string (shown on the ✗ state)
+  //   egressCheckedAt : Date of the egress probe (null = none)
   var routers = {};
-  routers[r1IP] = { cur: "", desired: "", rx: 0, tx: 0, hs: null, controlError: false, lastError: "" };
-  routers[r2IP] = { cur: tokyoIP, desired: "", rx: 18400000, tx: 4200000, hs: ago(9000), controlError: false, lastError: "" };
-  routers[r3IP] = { cur: "", desired: "", rx: 0, tx: 0, hs: null, controlError: false, lastError: "" };
-  routers[r4IP] = { cur: londonIP, desired: "", rx: 940000, tx: 210000, hs: ago(11 * 60000), controlError: false, lastError: "" };
-  routers[r5IP] = { cur: frankfurtIP, desired: "", rx: 0, tx: 0, hs: null, controlError: true,
+  routers[r1IP] = { cur: "", desired: "", rx: 0, tx: 0, hs: null, controlError: false, lastError: "", egressOk: null, egressDetail: "", egressCheckedAt: null };
+  routers[r2IP] = { cur: tokyoIP, desired: "", rx: 18400000, tx: 4200000, hs: ago(9000), controlError: false, lastError: "", egressOk: null, egressDetail: "", egressCheckedAt: null };
+  routers[r3IP] = { cur: "", desired: "", rx: 0, tx: 0, hs: null, controlError: false, lastError: "", egressOk: null, egressDetail: "", egressCheckedAt: null };
+  routers[r4IP] = { cur: londonIP, desired: "", rx: 940000, tx: 210000, hs: ago(11 * 60000), controlError: false, lastError: "", egressOk: null, egressDetail: "", egressCheckedAt: null };
+  routers[r5IP] = { cur: frankfurtIP, desired: "", rx: 0, tx: 0, hs: null, controlError: true, egressOk: null, egressDetail: "", egressCheckedAt: null,
     lastError: "ssh: handshake failed: host key mismatch for " + r5IP +
       " (tsctl can reach the device but cannot authenticate to control it)" };
   // Fallback-listed device: online but never auto-probed -> neutral "not probed"
   // until a manual Test SSH or an exit-node set (it has no tag:router).
-  routers[r6IP] = { unprobed: true, cur: "", desired: "", rx: 0, tx: 0, hs: null, controlError: false, lastError: "" };
+  routers[r6IP] = { unprobed: true, cur: "", desired: "", rx: 0, tx: 0, hs: null, controlError: false, lastError: "", egressOk: null, egressDetail: "", egressCheckedAt: null };
+
+  // Designated "no internet egress" router for the demo (office-router): after a
+  // CONFIRMED set to an exit node it reaches the device but can't fetch the captive-
+  // portal probe through the exit node, so egressOk:false with a realistic detail.
+  // Every other router reports egress OK. Mirrors the stage-1 keep-egress contract.
+  var NO_EGRESS_IP = r2IP;
+  function setEgress(rt, ip) {
+    rt.egressCheckedAt = new Date();
+    if (ip === NO_EGRESS_IP) {
+      rt.egressOk = false;
+      rt.egressDetail = "tsctl_egress_exit=4 (uclient-fetch: download timed out)";
+    } else {
+      rt.egressOk = true;
+      rt.egressDetail = "tsctl_egress_exit=0";
+    }
+  }
+  function clearEgress(rt) {
+    rt.egressOk = null;
+    rt.egressDetail = "";
+    rt.egressCheckedAt = null;
+  }
 
   // ---------------------------------------------------- in-memory zones ----
   // RAW groups (member arrays = StableID strings), mirroring internal/demo
@@ -244,6 +275,15 @@
       rv.desired = null;
       rv.lastError = "";
       rv.lastConfirmedAt = rfc3339(new Date());
+    }
+    // Stage-1 internet-egress (docs/design/keep-egress.md): emitted ONLY when an
+    // exit node is set + confirmed (state ok, cur != "") AND a probe has actually
+    // run (egressOk non-null). Direct/cleared, unconfirmed, or never-set-in-session
+    // routers carry no egress fields — matches the backend contract.
+    if (rv.state === "ok" && rt.cur && rt.egressOk != null) {
+      rv.egressOk = rt.egressOk;
+      rv.egressDetail = rt.egressDetail || "";
+      rv.egressCheckedAt = rfc3339(rt.egressCheckedAt);
     }
     return rv;
   }
@@ -508,25 +548,31 @@
       rt.unprobed = false;
       var resp;
       if (!targetID) {
-        // Clear -> confirmed Direct.
+        // Clear -> confirmed Direct. No egress probe on a clear.
         rt.cur = ""; rt.desired = ""; rt.rx = 0; rt.tx = 0; rt.hs = null; rt.lastError = "";
+        clearEgress(rt);
         resp = json(200, routerViewDTO(ip));
       } else if (targetID === "n-exit-flaky") {
         // Applied but NOT confirmed: leave current at prev, mark unconfirmed (amber).
+        // Egress probe runs only after CONFIRM, so no egress here.
         rt.desired = flakyIP;
         rt.lastError = "router " + ip + ": exit-node not confirmed (revert will fire): want " +
           flakyIP + ", got " + (rt.cur || "(none)");
+        clearEgress(rt);
         resp = json(200, routerViewDTO(ip)); // state:"unconfirmed"
       } else if (targetID === "n-exit-broken") {
         // The apply command itself failed: the change did NOT take (current
-        // unchanged); surface a non-2xx {error,detail,stderr}.
+        // unchanged); surface a non-2xx {error,detail,stderr}. Egress untouched —
+        // the previous confirmed selection (and its egress, if any) still stands.
         var detail = "router " + ip + ": apply exit-node exited 1: permission denied";
         resp = json(502, errBody("router command failed", detail, "permission denied"));
       } else {
-        // Normal target -> confirmed.
+        // Normal target -> confirmed. Egress probe runs after CONFIRM (keep-egress
+        // stage 1): office-router reports ✗ no egress, every other router ✓ OK.
         var t2 = nodeByID(targetID);
         rt.cur = primaryIPv4(t2.ips); rt.desired = ""; rt.rx = 96000; rt.tx = 24000;
         rt.hs = new Date(); rt.lastError = "";
+        setEgress(rt, ip);
         resp = json(200, routerViewDTO(ip));
       }
       broadcast(buildSnapshot());

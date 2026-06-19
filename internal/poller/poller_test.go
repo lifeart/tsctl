@@ -24,19 +24,24 @@ type fakeNM struct {
 func (f *fakeNM) Inventory(ctx context.Context) ([]store.NodeView, error) { return f.nodes, f.err }
 
 type fakeRC struct {
-	mu          sync.Mutex
-	statusRT    store.RouterRuntime
-	statusErr   error
-	statusCalls int
-	setRT       store.RouterRuntime
-	setErr      error
-	setCalls    int
-	lastAddr    string
-	lastTarget  *store.ExitNodeRef
-	lastPrev    *store.ExitNodeRef
-	probeOut    string
-	probeErr    error
-	probeCalls  int
+	mu            sync.Mutex
+	statusRT      store.RouterRuntime
+	statusErr     error
+	statusCalls   int
+	setRT         store.RouterRuntime
+	setErr        error
+	setCalls      int
+	lastAddr      string
+	lastTarget    *store.ExitNodeRef
+	lastPrev      *store.ExitNodeRef
+	probeOut      string
+	probeErr      error
+	probeCalls    int
+	egressOK      bool
+	egressDet     string
+	egressErr     error
+	egressCalls   int
+	lastEgressURL string
 }
 
 func (f *fakeRC) Status(ctx context.Context, addr string) (store.RouterRuntime, error) {
@@ -61,9 +66,18 @@ func (f *fakeRC) Probe(ctx context.Context, addr string) (string, error) {
 	return f.probeOut, f.probeErr
 }
 
+func (f *fakeRC) EgressProbe(ctx context.Context, addr, url string) (bool, string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.egressCalls++
+	f.lastEgressURL = url
+	return f.egressOK, f.egressDet, f.egressErr
+}
+
 func (f *fakeRC) calls() int           { f.mu.Lock(); defer f.mu.Unlock(); return f.setCalls }
 func (f *fakeRC) statusCallCount() int { f.mu.Lock(); defer f.mu.Unlock(); return f.statusCalls }
 func (f *fakeRC) probeCallCount() int  { f.mu.Lock(); defer f.mu.Unlock(); return f.probeCalls }
+func (f *fakeRC) egressCallCount() int { f.mu.Lock(); defer f.mu.Unlock(); return f.egressCalls }
 
 type fakeBC struct {
 	mu    sync.Mutex
@@ -284,6 +298,9 @@ func (f *blockStatusRC) SetExitNode(ctx context.Context, addr string, target, pr
 	return f.setRT, nil
 }
 func (f *blockStatusRC) Probe(ctx context.Context, addr string) (string, error) { return "", nil }
+func (f *blockStatusRC) EgressProbe(ctx context.Context, addr, url string) (bool, string, error) {
+	return true, "", nil
+}
 
 func TestRefresh_SlowStatusDoesNotBlockSetExitNodeNorClobberIt(t *testing.T) {
 	// L-3: the poll's slow Status dials must NOT hold mu, so SetExitNode can proceed
@@ -352,6 +369,9 @@ func (f *orchRC) SetExitNode(ctx context.Context, addr string, target, prev *sto
 	return store.RouterRuntime{Online: true, Current: f.target}, nil // confirms the target
 }
 func (f *orchRC) Probe(ctx context.Context, addr string) (string, error) { return "", nil }
+func (f *orchRC) EgressProbe(ctx context.Context, addr, url string) (bool, string, error) {
+	return true, "", nil
+}
 
 func TestRefresh_SetConfirmingDuringDialNotClobbered(t *testing.T) {
 	// Regression for the L-3 review's item-1 false-confirm: a SetExitNode whose step 1
@@ -461,6 +481,9 @@ func (f *seqRC) Status(ctx context.Context, addr string) (store.RouterRuntime, e
 	return store.RouterRuntime{Online: true}, nil
 }
 func (f *seqRC) Probe(ctx context.Context, addr string) (string, error) { return "", nil }
+func (f *seqRC) EgressProbe(ctx context.Context, addr, url string) (bool, string, error) {
+	return true, "", nil
+}
 func (f *seqRC) SetExitNode(ctx context.Context, addr string, target, prev *store.ExitNodeRef) (store.RouterRuntime, error) {
 	ip := ""
 	if target != nil {
@@ -843,6 +866,153 @@ func TestSetExitNode_Clear(t *testing.T) {
 	}
 }
 
+// seedEgress sets an egress result on the seeded router's RouterView so a test can
+// prove it is carried forward (failed set) or reset (clear).
+func seedEgress(st *store.Store, routerIP string, ok *bool, detail string) {
+	snap := st.Load()
+	routers := make([]store.RouterView, len(snap.Routers))
+	copy(routers, snap.Routers)
+	for i := range routers {
+		for _, ip := range routers[i].Node.TailscaleIPs {
+			if ip == routerIP {
+				routers[i].EgressOK = ok
+				routers[i].EgressDetail = detail
+				routers[i].EgressCheckedAt = time.Now()
+			}
+		}
+	}
+	ns := *snap
+	ns.Routers = routers
+	st.Store(&ns)
+}
+
+func TestSetExitNode_Egress(t *testing.T) {
+	routerIP, exitIP := "100.64.0.10", "100.64.0.20"
+	const egURL = "http://captive.tailscale.com/generate_204"
+	confirmedSet := store.RouterRuntime{Online: true, Current: &store.ExitNodeRef{StableID: "exit1", IP: exitIP}}
+
+	t.Run("confirmed set records EgressOK from the probe", func(t *testing.T) {
+		st := store.New()
+		seedSnapshot(st, routerIP, exitIP, true, true)
+		rc := &fakeRC{setRT: confirmedSet, egressOK: true, egressDet: "HTTP/1.1 204 No Content"}
+		p := New(st, &fakeNM{}, rc, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+		p.ConfigureEgress(true, egURL)
+
+		rv, err := p.SetExitNode(context.Background(), "router1", "exit1")
+		if err != nil {
+			t.Fatalf("set: %v", err)
+		}
+		if rc.egressCallCount() != 1 {
+			t.Fatalf("EgressProbe calls = %d, want 1", rc.egressCallCount())
+		}
+		if rc.lastEgressURL != egURL {
+			t.Errorf("egress url = %q, want %q", rc.lastEgressURL, egURL)
+		}
+		if rv.EgressOK == nil || !*rv.EgressOK {
+			t.Errorf("EgressOK = %v, want &true", rv.EgressOK)
+		}
+		if rv.EgressDetail != "HTTP/1.1 204 No Content" {
+			t.Errorf("EgressDetail = %q", rv.EgressDetail)
+		}
+		if rv.EgressCheckedAt.IsZero() {
+			t.Error("EgressCheckedAt should be set on a confirmed set")
+		}
+	})
+
+	t.Run("egress failure does not fail the confirmed set", func(t *testing.T) {
+		st := store.New()
+		seedSnapshot(st, routerIP, exitIP, true, true)
+		rc := &fakeRC{setRT: confirmedSet, egressOK: false, egressDet: "wget: download timed out"}
+		p := New(st, &fakeNM{}, rc, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+		p.ConfigureEgress(true, egURL)
+
+		rv, err := p.SetExitNode(context.Background(), "router1", "exit1")
+		if err != nil {
+			t.Fatalf("an egress failure must NOT fail the confirmed set: %v", err)
+		}
+		if rv.State != store.RouterOK {
+			t.Errorf("state = %q, want ok (egress is advisory)", rv.State)
+		}
+		if rv.EgressOK == nil || *rv.EgressOK {
+			t.Errorf("EgressOK = %v, want &false", rv.EgressOK)
+		}
+		if rv.EgressDetail != "wget: download timed out" {
+			t.Errorf("EgressDetail = %q", rv.EgressDetail)
+		}
+	})
+
+	t.Run("clear resets EgressOK to nil and never probes", func(t *testing.T) {
+		st := store.New()
+		seedSnapshot(st, routerIP, exitIP, true, true)
+		prior := true
+		seedEgress(st, routerIP, &prior, "stale ok") // a prior result that the clear must drop
+		rc := &fakeRC{setRT: store.RouterRuntime{Online: true, Current: nil}, egressOK: true}
+		p := New(st, &fakeNM{}, rc, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+		p.ConfigureEgress(true, egURL)
+
+		rv, err := p.SetExitNode(context.Background(), "router1", "") // clear
+		if err != nil {
+			t.Fatalf("clear: %v", err)
+		}
+		if rc.egressCallCount() != 0 {
+			t.Errorf("egress must NOT run on a clear (Direct has no egress), calls = %d", rc.egressCallCount())
+		}
+		if rv.EgressOK != nil {
+			t.Errorf("EgressOK = %v, want nil after a confirmed clear", rv.EgressOK)
+		}
+		if rv.EgressDetail != "" {
+			t.Errorf("EgressDetail = %q, want cleared", rv.EgressDetail)
+		}
+	})
+
+	t.Run("egress off skips the probe", func(t *testing.T) {
+		st := store.New()
+		seedSnapshot(st, routerIP, exitIP, true, true)
+		rc := &fakeRC{setRT: confirmedSet, egressOK: true}
+		// No ConfigureEgress -> egress OFF (zero value), as existing tests expect.
+		p := New(st, &fakeNM{}, rc, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+
+		rv, err := p.SetExitNode(context.Background(), "router1", "exit1")
+		if err != nil {
+			t.Fatalf("set: %v", err)
+		}
+		if rc.egressCallCount() != 0 {
+			t.Errorf("EgressProbe must NOT be called when egress is off, calls = %d", rc.egressCallCount())
+		}
+		if rv.EgressOK != nil {
+			t.Errorf("EgressOK = %v, want nil (the probe never ran)", rv.EgressOK)
+		}
+	})
+
+	t.Run("failed set leaves egress untouched", func(t *testing.T) {
+		st := store.New()
+		seedSnapshot(st, routerIP, exitIP, true, true)
+		prior := true
+		seedEgress(st, routerIP, &prior, "stale ok") // must be carried forward, not cleared
+		rc := &fakeRC{
+			setErr:   &router.CommandError{Addr: routerIP, Cmd: "apply exit-node", StderrText: "permission denied", Exit: 1},
+			statusRT: store.RouterRuntime{Online: true}, // hardFail re-read: reachable, unchanged
+			egressOK: true,
+		}
+		p := New(st, &fakeNM{}, rc, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+		p.ConfigureEgress(true, egURL)
+
+		rv, err := p.SetExitNode(context.Background(), "router1", "exit1")
+		if err == nil {
+			t.Fatal("expected the hard command failure to surface as an error")
+		}
+		if rc.egressCallCount() != 0 {
+			t.Errorf("egress must NOT run on a failed set, calls = %d", rc.egressCallCount())
+		}
+		if rv.EgressOK == nil || !*rv.EgressOK {
+			t.Errorf("EgressOK = %v, want the carried-forward &true (untouched on failure)", rv.EgressOK)
+		}
+		if rv.EgressDetail != "stale ok" {
+			t.Errorf("EgressDetail = %q, want carried-forward %q", rv.EgressDetail, "stale ok")
+		}
+	})
+}
+
 func TestSetExitNode_PreflightRefusals(t *testing.T) {
 	routerIP, exitIP := "100.64.0.10", "100.64.0.20"
 
@@ -1022,6 +1192,9 @@ func (d *dropMidOpRC) Status(ctx context.Context, addr string) (store.RouterRunt
 }
 
 func (d *dropMidOpRC) Probe(ctx context.Context, addr string) (string, error) { return "", nil }
+func (d *dropMidOpRC) EgressProbe(ctx context.Context, addr, url string) (bool, string, error) {
+	return true, "", nil
+}
 
 func (d *dropMidOpRC) SetExitNode(ctx context.Context, addr string, target, prev *store.ExitNodeRef) (store.RouterRuntime, error) {
 	// Same IP, empty StableID -- the buildRouterView fallback for a configured

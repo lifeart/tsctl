@@ -190,6 +190,12 @@ func (f *fakeRouterClient) Probe(ctx context.Context, addr string) (string, erro
 	return "Linux router 5.15.0\n0.10 0.20 0.30", nil
 }
 
+func (f *fakeRouterClient) EgressProbe(ctx context.Context, addr, url string) (bool, string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return true, "HTTP/1.1 204 No Content", nil
+}
+
 func (f *fakeRouterClient) configureSet(rt store.RouterRuntime, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

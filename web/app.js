@@ -403,6 +403,10 @@
     var currentText = el("span", "current-text");
     currentLine.appendChild(currentText);
 
+    // internet-egress indicator (stage 1, docs/design/keep-egress.md): filled in by
+    // updateRouterCard only when the backend actually probed egress after a set.
+    var egress = el("div", "egress-line hidden");
+
     var warn = el("div", "router-warn hidden");
     warn.appendChild(warnIcon());
     var warnText = el("span", "warn-text");
@@ -439,6 +443,7 @@
     root.appendChild(head);
     root.appendChild(ips);
     root.appendChild(currentLine);
+    root.appendChild(egress);
     root.appendChild(warn);
     root.appendChild(offlineNote);
     root.appendChild(picker);
@@ -453,7 +458,7 @@
 
     return {
       root: root, dot: dot, name: name, stateBadge: stateBadge, ips: ips,
-      currentLine: currentLine, currentText: currentText, warn: warn, warnText: warnText,
+      currentLine: currentLine, currentText: currentText, egress: egress, warn: warn, warnText: warnText,
       offlineNote: offlineNote, picker: picker, pickerHint: pickerHint, select: select, pending: pending,
       stats: stats, errBox: errBox, probeBtn: probeBtn, probeResult: probeResult, optionsSig: null,
     };
@@ -621,6 +626,11 @@
       rec.currentLine.classList.remove("is-stale");
     }
 
+    // internet-egress indicator (stage 1, docs/design/keep-egress.md). The backend
+    // probes egress only after a confirmed SET to an exit node, so egressOk is
+    // present (true/false) only then; absent/null (Direct / not probed) -> no line.
+    renderEgress(rec, rv);
+
     // offline note — unprobed (neutral) vs control-error vs genuine-offline wording.
     if (unprobed) {
       setText(rec.offlineNote, "Not probed yet — tsctl lists this device but hasn’t contacted it. Use Test SSH to check connectivity, or pick an exit node to control it.");
@@ -713,6 +723,29 @@
     }
 
     renderProbe(rec, sid);
+  }
+
+  // internet-egress line (stage 1 of docs/design/keep-egress.md). RouterView carries
+  // egressOk (boolean | absent/null), egressDetail (string), egressCheckedAt (RFC3339).
+  // The backend sets these only after a confirmed exit-node SET — absent/null means
+  // not checked (Direct / pre-probe), so we render nothing. egressDetail is router-
+  // controlled, so it goes in via textContent (el's text arg) — NEVER innerHTML.
+  function renderEgress(rec, rv) {
+    var box = rec.egress;
+    box.textContent = "";
+    if (rv.egressOk == null) {            // absent/null -> not checked -> no line
+      box.className = "egress-line hidden";
+      return;
+    }
+    var ok = rv.egressOk === true;
+    box.className = "egress-line " + (ok ? "egress-ok" : "egress-fail");
+    box.appendChild(el("div", "egress-status", ok ? "✓ Internet egress OK" : "✗ No internet egress"));
+    // On failure surface the router-controlled detail (exit node selected, but it
+    // can't reach the internet through it). textContent-only — XSS-safe.
+    if (!ok && rv.egressDetail) box.appendChild(el("div", "egress-detail", String(rv.egressDetail)));
+    if (rv.egressCheckedAt && parseTime(rv.egressCheckedAt)) {
+      box.appendChild(el("div", "egress-when", "Checked " + relTime(rv.egressCheckedAt)));
+    }
   }
 
   // ------------------------------------------------------------ SSH probe ---

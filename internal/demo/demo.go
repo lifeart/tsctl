@@ -248,6 +248,30 @@ func (w *World) Probe(ctx context.Context, addr string) (string, error) {
 		rn.hostname), nil
 }
 
+// EgressProbe implements poller.RouterClient: a scripted read-only egress check
+// over the same (simulated) transport as Status/Probe, with the same
+// lockAddr→mu order. Healthy routers report ok=true with a sample 204 detail; the
+// warehouse router (r4) reports ok=false so the demo shows the egress ✗ state.
+// (Required wiring: poller.RouterClient gained EgressProbe, which *World must
+// satisfy so the `_ poller.RouterClient = (*World)(nil)` assertion still compiles.)
+func (w *World) EgressProbe(ctx context.Context, addr, url string) (bool, string, error) {
+	unlock := w.lockAddr(addr)
+	defer unlock()
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	rn := w.findByIPLocked(addr)
+	if rn == nil {
+		return false, "", fmt.Errorf("demo: no router configured at %s", addr)
+	}
+	if addr == r4IP {
+		// One designated router: egress fails (e.g. its exit node has no upstream),
+		// driving the UI's egress ✗ indicator. A RESULT, not a transport error.
+		return false, "uclient-fetch: download timed out (no route to host)", nil
+	}
+	return true, "HTTP/1.1 204 No Content", nil
+}
+
 // SetExitNode implements poller.RouterClient with the three scripted outcomes
 // (DESIGN §8 failure-mode table). It honours (target, prev): on success current
 // becomes target; on any failure current is left at prev (i.e. the armed revert

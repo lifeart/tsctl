@@ -9,9 +9,17 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/lifeart/tsctl/internal/router"
 )
+
+// defaultEgressURL is the stable 204 generator the egress probe fetches by
+// default (docs/design/keep-egress.md). Used both as the -egress-url flag default
+// and by `tsctl demo`, so the demo exercises the egress ✓/✗ indicator.
+const defaultEgressURL = "http://captive.tailscale.com/generate_204"
 
 // Config is the fully-resolved runtime configuration. Source is flags + env
 // only (DESIGN §5: no YAML, no committed secrets).
@@ -43,6 +51,13 @@ type Config struct {
 	// non-nil = tsctl sets it to this value when setting an exit node. Other
 	// `tailscale up` settings are always preserved (we use incremental `set`).
 	ExitNodeLANAccess *bool
+
+	// EgressCheck enables the read-only egress probe the poller runs on a router
+	// after a CONFIRMED exit-node change (docs/design/keep-egress.md). Default TRUE.
+	// EgressURL is the http(s) endpoint the router fetches; validated fail-closed at
+	// load (must be http(s):// with no shell metacharacters).
+	EgressCheck bool
+	EgressURL   string
 
 	// --- router command transport (DEFAULT: tailscale-ssh) ---------------------
 	// RouterTransport selects how tsctl reaches a router to run commands:
@@ -90,6 +105,21 @@ func envDur(key string, def time.Duration) (time.Duration, error) {
 	return d, nil
 }
 
+// envBool returns a bool from the env var (strconv.ParseBool: 1/t/true/0/f/false,
+// case-insensitive), or def if unset. A set-but-invalid value is a hard error so
+// container/env config is accurate (never silently swallowed).
+func envBool(key string, def bool) (bool, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok {
+		return def, nil
+	}
+	b, err := strconv.ParseBool(strings.TrimSpace(v))
+	if err != nil {
+		return false, fmt.Errorf("invalid %s %q: want a boolean (true/false): %w", key, v, err)
+	}
+	return b, nil
+}
+
 // loadConfig resolves config from env defaults overridden by flags. args is the
 // flag slice (e.g. os.Args[1:] for `serve`).
 func loadConfig(args []string) (*Config, error) {
@@ -102,6 +132,12 @@ func loadConfig(args []string) (*Config, error) {
 		return nil, err
 	}
 	pollIntervalDef, err := envDur("TSCTL_POLL_INTERVAL", 30*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	// Egress check defaults to TRUE; a set-but-invalid env value is a hard error
+	// (never silently ignored), like the duration envs above.
+	egressCheckDef, err := envBool("TSCTL_EGRESS_CHECK", true)
 	if err != nil {
 		return nil, err
 	}
@@ -124,6 +160,10 @@ func loadConfig(args []string) (*Config, error) {
 	fs.DurationVar(&c.PollInterval, "poll-interval", pollIntervalDef, "refresh cadence while a client is connected")
 	lanAccess := fs.String("exit-node-lan-access", env("TSCTL_EXIT_NODE_LAN_ACCESS", "preserve"),
 		"manage --exit-node-allow-lan-access on the router: preserve|true|false (preserve keeps the router's existing setting)")
+	fs.BoolVar(&c.EgressCheck, "egress-check", egressCheckDef,
+		"after a confirmed exit-node change, run a read-only egress probe ON the router (default true)")
+	fs.StringVar(&c.EgressURL, "egress-url", env("TSCTL_EGRESS_URL", defaultEgressURL),
+		"URL the egress probe fetches from the router (http(s) only, no shell metacharacters)")
 	fs.StringVar(&c.RouterTransport, "router-transport", env("TSCTL_ROUTER_TRANSPORT", "tailscale-ssh"),
 		"router command transport: tailscale-ssh (default) | ip-password (opt-in, host-key-verified, LAN-trusted)")
 	fs.StringVar(&c.RouterHostKeyMode, "router-hostkey-mode", env("TSCTL_ROUTER_HOSTKEY_MODE", "tofu"),
@@ -287,6 +327,13 @@ func (c *Config) validate() error {
 		if _, err := netip.ParseAddr(r); err != nil {
 			return fmt.Errorf("router %q is not a valid IP (use the 100.x IPv4): %w", r, err)
 		}
+	}
+
+	// Egress probe URL: fail-closed on a bad value (same http(s)+no-metacharacters
+	// rule the router layer enforces before it ever reaches a shell), regardless of
+	// whether the check is enabled, so a typo is caught at startup.
+	if err := router.ValidateEgressURL(c.EgressURL); err != nil {
+		return fmt.Errorf("invalid -egress-url / TSCTL_EGRESS_URL: %w", err)
 	}
 
 	// Router transport + host-key mode (fail-closed; default tailscale-ssh).

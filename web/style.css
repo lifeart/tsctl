@@ -489,6 +489,30 @@ body {
   color: var(--text-secondary);
 }
 
+/* internet-egress indicator (stage 1, docs/design/keep-egress.md): shown on the
+   card only when the backend probed egress after a confirmed set. ✓ green = the
+   router reaches the internet through its exit node; ✗ amber = it can't. */
+.egress-line {
+  margin-top: 0.5rem;
+  font-size: 0.8125rem;
+  line-height: 1.4;
+  min-width: 0;
+}
+.egress-line.hidden { display: none; }
+.egress-status { font-weight: 600; }
+.egress-ok .egress-status { color: var(--c-green); }
+.egress-fail .egress-status { color: var(--c-amber); }
+.egress-detail {
+  margin-top: 0.25rem;
+  color: var(--text-secondary);
+  word-break: break-word;
+  white-space: pre-wrap;
+  max-height: 7rem;
+  overflow: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.egress-when { margin-top: 0.25rem; color: var(--text-tertiary); font-size: 0.75rem; }
+
 /* ----------------------------------------------- dots & icons ---------- */
 .dot {
   display: inline-block;

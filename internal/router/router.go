@@ -30,6 +30,7 @@ import (
 	"net"
 	"net/netip"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -378,6 +379,50 @@ func (c *Client) Probe(ctx context.Context, addr string) (string, error) {
 	return strings.TrimSpace(string(stdout)), nil
 }
 
+// EgressProbe makes ONE read-only outbound request FROM the router over the SAME
+// runSSH seam as Status/Probe (per-addr lock + per-command timeout). Because the
+// request originates on the router, it now routes through the router's CURRENT
+// exit node, so it tests actual internet egress through that node
+// (docs/design/keep-egress.md, stage 1). It changes no router state. addr is the
+// router's 100.x IPv4 (no port).
+//
+// url is validated FIRST -- a pure check, before any dial: it must be an
+// http(s):// URL with no shell metacharacters, so the validated, double-quoted
+// url can never break out of the command line. A bad url returns ("", "", error)
+// and never reaches the router.
+//
+// The trailing `tsctl_egress_exit=N` marker is parsed: N==0 -> ok=true; a
+// non-zero N is a RESULT (ok=false, err=nil) -- a router may legitimately have no
+// egress yet, so that is not a Go error. Only a transport/SSH failure returns a
+// non-nil error (with ok=false, detail="").
+func (c *Client) EgressProbe(ctx context.Context, addr, url string) (ok bool, detail string, err error) {
+	if err := ValidateEgressURL(url); err != nil {
+		return false, "", err
+	}
+
+	unlock := c.lockAddr(addr)
+	defer unlock()
+
+	stdout, stderr, _, runErr := c.runner.run(ctx, addr, egressCmd(url))
+	if runErr != nil {
+		return false, "", fmt.Errorf("router %s: egress probe: %w", addr, runErr)
+	}
+	// The fetch's own stderr is folded into stdout by the command's `2>&1`; stderr
+	// here would only carry shell noise. Parse the marker from stdout.
+	exit, detail, parsed := parseEgressExit(string(stdout))
+	if !parsed {
+		// No marker: the command line did not complete as expected. Treat it as a
+		// failed egress RESULT and surface whatever output we captured (never an
+		// empty, silent failure) rather than a Go error -- the SSH session ran.
+		out := strings.TrimSpace(string(stdout))
+		if out == "" {
+			out = strings.TrimSpace(string(stderr))
+		}
+		return false, out, nil
+	}
+	return exit == 0, detail, nil
+}
+
 // ParseStatus turns the bytes of `tailscale status --json` into a RouterRuntime.
 // Pure and version-tolerant.
 func ParseStatus(raw []byte) (store.RouterRuntime, error) {
@@ -627,6 +672,55 @@ func applyCmd(targetArg string, setting bool, lanAccess *bool) string {
 
 // keepCmd drops the keep-marker so the armed revert exits without reverting.
 func keepCmd(marker string) string { return fmt.Sprintf(": > %s", marker) }
+
+// egressURLForbidden is the set of characters ValidateEgressURL refuses in a url:
+// space, tab, newline, and the shell metacharacters ;|&$`<>()"'\ . With those
+// excluded (and an http(s):// prefix required) the validated url is safe to
+// double-quote into the egress command line -- it cannot break out of the quotes.
+// (\x60 is the backtick.)
+const egressURLForbidden = " \t\n;|&$\x60<>()\"'\\"
+
+// ValidateEgressURL enforces the egress-probe URL rule shared by the router layer
+// (EgressProbe) and the config loader (fail-closed on a bad -egress-url): the url
+// must start with http:// or https:// and contain none of egressURLForbidden, so
+// it can never be interpolated as anything but a single quoted argument.
+func ValidateEgressURL(url string) error {
+	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+		return fmt.Errorf("egress url %q: must start with http:// or https://", url)
+	}
+	if i := strings.IndexAny(url, egressURLForbidden); i >= 0 {
+		return fmt.Errorf("egress url %q: contains a forbidden character %q (no whitespace or shell metacharacters allowed)", url, url[i:i+1])
+	}
+	return nil
+}
+
+// egressCmd builds the read-only egress probe: ONE outbound request (prefer
+// uclient-fetch, the OpenWRT default; fall back to wget), folding fetch errors
+// into stdout (2>&1) and appending a parseable exit marker. The validated url is
+// double-quoted; ValidateEgressURL guarantees it has no quote/metacharacter that
+// could break out. Mirrors docs/design/keep-egress.md.
+func egressCmd(url string) string {
+	return fmt.Sprintf(`{ uclient-fetch -q -T 5 -O /dev/null "%s" || wget -q -T 5 -O /dev/null "%s"; } 2>&1; echo "tsctl_egress_exit=$?"`, url, url)
+}
+
+// egressMarker is the trailing line egressCmd echoes; parseEgressExit reads N from it.
+const egressMarker = "tsctl_egress_exit="
+
+// parseEgressExit finds the trailing `tsctl_egress_exit=N` marker in the command
+// output and returns N, the trimmed detail (the output BEFORE the marker), and
+// whether the marker parsed. A missing/garbled marker reports parsed=false so the
+// caller can treat it as a failed result without trusting a bogus exit code.
+func parseEgressExit(out string) (exit int, detail string, parsed bool) {
+	idx := strings.LastIndex(out, egressMarker)
+	if idx < 0 {
+		return 0, "", false
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(out[idx+len(egressMarker):]))
+	if err != nil {
+		return 0, "", false
+	}
+	return n, strings.TrimSpace(out[:idx]), true
+}
 
 // --- helpers ------------------------------------------------------------------
 

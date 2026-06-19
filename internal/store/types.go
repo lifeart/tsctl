@@ -96,6 +96,14 @@ type RouterView struct {
 	Reachable       bool
 	LastError       string // "" = healthy; NEVER swallow -- surface here
 	LastConfirmedAt time.Time
+
+	// Egress probe result (docs/design/keep-egress.md, stage 1). After a CONFIRMED
+	// exit-node SET the poller can run a read-only outbound request FROM the router
+	// (which now routes through its new exit node) to test actual internet egress.
+	// It is advisory: an egress failure never reverts or fails the set.
+	EgressOK        *bool     // nil = not checked / not applicable (Direct); else last egress result
+	EgressDetail    string    // probe output or error (when checked)
+	EgressCheckedAt time.Time // when egress was last checked
 }
 
 // ProbeResult is the outcome of a read-only SSH diagnostic against a router

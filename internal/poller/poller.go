@@ -47,6 +47,11 @@ type RouterClient interface {
 	// returns its trimmed stdout (or a transport/command error). Used by the
 	// "test SSH" probe endpoint.
 	Probe(ctx context.Context, addr string) (string, error)
+	// EgressProbe makes ONE read-only outbound request from the router (which now
+	// routes through its current exit node) to test actual internet egress
+	// (docs/design/keep-egress.md). ok==false with err==nil is a RESULT (no egress
+	// yet); only a transport/SSH failure returns a non-nil error.
+	EgressProbe(ctx context.Context, addr, url string) (bool, string, error)
 }
 
 // GroupReader supplies the current zone/group definitions (DESIGN
@@ -127,6 +132,13 @@ type Poller struct {
 	// dial leaves setSeq unchanged, so without the step-3 bump the poll would clobber
 	// the confirmed set with a stale read (a false-confirm). Guarded by mu.
 	setGen map[string]uint64
+
+	// egressCheck / egressURL configure the post-confirm egress probe
+	// (docs/design/keep-egress.md, stage 1). Set ONCE via ConfigureEgress before
+	// Run; the zero value (egressCheck=false) leaves egress OFF, so callers that
+	// never configure it -- and existing tests -- skip the probe entirely.
+	egressCheck bool
+	egressURL   string
 }
 
 // New constructs a Poller. transitions is the SSE hub's Transitions() channel
@@ -154,6 +166,15 @@ func New(st *store.Store, nm Netmapper, rc RouterClient, groups GroupReader, rou
 		setSeq:      make(map[string]uint64),
 		setGen:      make(map[string]uint64),
 	}
+}
+
+// ConfigureEgress enables (or disables) the post-confirm egress probe and sets the
+// URL it fetches FROM the router. Call ONCE at startup (before Run) -- the
+// composition root wires it from cfg.EgressCheck / cfg.EgressURL. The zero value
+// (check=false) leaves egress OFF, preserving existing behavior.
+func (p *Poller) ConfigureEgress(check bool, url string) {
+	p.egressCheck = check
+	p.egressURL = url
 }
 
 // groupList returns the current zone definitions, or nil when no GroupReader was
@@ -311,6 +332,31 @@ func (p *Poller) SetExitNode(ctx context.Context, routerID, targetStableID strin
 		}
 	}
 
+	// EGRESS PROBE (docs/design/keep-egress.md, stage 1): on a CONFIRMED SET (not a
+	// clear, not a failure) and only when configured, test actual internet egress
+	// THROUGH the just-selected exit node. Read-only, over the router's own runSSH
+	// seam; run OUTSIDE mu (a network round-trip, like the SetExitNode/re-read
+	// above) so it never blocks the poll loop. Advisory: an egress failure does NOT
+	// fail or revert the set -- the selection is already applied + confirmed. A
+	// transport error is surfaced (logged + carried as detail) but treated as
+	// ok=false, never swallowed.
+	setting := target != nil
+	var (
+		egressRan bool
+		egressOK  bool
+		egressDet string
+	)
+	if setErr == nil && setting && p.egressCheck {
+		eok, edet, eerr := p.rc.EgressProbe(ctx, addr, p.egressURL)
+		if eerr != nil {
+			p.logf("poller: egress probe %s: %v", addr, eerr)
+			if edet == "" {
+				edet = eerr.Error()
+			}
+		}
+		egressRan, egressOK, egressDet = true, eok, edet
+	}
+
 	var updated store.RouterView
 	p.mu.Lock()
 	p.setGen[addr]++ // step-3 set activity: lets a concurrent poll detect a set that
@@ -330,6 +376,20 @@ func (p *Poller) SetExitNode(ctx context.Context, routerID, targetStableID strin
 			rv.State = store.RouterOK
 			rv.LastError = ""
 			rv.LastConfirmedAt = now
+			switch {
+			case !setting:
+				// Confirmed CLEAR (Direct): there is no egress to test, so drop any
+				// carried-forward result (docs/design/keep-egress.md).
+				rv.EgressOK = nil
+				rv.EgressDetail = ""
+				rv.EgressCheckedAt = time.Time{}
+			case egressRan:
+				// Confirmed SET with egress checking on: record the probe result.
+				rv.EgressOK = &egressOK
+				rv.EgressDetail = egressDet
+				rv.EgressCheckedAt = now
+			}
+			// (Confirmed SET with egress OFF: leave any carried-forward egress as-is.)
 		case hardFail:
 			// The apply did not take; nothing is pending. Reflect the device's
 			// ACTUAL, unchanged selection from the best-effort re-read. Surface the
@@ -581,6 +641,11 @@ func (p *Poller) buildRouterView(ctx context.Context, addr string, nodes []store
 		rv.CurrentExitNode = prevRV.CurrentExitNode
 		rv.Stats = prevRV.Stats
 		rv.LastConfirmedAt = prevRV.LastConfirmedAt
+		// Carry the egress probe result forward so it persists across polls (a poll
+		// never re-probes egress; only a confirmed SetExitNode sets it).
+		rv.EgressOK = prevRV.EgressOK
+		rv.EgressDetail = prevRV.EgressDetail
+		rv.EgressCheckedAt = prevRV.EgressCheckedAt
 	}
 
 	// Offline-skip: a node present in the netmap but reporting offline must NOT be
@@ -641,6 +706,10 @@ func (p *Poller) buildListedRouterView(addr string, nodes []store.NodeView, prev
 		rv.CurrentExitNode = prevRV.CurrentExitNode
 		rv.Stats = prevRV.Stats
 		rv.LastConfirmedAt = prevRV.LastConfirmedAt
+		// Carry the egress probe result forward too (set only by a confirmed set).
+		rv.EgressOK = prevRV.EgressOK
+		rv.EgressDetail = prevRV.EgressDetail
+		rv.EgressCheckedAt = prevRV.EgressCheckedAt
 	}
 	// Offline wins: never render a netmap-offline device as "not probed".
 	if foundInNetmap && !rv.Node.Online {

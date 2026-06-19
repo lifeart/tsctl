@@ -531,6 +531,45 @@ func TestHandleRouter(t *testing.T) {
 	}
 }
 
+// TestRouterViewDTO_Egress locks in the egress wire shape (docs/design/keep-egress.md):
+// egressOk is OMITTED when nil (not checked / Direct), and present (with detail +
+// rfc3339 checkedAt) when checked -- including a non-nil pointer to false (✗).
+func TestRouterViewDTO_Egress(t *testing.T) {
+	// nil EgressOK -> all three egress keys omitted.
+	nilJSON, err := json.Marshal(routerViewDTO(store.RouterView{State: store.RouterOK}))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, k := range []string{"egressOk", "egressDetail", "egressCheckedAt"} {
+		if strings.Contains(string(nilJSON), k) {
+			t.Errorf("egress key %q must be omitted when EgressOK is nil; got %s", k, nilJSON)
+		}
+	}
+
+	// EgressOK=&false (checked, failed) -> egressOk:false present, with detail + time.
+	bad := false
+	checked := time.Date(2026, 6, 19, 10, 0, 0, 0, time.UTC)
+	var got map[string]any
+	b, err := json.Marshal(routerViewDTO(store.RouterView{
+		State: store.RouterOK, EgressOK: &bad, EgressDetail: "timed out", EgressCheckedAt: checked,
+	}))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if v, ok := got["egressOk"]; !ok || v != false {
+		t.Errorf("egressOk = %v (present=%v), want false present", v, ok)
+	}
+	if got["egressDetail"] != "timed out" {
+		t.Errorf("egressDetail = %v, want %q", got["egressDetail"], "timed out")
+	}
+	if got["egressCheckedAt"] != "2026-06-19T10:00:00Z" {
+		t.Errorf("egressCheckedAt = %v, want rfc3339 UTC", got["egressCheckedAt"])
+	}
+}
+
 func TestHandleSetExitNode_OK(t *testing.T) {
 	fc := &fakeController{rv: store.RouterView{
 		Node:  store.NodeView{StableID: "r1"},
