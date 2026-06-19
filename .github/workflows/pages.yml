@@ -35,6 +35,7 @@ jobs:
           # The SPA itself, copied verbatim (never modified for the demo).
           cp web/app.js _site/app.js
           cp web/style.css _site/style.css
+          cp web/favicon.svg _site/favicon.svg
           # The demo entry point + the client-side mock backend.
           cp demo/index.html _site/index.html
           cp demo/mock.js _site/mock.js
