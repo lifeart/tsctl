@@ -267,6 +267,70 @@ func TestFallback_FailedSetStatePersistsAcrossPoll(t *testing.T) {
 	}
 }
 
+// blockStatusRC blocks in Status until released, so a test can hold a poll mid-dial
+// while doing other work; SetExitNode returns immediately.
+type blockStatusRC struct {
+	entered chan string
+	release chan struct{}
+	setRT   store.RouterRuntime
+}
+
+func (f *blockStatusRC) Status(ctx context.Context, addr string) (store.RouterRuntime, error) {
+	f.entered <- addr
+	<-f.release
+	return store.RouterRuntime{Online: true}, nil // a STALE read: device on Direct
+}
+func (f *blockStatusRC) SetExitNode(ctx context.Context, addr string, target, prev *store.ExitNodeRef) (store.RouterRuntime, error) {
+	return f.setRT, nil
+}
+func (f *blockStatusRC) Probe(ctx context.Context, addr string) (string, error) { return "", nil }
+
+func TestRefresh_SlowStatusDoesNotBlockSetExitNodeNorClobberIt(t *testing.T) {
+	// L-3: the poll's slow Status dials must NOT hold mu, so SetExitNode can proceed
+	// while a poll is mid-dial; and the poll's stale read must NOT clobber the set.
+	const routerIP, exitIP = "100.64.0.10", "100.64.0.20"
+	st := store.New()
+	seedSnapshot(st, routerIP, exitIP, true, true)
+	rc := &blockStatusRC{
+		entered: make(chan string, 1),
+		release: make(chan struct{}),
+		setRT:   store.RouterRuntime{Online: true, Current: &store.ExitNodeRef{StableID: "exit1", IP: exitIP}},
+	}
+	nm := &fakeNM{nodes: []store.NodeView{
+		{StableID: "router1", TailscaleIPs: []string{routerIP}, Online: true, Type: store.NodeRouter},
+		{StableID: "exit1", TailscaleIPs: []string{exitIP}, Online: true, ExitNodeOption: true, Type: store.NodeExitNode},
+	}}
+	p := New(st, nm, rc, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+
+	// Start a poll; it blocks inside Status(router1) — holding NO mu.
+	pollDone := make(chan error, 1)
+	go func() { pollDone <- p.Refresh(context.Background()) }()
+	<-rc.entered
+
+	// SetExitNode must complete WITHOUT waiting for the blocked poll (proves mu is
+	// not held during the slow dial).
+	setDone := make(chan error, 1)
+	go func() { _, err := p.SetExitNode(context.Background(), "router1", "exit1"); setDone <- err }()
+	select {
+	case err := <-setDone:
+		if err != nil {
+			t.Fatalf("SetExitNode: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("SetExitNode blocked while a poll was mid-Status — mu held during slow I/O (L-3 not fixed)")
+	}
+
+	// Release the poll; its stale Status (Direct) must NOT overwrite the set (exit1).
+	close(rc.release)
+	if err := <-pollDone; err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	rv := findRouterViewByStableID(st.Load(), "router1")
+	if rv == nil || rv.CurrentExitNode == nil || rv.CurrentExitNode.IP != exitIP {
+		t.Errorf("poll clobbered the concurrent set: router1 = %+v, want current exit %q", rv, exitIP)
+	}
+}
+
 func TestAutoDiscover_ExcludesSelfFromManagedSet(t *testing.T) {
 	// A tsctl node double-tagged tag:router (+ IsSelf) must never be polled as a
 	// router -- the self-exclusion applies to the managed path, not just the fallback.

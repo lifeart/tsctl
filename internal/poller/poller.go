@@ -448,31 +448,29 @@ func (p *Poller) Probe(ctx context.Context, routerID string) (store.ProbeResult,
 // in Snapshot.NetmapErr); a snapshot is ALWAYS built and broadcast regardless.
 func (p *Poller) Refresh(ctx context.Context) error {
 	_, err, _ := p.group.Do("refresh", func() (any, error) {
-		// Hold mu across build (which Loads prev) AND the Store so the whole
-		// read-modify-write is atomic vs a concurrent SetExitNode (M3). The slow
-		// rc.SetExitNode network call in SetExitNode runs OUTSIDE mu, so it never
-		// blocks the poll loop for the dead-man's-switch window.
-		p.mu.Lock()
-		snap, invErr := p.build(ctx)
-		p.store.Store(snap)
-		// Broadcast UNDER mu so Store+Broadcast is atomic per writer: the hub's
-		// Broadcast is non-blocking (select+default), and this keeps the broadcast
-		// order equal to the store order (the hub coalesces to the latest, so an
-		// out-of-order older frame would otherwise win). Mirrors RefreshGroups.
-		p.bc.Broadcast(snap)
-		p.mu.Unlock()
-		return nil, invErr
+		return nil, p.refreshOnce(ctx)
 	})
 	return err
 }
 
-// build assembles a fresh immutable Snapshot. Inventory failure → NetmapErr +
-// keep last-good nodes; per-router failure → that RouterView unreachable +
-// LastError (never aborts the whole snapshot).
-func (p *Poller) build(ctx context.Context) (*store.Snapshot, error) {
+// refreshOnce does the SLOW poll work -- the netmap inventory and the per-router
+// SSH `tailscale status` dials -- WITHOUT holding mu, then takes mu only for a fast
+// merge + Store + Broadcast. This keeps a slow poll (many routers, or a hung SSH
+// up to the timeout) from blocking SetExitNode / RefreshGroups, which need mu only
+// briefly (L-3).
+//
+// Atomicity vs a concurrent SetExitNode (M3): we snapshot each router's setSeq
+// BEFORE the dials; at the locked merge, if a router's setSeq changed, a
+// SetExitNode ran for it during our now-stale dial, so we KEEP the currently
+// published view for that router instead of clobbering it with our stale read
+// (the same per-router sequence that guards the SetExitNode reconcile). Inventory
+// failure -> NetmapErr + keep last-good nodes; a per-router dial failure -> that
+// RouterView unreachable (never aborts the whole snapshot).
+func (p *Poller) refreshOnce(ctx context.Context) error {
 	now := time.Now()
 	prev := p.store.Load()
 
+	// SLOW (no mu): netmap inventory.
 	nodes, invErr := p.nm.Inventory(ctx)
 	netmapErr := ""
 	netmapAt := now
@@ -502,6 +500,17 @@ func (p *Poller) build(ctx context.Context) (*store.Snapshot, error) {
 			})
 		}
 	}
+
+	// Snapshot each router's setSeq BEFORE the slow dials, so the merge can detect a
+	// SetExitNode that intervened during them.
+	seqAt := make(map[string]uint64, len(addrs))
+	p.mu.Lock()
+	for _, addr := range addrs {
+		seqAt[addr] = p.setSeq[addr]
+	}
+	p.mu.Unlock()
+
+	// SLOW (no mu): per-router dials. Fallback routers are listed without dialing.
 	routers := make([]store.RouterView, 0, len(addrs))
 	for _, addr := range addrs {
 		if usedFallback {
@@ -511,14 +520,32 @@ func (p *Poller) build(ctx context.Context) (*store.Snapshot, error) {
 		}
 	}
 
-	return &store.Snapshot{
+	// FAST (mu): merge, then Store + Broadcast atomically. Broadcast is UNDER mu
+	// (the hub is non-blocking) so frame order == store order (RefreshGroups too).
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	cur := p.store.Load()
+	for i, addr := range addrs {
+		if p.setSeq[addr] != seqAt[addr] {
+			// A SetExitNode ran for this router while we were dialing: its reconcile
+			// owns the published state. Keep the current view; don't clobber it with
+			// our stale read.
+			if curRV := findRouterView(cur, addr); curRV != nil {
+				routers[i] = *curRV
+			}
+		}
+	}
+	snap := &store.Snapshot{
 		Nodes:     nodes,
 		Routers:   routers,
 		Groups:    buildGroupViews(p.groupList(), nodes),
 		NetmapAt:  netmapAt,
 		NetmapErr: netmapErr,
 		BuiltAt:   now,
-	}, invErr
+	}
+	p.store.Store(snap)
+	p.bc.Broadcast(snap)
+	return invErr
 }
 
 // buildRouterView resolves one configured router to a RouterView: match its IP in
