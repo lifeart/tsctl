@@ -150,8 +150,9 @@
     lastError: "ssh: handshake failed: host key mismatch for " + r5IP +
       " (tsctl can reach the device but cannot authenticate to control it)" };
   // Fallback-listed device: online but never auto-probed -> neutral "not probed"
-  // until a manual Test SSH or an exit-node set (it has no tag:router).
-  routers[r6IP] = { unprobed: true, cur: "", desired: "", rx: 0, tx: 0, hs: null, controlError: false, lastError: "", egressOk: null, egressDetail: "", egressCheckedAt: null };
+  // until a manual Test SSH or an exit-node set (it has no tag:router). It is
+  // ACTUALLY routing through frankfurt; a Test SSH resolves that (card + graph wire).
+  routers[r6IP] = { unprobed: true, cur: frankfurtIP, desired: "", rx: 0, tx: 0, hs: null, controlError: false, lastError: "", egressOk: null, egressDetail: "", egressCheckedAt: null };
 
   // Stage-2 explicit-Keep gate runtime (docs/design/keep-egress.md, -require-keep):
   //   awaitingKeep : a CONFIRMED set is applied but NOT kept yet (armed revert pending)
@@ -692,13 +693,20 @@
         checkedAt: checkedAt,
       }));
     }
-    // Healthy online router: SSH OK + a multi-line stats sample.
-    return delay(wait, json(200, {
-      ok: true,
-      durationMs: 110 + rnd(40),
-      output: probeOutput(node),
-      checkedAt: checkedAt,
-    }));
+    // Healthy online router: SSH OK + a multi-line stats sample. A successful probe
+    // also RESOLVES the device's exit node and lifts it out of "unprobed" (mirrors
+    // the backend's resolveAfterProbe) -- broadcast a fresh frame so the card + graph
+    // show real routing, not just the probe panel.
+    return delay(wait, null).then(function () {
+      rt.unprobed = false;
+      broadcast(buildSnapshot());
+      return json(200, {
+        ok: true,
+        durationMs: 110 + rnd(40),
+        output: probeOutput(node),
+        checkedAt: checkedAt,
+      });
+    });
   }
 
   // --- the explicit-Keep gate (stage 2, docs/design/keep-egress.md) -------

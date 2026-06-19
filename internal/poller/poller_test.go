@@ -563,6 +563,65 @@ func TestSetExitNode_ConcurrentSameRouterNoFalseConfirm(t *testing.T) {
 	}
 }
 
+func TestProbe_ResolvesExitNodeAndState(t *testing.T) {
+	// A manual Test SSH must not just prove connectivity -- it resolves the device's
+	// ACTUAL exit node and lifts it out of "unprobed" so the card + graph show real
+	// routing.
+	const piIP, exitIP = "100.64.0.30", "100.64.0.20"
+	st := store.New()
+	st.Store(&store.Snapshot{Routers: []store.RouterView{{
+		Node:  store.NodeView{StableID: "pi", TailscaleIPs: []string{piIP}, Online: true, Type: store.NodeGeneric},
+		State: store.RouterUnprobed,
+	}}})
+	bc := newFakeBC()
+	rc := &fakeRC{
+		probeOut: "Linux pi 5.15",
+		statusRT: store.RouterRuntime{Online: true, Current: &store.ExitNodeRef{StableID: "exit1", IP: exitIP}},
+	}
+	p := New(st, &fakeNM{}, rc, nil, nil, bc, make(chan int), time.Second, nopLogf)
+
+	res, err := p.Probe(context.Background(), "pi")
+	if err != nil || !res.OK {
+		t.Fatalf("probe: err=%v ok=%v", err, res.OK)
+	}
+	got := findRouterViewByStableID(st.Load(), "pi")
+	if got.State != store.RouterOK {
+		t.Errorf("after probe: state=%q, want ok (resolved out of unprobed)", got.State)
+	}
+	if got.CurrentExitNode == nil || got.CurrentExitNode.StableID != "exit1" {
+		t.Errorf("after probe: currentExitNode=%+v, want exit1", got.CurrentExitNode)
+	}
+	if rc.statusCallCount() == 0 {
+		t.Error("probe must resolve the exit node via a Status read")
+	}
+	bc.mu.Lock()
+	n := len(bc.snaps)
+	bc.mu.Unlock()
+	if n == 0 {
+		t.Error("probe must broadcast the resolved snapshot")
+	}
+}
+
+func TestProbe_StatusFailureKeepsConnectivityResult(t *testing.T) {
+	// If the exit-node resolve (Status) fails after a successful stats probe, the
+	// connectivity result still stands and the prior view is left untouched.
+	const piIP = "100.64.0.30"
+	st := store.New()
+	st.Store(&store.Snapshot{Routers: []store.RouterView{{
+		Node:  store.NodeView{StableID: "pi", TailscaleIPs: []string{piIP}, Online: true, Type: store.NodeGeneric},
+		State: store.RouterUnprobed,
+	}}})
+	rc := &fakeRC{probeOut: "Linux pi", statusErr: errors.New("status boom")}
+	p := New(st, &fakeNM{}, rc, nil, nil, newFakeBC(), make(chan int), time.Second, nopLogf)
+	res, err := p.Probe(context.Background(), "pi")
+	if err != nil || !res.OK {
+		t.Fatalf("probe should still succeed on connectivity: err=%v ok=%v", err, res.OK)
+	}
+	if got := findRouterViewByStableID(st.Load(), "pi").State; got != store.RouterUnprobed {
+		t.Errorf("a failed resolve must leave the view unchanged, got state=%q", got)
+	}
+}
+
 // keepRC returns a distinct marker per ApplyExitNode and records every
 // KeepExitNode marker, so a test can assert the supersede-disarm (Finding A).
 type keepRC struct {

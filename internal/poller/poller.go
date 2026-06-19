@@ -726,7 +726,56 @@ func (p *Poller) Probe(ctx context.Context, routerID string) (store.ProbeResult,
 		// surfaced in Error -- never swallowed, never a returned Go error.
 		return store.ProbeResult{OK: false, Error: err.Error(), DurationMs: dur, CheckedAt: time.Now()}, nil
 	}
+	// The probe proved contact -- RESOLVE the device's actual exit-node selection so
+	// a manual Test SSH also lifts the card out of "not probed / exit node unknown"
+	// and shows real routing (this is what the operator expects after a green probe).
+	// Best-effort: a Status failure leaves the successful connectivity result intact.
+	p.resolveAfterProbe(ctx, addr)
 	return store.ProbeResult{OK: true, Output: out, DurationMs: dur, CheckedAt: time.Now()}, nil
+}
+
+// resolveAfterProbe reads the router's current exit node (Status) and merges it
+// into the published snapshot, transitioning a never-contacted device to its real
+// state (ok / Direct). It is a manual single-device action (no probe storm) but it
+// WRITES the snapshot, so it takes the SAME setGen guard as a poll: if a
+// SetExitNode/Keep touched this router during the (slow, unlocked) Status dial,
+// that op owns the state and we skip. A live awaiting-keep gate likewise owns the
+// router. On publish it bumps setGen so a concurrent poll's stale (carried-forward)
+// merge keeps this resolved view instead of clobbering it back to "unprobed".
+func (p *Poller) resolveAfterProbe(ctx context.Context, addr string) {
+	p.mu.Lock()
+	if _, hasKeep := p.pendingKeep[addr]; hasKeep {
+		p.mu.Unlock()
+		return
+	}
+	genAt := p.setGen[addr]
+	p.mu.Unlock()
+
+	rt, err := p.rc.Status(ctx, addr) // slow: OUTSIDE mu
+	if err != nil {
+		return
+	}
+
+	var published *store.Snapshot
+	p.mu.Lock()
+	if _, hasKeep := p.pendingKeep[addr]; p.setGen[addr] == genAt && !hasKeep {
+		if final, ok := p.withRouter(addr, func(rv *store.RouterView) {
+			rv.Reachable = true
+			rv.CurrentExitNode = rt.Current
+			rv.Stats = rt.Stats
+			rv.LastError = ""
+			rv.LastConfirmedAt = time.Now()
+			reconcileState(rv)
+		}); ok {
+			p.setGen[addr]++ // protect this publish from a concurrent poll's stale merge
+			p.store.Store(final)
+			published = final
+		}
+	}
+	p.mu.Unlock()
+	if published != nil {
+		p.bc.Broadcast(published)
+	}
 }
 
 // Refresh builds one fresh Snapshot (inventory + per-router status), stores it,
