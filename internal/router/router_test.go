@@ -278,6 +278,114 @@ func TestSetExitNode_FailedConfirmNoKeep(t *testing.T) {
 	}
 }
 
+// TestApplyExitNode_DeferredKeepReturnsMarkerNoKeepCmd proves the explicit-Keep
+// split (docs/design/keep-egress.md stage 2): autoKeep=false runs arm→apply→confirm
+// and returns the keep-marker WITHOUT issuing the keep command, so the armed revert
+// is still pending until KeepExitNode is called.
+func TestApplyExitNode_DeferredKeepReturnsMarkerNoKeepCmd(t *testing.T) {
+	const marker = "/tmp/tsctl-keep-test-apply"
+	f := &fakeRunner{respond: statusRespondingWith(readFixture(t, "status_exit_set.json"))}
+	c := newFakeClient(f, marker)
+
+	target := &store.ExitNodeRef{StableID: "n-exit-de", Name: "exit-de", IP: "100.64.0.5"}
+	rt, gotMarker, err := c.ApplyExitNode(context.Background(), "100.64.0.1", target, nil, false)
+	if err != nil {
+		t.Fatalf("ApplyExitNode: %v", err)
+	}
+	if rt.Current == nil || rt.Current.IP != "100.64.0.5" {
+		t.Errorf("confirmed Current = %v, want IP 100.64.0.5", rt.Current)
+	}
+	if gotMarker != marker {
+		t.Errorf("returned marker = %q, want %q (caller must Keep it)", gotMarker, marker)
+	}
+	// arm, apply, status -- and crucially NO keep command (it is deferred).
+	want := []string{
+		"nohup sh -c 'sleep 60; [ -f /tmp/tsctl-keep-test-apply ] && exit 0; tailscale set --exit-node=' >/dev/null 2>&1 &",
+		"tailscale set --exit-node=100.64.0.5",
+		"tailscale status --json",
+	}
+	if got := f.cmds(); !eqStrings(got, want) {
+		t.Errorf("command sequence mismatch:\n got: %#v\nwant: %#v", got, want)
+	}
+	for _, cmd := range f.cmds() {
+		if cmd == keepCmd(marker) {
+			t.Errorf("autoKeep=false must NOT issue the keep command %q", cmd)
+		}
+	}
+}
+
+// TestApplyExitNode_AutoKeepWritesMarker proves autoKeep=true preserves v1: the keep
+// command IS issued inline and marker=="" is returned (nothing for the caller to do).
+func TestApplyExitNode_AutoKeepWritesMarker(t *testing.T) {
+	const marker = "/tmp/tsctl-keep-test-auto"
+	f := &fakeRunner{respond: statusRespondingWith(readFixture(t, "status_exit_set.json"))}
+	c := newFakeClient(f, marker)
+
+	target := &store.ExitNodeRef{StableID: "n-exit-de", Name: "exit-de", IP: "100.64.0.5"}
+	_, gotMarker, err := c.ApplyExitNode(context.Background(), "100.64.0.1", target, nil, true)
+	if err != nil {
+		t.Fatalf("ApplyExitNode: %v", err)
+	}
+	if gotMarker != "" {
+		t.Errorf("autoKeep marker = %q, want empty (kept inline)", gotMarker)
+	}
+	want := []string{
+		"nohup sh -c 'sleep 60; [ -f /tmp/tsctl-keep-test-auto ] && exit 0; tailscale set --exit-node=' >/dev/null 2>&1 &",
+		"tailscale set --exit-node=100.64.0.5",
+		"tailscale status --json",
+		": > /tmp/tsctl-keep-test-auto",
+	}
+	if got := f.cmds(); !eqStrings(got, want) {
+		t.Errorf("command sequence mismatch:\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+// TestKeepExitNode runs the keep command for a deferred marker; a non-zero exit is a
+// *CommandError carrying stderr.
+func TestKeepExitNode(t *testing.T) {
+	const marker = "/tmp/tsctl-keep-test-keep"
+
+	t.Run("success issues keepCmd", func(t *testing.T) {
+		f := &fakeRunner{}
+		c := newFakeClient(f, marker)
+		if err := c.KeepExitNode(context.Background(), "100.64.0.1", marker); err != nil {
+			t.Fatalf("KeepExitNode: %v", err)
+		}
+		if got := f.cmds(); !eqStrings(got, []string{keepCmd(marker)}) {
+			t.Errorf("commands = %v, want [%q]", got, keepCmd(marker))
+		}
+		if f.calls[0].addr != "100.64.0.1" {
+			t.Errorf("addr = %q, want 100.64.0.1", f.calls[0].addr)
+		}
+	})
+
+	t.Run("non-zero exit is a CommandError", func(t *testing.T) {
+		f := &fakeRunner{respond: func(cmd string) ([]byte, []byte, int, error) {
+			return nil, []byte("  read-only file system\n"), 1, nil
+		}}
+		c := newFakeClient(f, marker)
+		err := c.KeepExitNode(context.Background(), "100.64.0.1", marker)
+		if err == nil {
+			t.Fatal("expected an error on a non-zero keep exit")
+		}
+		var ce *CommandError
+		if !errors.As(err, &ce) {
+			t.Fatalf("expected a *CommandError, got %T: %v", err, err)
+		}
+		if ce.Stderr() != "read-only file system" {
+			t.Errorf("stderr = %q, want trimmed", ce.Stderr())
+		}
+	})
+}
+
+func TestRevertWindowMatchesArmCmd(t *testing.T) {
+	// The exported RevertWindow (used by the poller for RevertAt) must equal armCmd's
+	// sleep, or the UI countdown would disagree with the router's actual revert.
+	if RevertWindow != revertWindowSeconds*time.Second {
+		t.Errorf("RevertWindow = %v, want %v", RevertWindow, revertWindowSeconds*time.Second)
+	}
+}
+
 func TestSetExitNode_RejectsInjection(t *testing.T) {
 	f := &fakeRunner{respond: statusRespondingWith(readFixture(t, "status_no_exit.json"))}
 	c := newFakeClient(f, "/tmp/tsctl-keep-test-4")

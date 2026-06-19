@@ -174,14 +174,22 @@ func (f *fakeRouterClient) Status(ctx context.Context, addr string) (store.Route
 	return f.status, f.statusErr
 }
 
-func (f *fakeRouterClient) SetExitNode(ctx context.Context, addr string, target, prev *store.ExitNodeRef) (store.RouterRuntime, error) {
+func (f *fakeRouterClient) ApplyExitNode(ctx context.Context, addr string, target, prev *store.ExitNodeRef, autoKeep bool) (store.RouterRuntime, string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.setCalls++
 	f.lastSetAddr = addr
 	f.lastSetTarget = target
 	f.lastSetPrev = prev
-	return f.setResult, f.setErr
+	// The flow runs with -require-keep OFF (no ConfigureKeep), so autoKeep is always
+	// true here and no marker is deferred.
+	return f.setResult, "", f.setErr
+}
+
+func (f *fakeRouterClient) KeepExitNode(ctx context.Context, addr, marker string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return nil
 }
 
 func (f *fakeRouterClient) Probe(ctx context.Context, addr string) (string, error) {

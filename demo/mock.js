@@ -16,10 +16,15 @@
 //   DELETE /api/groups/{id}                -> 204 | 404
 //   POST   /api/routers/{id}/exit-node     -> scripted ok / unconfirmed / broken /
 //                                             zone-enforcement reject / clear. A
-//                                             CONFIRMED set adds internet-egress
-//                                             fields to the RouterView (egressOk/
-//                                             egressDetail/egressCheckedAt; stage-1
-//                                             keep-egress — office-router reports ✗).
+//                                             CONFIRMED normal set adds internet-egress
+//                                             fields (egressOk/egressDetail/
+//                                             egressCheckedAt; stage-1 keep-egress —
+//                                             office-router reports ✗) and, in
+//                                             -require-keep mode, enters state
+//                                             "awaiting-keep" + revertAt (stage 2).
+//   POST   /api/routers/{id}/keep          -> stage-2 explicit-Keep gate: 200 kept
+//                                             (state ok) | 409 window elapsed (router
+//                                             auto-reverts) / nothing awaiting | 404
 //   POST   /api/routers/{id}/probe         -> SSH probe: 200 {ok,durationMs,output|
 //                                             error,checkedAt} (online OK / control-
 //                                             error / offline) | 404 unknown id
@@ -39,6 +44,13 @@
   var PROBE_VAR_MS = 300;  // + up to this much jitter (~600-900ms total)
   var OPEN_MS = 120;       // EventSource "connect" delay (well under the 8s watchdog)
   var TICK_MS = 3000;      // SSE frame cadence + world time-variation
+
+  // Stage-2 explicit-Keep gate (docs/design/keep-egress.md). The demo runs in
+  // -require-keep mode: a CONFIRMED normal set enters "awaiting-keep" with a short
+  // revert window, so the gate + live countdown + Keep button are demoable (and the
+  // auto-revert fires if the operator never Keeps).
+  var REQUIRE_KEEP = true;     // run the demo as if started with -require-keep
+  var KEEP_WINDOW_MS = 35000;  // revert window: long enough to read + Keep, short to demo
 
   // -------------------------------------------------- fixture addresses ----
   // Mirrors internal/demo/demo.go (plus one extra "control error" router).
@@ -141,6 +153,16 @@
   // until a manual Test SSH or an exit-node set (it has no tag:router).
   routers[r6IP] = { unprobed: true, cur: "", desired: "", rx: 0, tx: 0, hs: null, controlError: false, lastError: "", egressOk: null, egressDetail: "", egressCheckedAt: null };
 
+  // Stage-2 explicit-Keep gate runtime (docs/design/keep-egress.md, -require-keep):
+  //   awaitingKeep : a CONFIRMED set is applied but NOT kept yet (armed revert pending)
+  //   revertAt     : Date the armed revert fires (null = none)
+  //   prevExit     : exit-node IP to auto-revert to if not kept in time ("" = Direct)
+  Object.keys(routers).forEach(function (ip) {
+    routers[ip].awaitingKeep = false;
+    routers[ip].revertAt = null;
+    routers[ip].prevExit = "";
+  });
+
   // Designated "no internet egress" router for the demo (office-router): after a
   // CONFIRMED set to an exit node it reaches the device but can't fetch the captive-
   // portal probe through the exit node, so egressOk:false with a realistic detail.
@@ -160,6 +182,21 @@
     rt.egressOk = null;
     rt.egressDetail = "";
     rt.egressCheckedAt = null;
+  }
+
+  // Auto-revert an awaiting-keep router to its previous exit node (the dead-man's-
+  // switch firing). A revert is NOT a deliberate set, so it clears the keep arming
+  // and the egress probe; the router settles back to a clean "ok" on the prev node.
+  function revertAwaitingKeep(rt) {
+    rt.cur = rt.prevExit || "";
+    rt.desired = "";
+    rt.awaitingKeep = false;
+    rt.revertAt = null;
+    rt.prevExit = "";
+    rt.lastError = "";
+    clearEgress(rt);
+    if (rt.cur) { rt.rx = 96000; rt.tx = 24000; rt.hs = new Date(); }
+    else { rt.rx = 0; rt.tx = 0; rt.hs = null; }
   }
 
   // ---------------------------------------------------- in-memory zones ----
@@ -265,6 +302,23 @@
       rv.lastError = rt.lastError || ("dial " + ip + ":22: connect: host is down (demo: router offline)");
       return rv;
     }
+    // Stage-2 explicit-Keep gate (docs/design/keep-egress.md, -require-keep): the set
+    // is applied + confirmed (cur = target) but NOT kept — the armed revert fires at
+    // revertAt unless the operator Keeps. Carries revertAt + still reports egress.
+    // Explicitly NOT "ok" (success is only after Keep).
+    if (rt.awaitingKeep) {
+      rv.state = "awaiting-keep";
+      rv.desired = null;
+      rv.lastError = "";
+      rv.lastConfirmedAt = rfc3339(rt.egressCheckedAt || new Date());
+      rv.revertAt = rfc3339(rt.revertAt);
+      if (rt.cur && rt.egressOk != null) {
+        rv.egressOk = rt.egressOk;
+        rv.egressDetail = rt.egressDetail || "";
+        rv.egressCheckedAt = rfc3339(rt.egressCheckedAt);
+      }
+      return rv;
+    }
     // Reachable: derive state from cur vs desired (never optimistic).
     if (rt.desired && rt.desired !== rt.cur) {
       rv.state = "unconfirmed";
@@ -347,6 +401,16 @@
   function rnd(n) { return Math.floor(Math.random() * n); }
   function tick() {
     var now = new Date();
+    // Stage-2 keep gate (docs/design/keep-egress.md): any router whose revert window
+    // has elapsed without a Keep auto-reverts to its previous exit node on this tick
+    // — the demo's dead-man's-switch firing (mirrors the poller clearing a stale
+    // pending-keep entry on the next poll). The fresh frame shows the reverted "ok".
+    ROUTER_IPS.forEach(function (ip) {
+      var rt = routers[ip];
+      if (rt.awaitingKeep && rt.revertAt && now.getTime() > new Date(rt.revertAt).getTime()) {
+        revertAwaitingKeep(rt);
+      }
+    });
     // Stats climb only when the current exit node is ONLINE and the router is
     // reachable (a router pointed at an offline exit keeps a stale handshake).
     ROUTER_IPS.forEach(function (ip) {
@@ -546,6 +610,9 @@
       // A set CONTACTS the device, so it's no longer "unprobed" — mirrors the real
       // backend, where SetExitNode reconciles a fallback device to a real state.
       rt.unprobed = false;
+      // A new set supersedes any prior pending-keep arming (setSeq-bump analog): the
+      // newer op owns the router. The normal-target branch below re-arms when needed.
+      rt.awaitingKeep = false; rt.revertAt = null; rt.prevExit = "";
       var resp;
       if (!targetID) {
         // Clear -> confirmed Direct. No egress probe on a clear.
@@ -570,9 +637,17 @@
         // Normal target -> confirmed. Egress probe runs after CONFIRM (keep-egress
         // stage 1): office-router reports ✗ no egress, every other router ✓ OK.
         var t2 = nodeByID(targetID);
+        var prevExit = rt.cur;                 // remembered so the auto-revert can restore it
         rt.cur = primaryIPv4(t2.ips); rt.desired = ""; rt.rx = 96000; rt.tx = 24000;
         rt.hs = new Date(); rt.lastError = "";
         setEgress(rt, ip);
+        if (REQUIRE_KEEP) {
+          // Stage 2 (-require-keep): confirmed but NOT kept — arm the dead-man's-switch.
+          // The router reverts to prevExit at revertAt unless the operator Keeps.
+          rt.awaitingKeep = true;
+          rt.prevExit = prevExit;
+          rt.revertAt = new Date(Date.now() + KEEP_WINDOW_MS);
+        }
         resp = json(200, routerViewDTO(ip));
       }
       broadcast(buildSnapshot());
@@ -624,6 +699,44 @@
       output: probeOutput(node),
       checkedAt: checkedAt,
     }));
+  }
+
+  // --- the explicit-Keep gate (stage 2, docs/design/keep-egress.md) -------
+  // POST /api/routers/{id}/keep: confirm an awaiting-keep selection (write the keep
+  // marker / cancel the armed revert). Mirrors the backend contract:
+  //   200 RouterView (kept -> state "ok") | 404 unknown id |
+  //   409 if the window elapsed / nothing is awaiting a keep. On an elapsed window
+  //   the router auto-reverts to its previous exit node (so the revert is demoable).
+  function keepRouter(routerID) {
+    var node = nodeByID(routerID);
+    if (!node || !node.ips.length || ROUTER_IPS.indexOf(node.ips[0]) === -1) {
+      return delay(PREFLIGHT_MS, json(404, errBody('unknown router "' + routerID + '"', "", "")));
+    }
+    var ip = node.ips[0];
+    var rt = routers[ip];
+    // Nothing awaiting a keep (already kept / never armed / superseded) -> 409.
+    if (!rt.awaitingKeep) {
+      return delay(PREFLIGHT_MS, json(409, errBody("nothing to keep",
+        "this router is not awaiting a keep (already kept, superseded, or never armed)", "")));
+    }
+    // Window elapsed -> the router has reverted; surface 409 and perform the revert so
+    // the demo visibly shows the auto-revert on the next frame.
+    if (rt.revertAt && Date.now() > new Date(rt.revertAt).getTime()) {
+      return delay(PREFLIGHT_MS, null).then(function () {
+        revertAwaitingKeep(rt);
+        broadcast(buildSnapshot());
+        return json(409, errBody("revert window elapsed",
+          "the revert window elapsed; the router has reverted to its previous exit node", ""));
+      });
+    }
+    // Keep: cancel the armed revert and settle to a confirmed "ok" on the kept node.
+    return delay(PREFLIGHT_MS, null).then(function () {
+      rt.awaitingKeep = false;
+      rt.revertAt = null;
+      rt.prevExit = "";
+      broadcast(buildSnapshot());
+      return json(200, routerViewDTO(ip));
+    });
   }
 
   // --- router table -------------------------------------------------------
@@ -699,6 +812,12 @@
     var pm = path.match(/^\/api\/routers\/([^/]+)\/probe$/);
     if (pm && method === "POST") {
       return probeRouter(decodeURIComponent(pm[1]));
+    }
+
+    // Explicit-Keep gate (stage 2): confirm an awaiting-keep selection.
+    var km = path.match(/^\/api\/routers\/([^/]+)\/keep$/);
+    if (km && method === "POST") {
+      return keepRouter(decodeURIComponent(km[1]));
     }
 
     // Any other /api/ path: 404 (mirrors the backend's unknown-route behavior).

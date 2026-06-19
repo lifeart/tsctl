@@ -35,6 +35,10 @@ type fakeController struct {
 	gotRouterID string
 	gotTarget   string
 
+	keepRV    store.RouterView
+	keepErr   error
+	gotKeepID string
+
 	probeRes   store.ProbeResult
 	probeErr   error
 	gotProbeID string
@@ -46,6 +50,11 @@ func (f *fakeController) SetExitNode(ctx context.Context, routerID, targetStable
 	f.gotRouterID = routerID
 	f.gotTarget = targetStableID
 	return f.rv, f.err
+}
+
+func (f *fakeController) Keep(ctx context.Context, routerID string) (store.RouterView, error) {
+	f.gotKeepID = routerID
+	return f.keepRV, f.keepErr
 }
 
 func (f *fakeController) Probe(ctx context.Context, routerID string) (store.ProbeResult, error) {
@@ -619,6 +628,120 @@ func TestHandleSetExitNode_GenericErrorIs502(t *testing.T) {
 	a.handleSetExitNode(rec, req)
 	if rec.Code != http.StatusBadGateway {
 		t.Errorf("code = %d want 502", rec.Code)
+	}
+}
+
+// TestRouterViewDTO_RevertAt locks in the awaiting-keep wire shape: revertAt is
+// OMITTED when zero and present (rfc3339 UTC) when set, and state flows as the
+// "awaiting-keep" string (docs/design/keep-egress.md stage 2).
+func TestRouterViewDTO_RevertAt(t *testing.T) {
+	// Zero RevertAt -> key omitted.
+	zeroJSON, err := json.Marshal(routerViewDTO(store.RouterView{State: store.RouterOK}))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(zeroJSON), "revertAt") {
+		t.Errorf("revertAt must be omitted when zero; got %s", zeroJSON)
+	}
+
+	// awaiting-keep with a RevertAt -> state + revertAt present.
+	at := time.Date(2026, 6, 19, 10, 0, 0, 0, time.UTC)
+	var got map[string]any
+	b, err := json.Marshal(routerViewDTO(store.RouterView{State: store.RouterAwaitingKeep, RevertAt: at}))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got["state"] != "awaiting-keep" {
+		t.Errorf("state = %v, want awaiting-keep", got["state"])
+	}
+	if got["revertAt"] != "2026-06-19T10:00:00Z" {
+		t.Errorf("revertAt = %v, want rfc3339 UTC", got["revertAt"])
+	}
+}
+
+func TestHandleKeep_OK(t *testing.T) {
+	fc := &fakeController{keepRV: store.RouterView{
+		Node:  store.NodeView{StableID: "r1"},
+		State: store.RouterOK, Reachable: true,
+	}}
+	a := New(store.New(), fakeWhoIs{login: "alice"}, fc, Config{Owner: "alice"})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/routers/r1/keep", nil)
+	req.SetPathValue("id", "r1")
+	a.handleKeep(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d body=%s", rec.Code, rec.Body)
+	}
+	if fc.gotKeepID != "r1" {
+		t.Errorf("controller keep called with %q, want r1", fc.gotKeepID)
+	}
+	var got map[string]any
+	json.Unmarshal(rec.Body.Bytes(), &got)
+	if got["state"] != "ok" {
+		t.Errorf("state = %v, want ok", got["state"])
+	}
+}
+
+func TestHandleKeep_ErrorStatuses(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"no/elapsed/superseded pending -> 409", &ctrlErr{status: 409, msg: "the revert window elapsed; the router has reverted"}, 409},
+		{"unknown router -> 404", &ctrlErr{status: 404, msg: `unknown router "ghost"`}, 404},
+		{"router command failed -> 502", &ctrlErr{status: 502, msg: "router command failed", det: "disk full", serr: "disk full"}, 502},
+		{"generic error -> 502", errors.New("plain failure"), 502},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fc := &fakeController{keepErr: tc.err}
+			a := New(store.New(), fakeWhoIs{login: "alice"}, fc, Config{Owner: "alice"})
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/api/routers/r1/keep", nil)
+			req.SetPathValue("id", "r1")
+			a.handleKeep(rec, req)
+			if rec.Code != tc.want {
+				t.Fatalf("code = %d want %d body=%s", rec.Code, tc.want, rec.Body)
+			}
+			var got map[string]string
+			json.Unmarshal(rec.Body.Bytes(), &got)
+			if got["error"] == "" {
+				t.Errorf("error body must carry a message, got %v", got)
+			}
+		})
+	}
+}
+
+// TestRoutes_KeepSecurity proves POST /keep runs through the SAME middleware as
+// exit-node: missing CSRF -> 403, valid owner+CSRF+Host -> 200.
+func TestRoutes_KeepSecurity(t *testing.T) {
+	const host = "tsctl"
+	fc := &fakeController{keepRV: store.RouterView{Node: store.NodeView{StableID: "r1"}, State: store.RouterOK}}
+	a := New(store.New(), fakeWhoIs{login: "alice"}, fc, Config{Owner: "alice", AllowedHosts: []string{host}})
+	h := a.Routes()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/routers/r1/keep", nil)
+	req.Host = host
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("keep missing CSRF = %d want 403", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/routers/r1/keep", nil)
+	req.Host = host
+	req.Header.Set("X-Tsctl-CSRF", "tok")
+	req.AddCookie(&http.Cookie{Name: "tsctl_csrf", Value: "tok"})
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("valid keep = %d want 200 body=%s", rec.Code, rec.Body)
+	}
+	if fc.gotKeepID != "r1" {
+		t.Errorf("controller kept %q, want r1", fc.gotKeepID)
 	}
 }
 

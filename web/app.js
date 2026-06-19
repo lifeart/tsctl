@@ -43,6 +43,8 @@
     sessionActive: false, // signed in via password → show the "Sign out" affordance
     busyRouters: {},   // stableID -> true while a POST is in flight
     busyTarget: {},    // stableID -> the value picked while busy
+    keepBusy: {},      // stableID -> true while a POST /keep (Keep button) is in flight
+    keepErrors: {},    // stableID -> inline message for a failed Keep (network error)
     actionErrors: {},  // stableID -> {error, detail, stderr}
     pendingSince: {},  // stableID -> ms when the pending/applying began (countdown)
     probes: {},        // stableID -> {busy} | {data:{ok,durationMs,output|error,checkedAt}} | {netError} (transient SSH-probe result; not from the snapshot)
@@ -407,6 +409,19 @@
     // updateRouterCard only when the backend actually probed egress after a set.
     var egress = el("div", "egress-line hidden");
 
+    // explicit-Keep gate (stage 2, docs/design/keep-egress.md): shown only when the
+    // backend reports state "awaiting-keep" — a CONFIRMED selection inside the revert
+    // window that has NOT been kept yet. It carries a live countdown to revertAt and a
+    // prominent Keep button; not keeping in time auto-reverts (dead-man's-switch).
+    var keepGate = el("div", "keep-gate hidden");
+    var keepNote = el("div", "keep-note");
+    var keepBtn = el("button", "keep-btn", "Keep");
+    keepBtn.type = "button";
+    var keepErr = el("div", "keep-err hidden");
+    keepGate.appendChild(keepNote);
+    keepGate.appendChild(keepBtn);
+    keepGate.appendChild(keepErr);
+
     var warn = el("div", "router-warn hidden");
     warn.appendChild(warnIcon());
     var warnText = el("span", "warn-text");
@@ -444,6 +459,7 @@
     root.appendChild(ips);
     root.appendChild(currentLine);
     root.appendChild(egress);
+    root.appendChild(keepGate);
     root.appendChild(warn);
     root.appendChild(offlineNote);
     root.appendChild(picker);
@@ -455,10 +471,12 @@
 
     select.addEventListener("change", function () { onSelectChange(sid, select); });
     probeBtn.addEventListener("click", function () { onProbe(sid); });
+    keepBtn.addEventListener("click", function () { onKeep(sid); });
 
     return {
       root: root, dot: dot, name: name, stateBadge: stateBadge, ips: ips,
       currentLine: currentLine, currentText: currentText, egress: egress, warn: warn, warnText: warnText,
+      keepGate: keepGate, keepNote: keepNote, keepBtn: keepBtn, keepErr: keepErr,
       offlineNote: offlineNote, picker: picker, pickerHint: pickerHint, select: select, pending: pending,
       stats: stats, errBox: errBox, probeBtn: probeBtn, probeResult: probeResult, optionsSig: null,
     };
@@ -469,6 +487,7 @@
       ok: ["connected", "state-ok"],
       pending: ["applying", "state-pending"],
       unconfirmed: ["unconfirmed", "state-unconfirmed"],
+      "awaiting-keep": ["awaiting keep", "state-awaiting-keep"],
       unreachable: ["offline", "state-unreachable"],
     };
     var m = map[st] || [String(st || "?"), "state-unknown"];
@@ -490,6 +509,20 @@
     var rem = REVERT_WINDOW - Math.floor((Date.now() - since) / 1000);
     if (rem < 0) rem = 0;
     return " — auto-reverts in ~" + rem + "s if not confirmed";
+  }
+
+  // Seconds left until the armed revert (rv.revertAt) fires, recomputed live from
+  // the RFC3339 deadline (never a value frozen across SSE frames). null = no/invalid
+  // deadline; 0 = elapsed (the next SSE frame will show the reverted state).
+  function revertRemaining(rv) {
+    var t = parseTime(rv && rv.revertAt);
+    if (!t) return null;
+    var rem = Math.ceil((t.getTime() - Date.now()) / 1000);
+    return rem > 0 ? rem : 0;
+  }
+  function fmtMSS(secs) {
+    var m = Math.floor(secs / 60), s = secs % 60;
+    return m + ":" + (s < 10 ? "0" : "") + s;
   }
 
   // approved exit-node options for one router: Direct + approved nodes, minus
@@ -570,7 +603,10 @@
       // picker enabled so the user can set an exit node on demand (that's what
       // contacts it). Genuinely offline/unreachable devices stay disabled.
       var unprobed = (rv.state || "") === "unprobed";
-      disabled = !reachable && !unprobed;
+      // awaiting-keep: the selection is applied + confirmed but not kept yet. Show the
+      // applied target but keep the picker DISABLED (mirror the pending disable) — the
+      // operator must Keep or let it auto-revert before changing it again.
+      disabled = (!reachable && !unprobed) || st === "awaiting-keep";
     }
     ensureOption(sel, val);
     if (sel.value !== (val == null ? "" : val)) sel.value = val == null ? "" : val;
@@ -630,6 +666,11 @@
     // probes egress only after a confirmed SET to an exit node, so egressOk is
     // present (true/false) only then; absent/null (Direct / not probed) -> no line.
     renderEgress(rec, rv);
+
+    // explicit-Keep gate (stage 2): renders the live countdown + Keep button only
+    // while state === "awaiting-keep"; hidden (and any stale inline error cleared)
+    // otherwise.
+    renderKeepGate(rec, rv);
 
     // offline note — unprobed (neutral) vs control-error vs genuine-offline wording.
     if (unprobed) {
@@ -745,6 +786,57 @@
     if (!ok && rv.egressDetail) box.appendChild(el("div", "egress-detail", String(rv.egressDetail)));
     if (rv.egressCheckedAt && parseTime(rv.egressCheckedAt)) {
       box.appendChild(el("div", "egress-when", "Checked " + relTime(rv.egressCheckedAt)));
+    }
+  }
+
+  // explicit-Keep gate (stage 2 of docs/design/keep-egress.md). When the backend
+  // reports state "awaiting-keep" (a CONFIRMED selection inside the revert window,
+  // NOT yet kept — explicitly NOT success), show a live countdown to rv.revertAt and
+  // a prominent Keep button. The countdown is recomputed from revertAt on every 1s
+  // render tick (never a frozen value); at 0 it shows "Reverting…" and the next SSE
+  // frame settles to the reverted state.
+  function renderKeepGate(rec, rv) {
+    var sid = rv.node && rv.node.stableID;
+    if ((rv.state || "") !== "awaiting-keep") {
+      rec.keepGate.className = "keep-gate hidden";
+      if (sid) delete state.keepErrors[sid]; // drop any error from a prior window
+      return;
+    }
+    rec.keepGate.className = "keep-gate";
+
+    var rem = revertRemaining(rv);
+    var reverting = rem !== null && rem <= 0;
+    if (reverting) {
+      setText(rec.keepNote, "Reverting…");
+    } else if (rem === null) {
+      // No usable deadline in the frame: still make the gate actionable.
+      setText(rec.keepNote, "Applied — Keep to confirm, or it auto-reverts.");
+    } else {
+      setText(rec.keepNote, "Applied — Keep within " + fmtMSS(rem) + " or it auto-reverts.");
+    }
+
+    var busy = !!state.keepBusy[sid];
+    var btn = rec.keepBtn;
+    btn.textContent = "";
+    if (busy) {
+      btn.disabled = true;
+      btn.appendChild(spinnerIcon());
+      btn.appendChild(document.createTextNode(" Keeping…"));
+    } else {
+      // Disable once the window has elapsed (the revert is firing) — Keep would 409.
+      btn.disabled = reverting;
+      btn.appendChild(document.createTextNode("Keep"));
+    }
+
+    // Inline feedback for a Keep that failed without changing server state (network
+    // error). 409/HTTP errors are toasted and left to the next frame to settle.
+    var err = sid && state.keepErrors[sid];
+    if (err) {
+      setText(rec.keepErr, err);
+      rec.keepErr.className = "keep-err";
+    } else {
+      setText(rec.keepErr, "");
+      rec.keepErr.className = "keep-err hidden";
     }
   }
 
@@ -960,6 +1052,11 @@
       else toast("ok", "Exit node cleared", routerName + " is now direct (no exit node).");
     } else if (st === "unconfirmed") {
       toast("warn", "Sent, not confirmed", "The change was applied to " + routerName + " but couldn’t be confirmed. It will auto-revert if it can’t confirm.");
+    } else if (st === "awaiting-keep") {
+      // Applied + confirmed, but NOT kept yet (stage 2): explicitly not success.
+      toast("warn", "Applied — Keep to confirm",
+        (rv.currentExitNode ? "Routing " + routerName + " through " + shortLabel(rv.currentExitNode) : routerName + "’s change")
+        + " was applied. Keep it before the countdown ends or it auto-reverts.");
     } else if (st === "unreachable") {
       toast("err", routerName + " unreachable", rv.lastError || "The router could not be reached.");
     } else {
@@ -981,6 +1078,64 @@
         delete state.busyTarget[sid];
         render();
       });
+  }
+
+  // ---------------------------------------------------------- explicit Keep ---
+  // Confirm an awaiting-keep selection (stage 2, docs/design/keep-egress.md). Uses
+  // the SAME authenticated/CSRF flow as the exit-node POST via apiWrite: 401 →
+  // login overlay; 403 → refresh the token + retry once, then forbidden full view;
+  // a network error → inline message + toast. The Keep button is busy (disabled)
+  // while its POST is in flight. Never silently swallows a failure.
+  function onKeep(sid) {
+    if (!sid) return;
+    if (state.keepBusy[sid]) return;       // a Keep is already in flight for this router
+    state.keepBusy[sid] = true;
+    delete state.keepErrors[sid];          // clear any prior inline error before retrying
+    render();                              // show the "Keeping…" busy state immediately
+    apiWrite("POST", "/api/routers/" + encodeURIComponent(sid) + "/keep", null)
+      .then(function (res) {
+        if (!res) return;                  // 401 → login overlay took over
+        // A 403 that PERSISTS after apiWrite's token refresh is a genuine Host/CSRF
+        // block — show the authoritative forbidden view (like the exit-node path).
+        if (res.status === 403) { handleAuthFailure(403, res.data); return; }
+        if (res.status === 404) {
+          toast("err", "Router not found", "tsctl no longer knows this router.");
+          return;
+        }
+        if (res.status === 409) {
+          // Window elapsed / superseded / nothing awaiting: not an error to surface
+          // inline — toast it and let the next SSE frame settle the (reverted) state.
+          var why = (res.data && (res.data.error || res.data.detail)) || "Too late — the router reverted.";
+          toast("warn", "Couldn’t keep", why);
+          return;
+        }
+        if (!res.ok) {
+          var em = (res.data && (res.data.error || res.data.detail)) || ("Keep failed (HTTP " + res.status + ").");
+          state.keepErrors[sid] = em;
+          toast("err", "Couldn’t keep", em);
+          return;
+        }
+        // 200: the returned RouterView is the kept (ok) state — reflect it + announce.
+        if (res.data) {
+          mergeRouterView(res.data);
+          announceKeep(sid, res.data);
+        }
+      })
+      .catch(function (err) {
+        var m = String((err && err.message) || err);
+        state.keepErrors[sid] = "Network error: " + m;   // inline (CLAUDE.md: no silent swallow)
+        toast("err", "Network error", m);
+      })
+      .then(function () {
+        delete state.keepBusy[sid];
+        render();
+      });
+  }
+
+  function announceKeep(sid, rv) {
+    var routerName = (rv.node && (rv.node.name || rv.node.hostname)) || sid;
+    if (rv.currentExitNode) toast("ok", "Kept", "Now routing " + routerName + " through " + shortLabel(rv.currentExitNode) + ".");
+    else toast("ok", "Kept", routerName + " kept.");
   }
 
   // ============================================================= zone graph ===
@@ -1128,7 +1283,7 @@
     var cur = rv.currentExitNode;
     var wire;
     if (localBusy || st === "pending") wire = "pending";
-    else if (st === "unconfirmed") wire = "unconfirmed";
+    else if (st === "unconfirmed" || st === "awaiting-keep") wire = "unconfirmed";
     else if (unprobed) wire = "off";
     else if (!reachable || st === "unreachable") wire = "off";
     else wire = "ok";
@@ -1203,7 +1358,7 @@
     }
 
     setDot(rec.dot, s.online);
-    var stMap = { ok: "connected", pending: "applying", unconfirmed: "unconfirmed", unreachable: "offline" };
+    var stMap = { ok: "connected", pending: "applying", unconfirmed: "unconfirmed", "awaiting-keep": "awaiting keep", unreachable: "offline" };
     if (s.unprobed) {
       setText(rec.state, "not probed");
       rec.state.className = "gnode-state state-unprobed";
@@ -1219,6 +1374,7 @@
     if (s.localBusy) { subText = "Applying…" + countdownSuffix(item.sid); ariaConn = "applying a change"; }
     else if (s.st === "pending") { subText = "Applying " + shortLabel(rv.desired) + countdownSuffix(item.sid); ariaConn = "applying " + shortLabel(rv.desired); }
     else if (s.st === "unconfirmed") { subText = "Sent to " + shortLabel(rv.desired) + " — not confirmed"; ariaConn = "sent to " + shortLabel(rv.desired) + ", not confirmed"; }
+    else if (s.st === "awaiting-keep") { subText = "→ " + shortLabel(s.cur) + " — Keep to confirm (Devices)"; ariaConn = "applied to " + shortLabel(s.cur) + ", awaiting keep — Keep it in the Devices tab"; }
     else if (s.controlError) { subText = "Control error — can’t control"; ariaConn = "control error, tsctl can’t control this router"; }
     else if (s.unprobed) { subText = "Not probed — pick an exit node, or Test SSH in Devices"; ariaConn = "not probed yet"; }
     else if (!s.reachable) { subText = "Offline — control disabled"; ariaConn = "offline, control disabled"; }
@@ -1226,9 +1382,10 @@
     else { subText = "Direct — no exit node"; ariaConn = "direct, no exit node"; }
     setText(rec.sub, subText);
 
-    // Disabled while settling (busy/pending/unconfirmed) or offline/control-error —
-    // mirrors the card picker; the never-optimistic machine owns the transition.
-    var settling = s.localBusy || s.st === "pending" || s.st === "unconfirmed";
+    // Disabled while settling (busy/pending/unconfirmed/awaiting-keep) or offline/
+    // control-error — mirrors the card picker; the never-optimistic machine owns the
+    // transition (and awaiting-keep is resolved by Keep / auto-revert, not a rewire).
+    var settling = s.localBusy || s.st === "pending" || s.st === "unconfirmed" || s.st === "awaiting-keep";
     // Unprobed devices are reachable-UNKNOWN, not unreachable: keep them actionable
     // so the user can set an exit node (which contacts them) without probing first.
     var interactive = (s.reachable || s.unprobed) && !settling;
@@ -2047,7 +2204,7 @@
       var lsid = routers[li].node && routers[li].node.stableID;
       if (lsid) live[lsid] = true;
     }
-    [state.probes, state.actionErrors, state.pendingSince].forEach(function (m) {
+    [state.probes, state.actionErrors, state.pendingSince, state.keepErrors].forEach(function (m) {
       for (var k in m) {
         if (Object.prototype.hasOwnProperty.call(m, k) && !live[k]) delete m[k];
       }

@@ -55,6 +55,11 @@ type WhoIser interface {
 // RouterView (the device's ACTUAL state, never optimistic).
 type Controller interface {
 	SetExitNode(ctx context.Context, routerID, targetStableID string) (store.RouterView, error)
+	// Keep writes the keep-marker for a router AWAITING an explicit Keep (docs/design/
+	// keep-egress.md stage 2), cancelling the armed revert and reconciling to ok. It
+	// returns the reconciled RouterView, or a structural control error (404 unknown,
+	// 409 no/elapsed/superseded pending keep, 502 router failure).
+	Keep(ctx context.Context, routerID string) (store.RouterView, error)
 	// Probe runs a read-only SSH diagnostic against the router. An SSH failure is
 	// a RESULT (ProbeResult.OK=false), not an error; only a router-not-found (or
 	// similar) returns a non-nil error (mapped to its HTTP status).
@@ -152,6 +157,10 @@ func (a *API) Routes() http.Handler {
 	data.HandleFunc("GET /api/nodes", a.handleNodes)
 	data.HandleFunc("GET /api/routers/{id}", a.handleRouter)
 	data.HandleFunc("POST /api/routers/{id}/exit-node", a.handleSetExitNode)
+	// Explicit-Keep gate (docs/design/keep-egress.md stage 2). Same data mux ->
+	// identical middleware (RequireAuth here + RequireHost + RequireCSRF outer) as
+	// exit-node: a state-changing POST that needs auth + a valid CSRF token + Host.
+	data.HandleFunc("POST /api/routers/{id}/keep", a.handleKeep)
 	// Read-only "test SSH + get router stats" probe. Registered on the SAME data
 	// mux as exit-node, so it inherits the identical middleware stack: RequireAuth
 	// (here) + RequireHost + RequireCSRF (outer) -- a state-changing POST requires
@@ -459,6 +468,35 @@ func (a *API) handleSetExitNode(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, routerViewDTO(rv))
 }
 
+// handleKeep confirms (keeps) a router awaiting an explicit Keep and returns the
+// reconciled RouterView (200). There is no request body. It mirrors
+// handleSetExitNode's structural status/detail/stderr error mapping: 404 unknown
+// router, 409 no/elapsed/superseded pending keep, 502 router-command failure.
+func (a *API) handleKeep(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	rv, err := a.ctrl.Keep(r.Context(), id)
+	if err != nil {
+		status := http.StatusBadGateway
+		detail := ""
+		stderr := ""
+		var hs interface{ HTTPStatus() int }
+		if errors.As(err, &hs) {
+			status = hs.HTTPStatus()
+		}
+		var de interface{ Detail() string }
+		if errors.As(err, &de) {
+			detail = de.Detail()
+		}
+		var se interface{ Stderr() string }
+		if errors.As(err, &se) {
+			stderr = se.Stderr()
+		}
+		writeErrDetail(w, status, err.Error(), detail, stderr)
+		return
+	}
+	writeJSON(w, http.StatusOK, routerViewDTO(rv))
+}
+
 // handleProbe runs the read-only "test SSH" diagnostic for the router {id} and
 // returns the ProbeResult as JSON (200). There is no request body. An SSH/command
 // failure is a RESULT (ProbeResult.OK=false) returned with 200; only a control
@@ -637,6 +675,9 @@ type RouterViewDTO struct {
 	Reachable       bool            `json:"reachable"`
 	LastError       string          `json:"lastError"`
 	LastConfirmedAt string          `json:"lastConfirmedAt"`
+	// RevertAt (rfc3339) is the armed-revert deadline; only meaningful (and only
+	// emitted) while state == "awaiting-keep" (docs/design/keep-egress.md stage 2).
+	RevertAt string `json:"revertAt,omitempty"`
 	// Egress probe result (docs/design/keep-egress.md). egressOk is omitted when
 	// nil (not checked / Direct); a non-nil pointer to false still serializes (✗).
 	EgressOK        *bool  `json:"egressOk,omitempty"`
@@ -739,6 +780,7 @@ func routerViewDTO(rv store.RouterView) RouterViewDTO {
 		Reachable:       rv.Reachable,
 		LastError:       rv.LastError,
 		LastConfirmedAt: rfc3339(rv.LastConfirmedAt),
+		RevertAt:        rfc3339(rv.RevertAt),
 		EgressOK:        rv.EgressOK,
 		EgressDetail:    rv.EgressDetail,
 		EgressCheckedAt: rfc3339(rv.EgressCheckedAt),

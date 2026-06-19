@@ -42,7 +42,15 @@ type Netmapper interface {
 // Implemented by *router.Client. addr is the router's 100.x IPv4 (no port).
 type RouterClient interface {
 	Status(ctx context.Context, addr string) (store.RouterRuntime, error)
-	SetExitNode(ctx context.Context, addr string, target *store.ExitNodeRef, prev *store.ExitNodeRef) (store.RouterRuntime, error)
+	// ApplyExitNode runs arm→apply→confirm. On confirm it either writes the keep
+	// marker inline (autoKeep=true, returns marker=="") or returns the marker for a
+	// deferred KeepExitNode (autoKeep=false, the explicit-Keep gate). On any failure
+	// the marker is left unwritten (the armed revert fires) and marker=="" is
+	// returned with the error. (docs/design/keep-egress.md stage 2.)
+	ApplyExitNode(ctx context.Context, addr string, target *store.ExitNodeRef, prev *store.ExitNodeRef, autoKeep bool) (store.RouterRuntime, string, error)
+	// KeepExitNode writes the keep marker for a prior ApplyExitNode(autoKeep=false),
+	// cancelling the armed revert. A non-zero exit / transport failure is returned.
+	KeepExitNode(ctx context.Context, addr, marker string) error
 	// Probe runs a read-only diagnostic over the same transport as Status and
 	// returns its trimmed stdout (or a transport/command error). Used by the
 	// "test SSH" probe endpoint.
@@ -85,7 +93,8 @@ const (
 // api stays decoupled from this concrete error type). See controlError.
 const (
 	statusBadRequest    = 400
-	statusNotFound      = 404 // unknown router (probe)
+	statusNotFound      = 404 // unknown router (probe / keep)
+	statusConflict      = 409 // keep with no/elapsed/superseded pending entry (keep-egress)
 	statusUnprocessable = 422 // zone policy refusal (docs/design/zones.md)
 	statusBadGateway    = 502
 )
@@ -139,6 +148,33 @@ type Poller struct {
 	// never configure it -- and existing tests -- skip the probe entirely.
 	egressCheck bool
 	egressURL   string
+
+	// requireKeep gates the explicit-Keep step (docs/design/keep-egress.md stage 2).
+	// Set ONCE via ConfigureKeep before Run; the zero value (false) keeps the
+	// backward-compatible AUTO-keep behavior, so every existing test/behavior is
+	// byte-for-byte identical when it is off.
+	requireKeep bool
+	// revertWindow is the dead-man's-switch deadline (router.RevertWindow) used to
+	// compute a confirmed-but-unkept selection's RevertAt. A field so tests can
+	// shorten it.
+	revertWindow time.Duration
+	// pendingKeep records, per router addr, a confirmed exit-node change that is
+	// AWAITING an operator Keep within the revert window: {marker, revertAt, seq}.
+	// mu-guarded (same lock as the snapshot RMW + setSeq/setGen). In-memory BY
+	// DESIGN: a tsctl restart loses it -> the marker is never written -> the router
+	// auto-reverts (fail-safe; the dead-man's-switch holds). seq ties the entry to
+	// the SetExitNode that created it (== setSeq[addr] at step 1) so a newer set
+	// supersedes a stale pending Keep.
+	pendingKeep map[string]keepEntry
+}
+
+// keepEntry is one router's pending explicit-Keep (docs/design/keep-egress.md
+// stage 2). marker is the router-side keep-marker path ApplyExitNode returned;
+// revertAt is when the armed revert fires; seq is the owning SetExitNode's setSeq.
+type keepEntry struct {
+	marker   string
+	revertAt time.Time
+	seq      uint64
 }
 
 // New constructs a Poller. transitions is the SSE hub's Transitions() channel
@@ -153,18 +189,20 @@ func New(st *store.Store, nm Netmapper, rc RouterClient, groups GroupReader, rou
 		logf = func(string, ...any) {} // verbosity guard, not error swallowing
 	}
 	return &Poller{
-		store:       st,
-		nm:          nm,
-		rc:          rc,
-		groups:      groups,
-		bc:          bc,
-		routers:     routers,
-		transitions: transitions,
-		interval:    interval,
-		linger:      defaultLinger,
-		logf:        logf,
-		setSeq:      make(map[string]uint64),
-		setGen:      make(map[string]uint64),
+		store:        st,
+		nm:           nm,
+		rc:           rc,
+		groups:       groups,
+		bc:           bc,
+		routers:      routers,
+		transitions:  transitions,
+		interval:     interval,
+		linger:       defaultLinger,
+		logf:         logf,
+		setSeq:       make(map[string]uint64),
+		setGen:       make(map[string]uint64),
+		pendingKeep:  make(map[string]keepEntry),
+		revertWindow: router.RevertWindow,
 	}
 }
 
@@ -175,6 +213,14 @@ func New(st *store.Store, nm Netmapper, rc RouterClient, groups GroupReader, rou
 func (p *Poller) ConfigureEgress(check bool, url string) {
 	p.egressCheck = check
 	p.egressURL = url
+}
+
+// ConfigureKeep enables (or disables) the explicit-Keep gate (docs/design/keep-
+// egress.md stage 2). Call ONCE at startup (before Run) -- the composition root
+// wires it from cfg.RequireKeep. The zero value (false) leaves the gate OFF, so a
+// confirmed set auto-keeps exactly as in v1 (default behavior unchanged).
+func (p *Poller) ConfigureKeep(require bool) {
+	p.requireKeep = require
 }
 
 // groupList returns the current zone definitions, or nil when no GroupReader was
@@ -306,13 +352,26 @@ func (p *Poller) SetExitNode(ctx context.Context, routerID, targetStableID strin
 	}
 	p.bc.Broadcast(pending)
 
-	// Dead-man's-switch on the router (arm → apply → confirm → keep). Run OUTSIDE
+	// Dead-man's-switch on the router (arm → apply → confirm [→ keep]). Run OUTSIDE
 	// mu: it can take the whole revert window, and must not block the poll loop.
 	// Hand the router layer its OWN copy of target -- `target` is simultaneously
 	// published in the pending snapshot's Desired, so sharing the pointer with the
 	// router (as we already avoid for `prev`) would be a torn-read footgun for a
 	// lock-free reader if any RouterClient ever mutated it.
-	rt, setErr := p.rc.SetExitNode(ctx, addr, copyExitRef(target), prev)
+	//
+	// autoKeep mirrors the default: with -require-keep OFF the marker is written
+	// inline on confirm (v1 auto-keep); with it ON the marker is returned and held
+	// until an explicit operator Keep (the awaiting-keep gate below).
+	// Auto-keep when -require-keep is OFF, OR when CLEARING to Direct: going Direct
+	// carries no connectivity risk, so it never needs an operator Keep. Only a SET
+	// with -require-keep ON enters the awaiting-keep gate.
+	autoKeep := !p.requireKeep || target == nil
+	// The router's revert timer starts at ARM (inside ApplyExitNode), so RevertAt is
+	// measured from BEFORE the apply, not after (Finding C): otherwise the displayed
+	// countdown + Keep validity would outlast the device's real revert by ~the
+	// apply/confirm latency.
+	armAt := time.Now()
+	rt, marker, setErr := p.rc.ApplyExitNode(ctx, addr, copyExitRef(target), prev, autoKeep)
 	now := time.Now()
 
 	// Distinguish a DEFINITIVE command failure (the arm/apply command RAN and
@@ -367,15 +426,27 @@ func (p *Poller) SetExitNode(ctx context.Context, routerID, targetStableID strin
 	// node the device is no longer on). The newest op owns the published snapshot.
 	superseded := p.setSeq[addr] != mySeq
 	final, ok := p.withRouter(addr, func(rv *store.RouterView) {
+		rv.RevertAt = time.Time{} // only an awaiting-keep selection carries a deadline
 		switch {
 		case setErr == nil: // confirmed
 			rv.Stats = rt.Stats
 			rv.Reachable = true
 			rv.CurrentExitNode = rt.Current
 			rv.Desired = nil
-			rv.State = store.RouterOK
 			rv.LastError = ""
 			rv.LastConfirmedAt = now
+			if autoKeep {
+				// Auto-keep (-require-keep OFF): the marker was written inline -> this
+				// IS success. UNCHANGED v1 behavior.
+				rv.State = store.RouterOK
+			} else {
+				// -require-keep ON: confirmed but the marker is NOT written yet. This is
+				// explicitly NOT success -- the armed revert fires at RevertAt unless the
+				// operator calls Keep within the window (the pending entry is recorded
+				// under the SAME mu below).
+				rv.State = store.RouterAwaitingKeep
+				rv.RevertAt = armAt.Add(p.revertWindow)
+			}
 			switch {
 			case !setting:
 				// Confirmed CLEAR (Direct): there is no egress to test, so drop any
@@ -425,10 +496,41 @@ func (p *Poller) SetExitNode(ctx context.Context, routerID, targetStableID strin
 		}
 		updated = *rv
 	})
+	var disarmMarker string // a prior awaiting-keep sleeper this op orphaned (Finding A)
 	if ok && !superseded {
+		// Record / clear the explicit-Keep gate under the SAME mu as the store (and
+		// the setSeq/setGen guard) so the pending entry, the snapshot, and the
+		// supersede check stay mutually consistent. A superseded op (handled by the
+		// outer guard) records NOTHING -- the newest op owns the router's gate.
+		//
+		// If a CONFIRMED change replaces a prior awaiting-keep entry, that prior set's
+		// router-side revert timer is now orphaned (its marker would never be written),
+		// and would later revert the device away from THIS new selection -- even if it
+		// gets Kept. Capture its marker so we can disarm it (write it) below. (Only on
+		// a confirmed outcome: a failed op leaves the prior gate to its own fate.)
+		if prior, had := p.pendingKeep[addr]; had && setErr == nil && prior.marker != "" && prior.marker != marker {
+			disarmMarker = prior.marker
+		}
+		if setErr == nil && !autoKeep {
+			p.pendingKeep[addr] = keepEntry{marker: marker, revertAt: armAt.Add(p.revertWindow), seq: mySeq}
+		} else {
+			// Auto-keep, a confirmed clear, or any failure: no gate is pending for this
+			// router -- drop any stale entry a prior set left.
+			delete(p.pendingKeep, addr)
+		}
 		p.store.Store(final)
 	}
 	p.mu.Unlock()
+	if disarmMarker != "" {
+		// Disarm the superseded set's orphaned revert by writing its keep-marker, so
+		// its sleeping `tailscale set --exit-node=<old prev>` exits instead of firing
+		// ~RevertWindow later and clobbering the selection we just (re)pointed. The
+		// per-addr lock inside KeepExitNode is taken fresh (this op already released
+		// it), so no nesting; best-effort -- a failure just leaves the orphan as before.
+		if err := p.rc.KeepExitNode(ctx, addr, disarmMarker); err != nil {
+			p.logf("poller: disarm superseded keep %s: %v", addr, err)
+		}
+	}
 	if !ok {
 		// Router vanished from the snapshot between apply and reconcile (M4):
 		// never return/store a blank RouterView. Surface the underlying router
@@ -462,6 +564,90 @@ func (p *Poller) SetExitNode(ctx context.Context, routerID, targetStableID strin
 	default:
 		return updated, routerControlError(setErr)
 	}
+}
+
+// Keep writes the keep-marker for a router currently AWAITING an explicit Keep
+// (docs/design/keep-egress.md stage 2), cancelling the armed dead-man's-switch
+// revert and reconciling the router to RouterOK. It mirrors SetExitNode's
+// structural-controlError pattern so the api maps the status the same way:
+//   - unknown router / no IP            -> 404
+//   - no pending entry                  -> 409 ("no exit-node change is awaiting confirmation")
+//   - the revert window already elapsed -> 409 ("the revert window elapsed; the router has reverted")
+//   - a newer set superseded this one   -> 409
+//   - KeepExitNode (router) failed      -> 502 (the pending entry is LEFT so the operator can retry)
+//
+// The slow KeepExitNode runs OUTSIDE mu; the validate-before and reconcile-after
+// both run UNDER mu so the pending entry + setSeq/setGen + snapshot stay coherent.
+func (p *Poller) Keep(ctx context.Context, routerID string) (store.RouterView, error) {
+	snap := p.store.Load()
+	rv := findRouterViewByStableID(snap, routerID)
+	if rv == nil {
+		return store.RouterView{}, &controlError{status: statusNotFound, msg: fmt.Sprintf("unknown router %q", routerID)}
+	}
+	addr := primaryIP(rv.Node)
+	if addr == "" {
+		return store.RouterView{}, &controlError{status: statusNotFound, msg: fmt.Sprintf("router %q has no Tailscale IPv4 address", routerID)}
+	}
+
+	// Validate the pending entry under mu: present, within the window, not superseded.
+	p.mu.Lock()
+	entry, has := p.pendingKeep[addr]
+	switch {
+	case !has:
+		p.mu.Unlock()
+		return store.RouterView{}, &controlError{status: statusConflict, msg: "no exit-node change is awaiting confirmation"}
+	case time.Now().After(entry.revertAt):
+		// The dead-man's-switch has already fired on the router; the in-memory entry is
+		// stale. Drop it and tell the operator the truth.
+		delete(p.pendingKeep, addr)
+		p.mu.Unlock()
+		return store.RouterView{}, &controlError{status: statusConflict, msg: "the revert window elapsed; the router has reverted"}
+	case entry.seq != p.setSeq[addr]:
+		// A newer SetExitNode bumped setSeq past this entry; that op owns the router.
+		p.mu.Unlock()
+		return store.RouterView{}, &controlError{status: statusConflict, msg: "a newer exit-node change superseded this one"}
+	}
+	marker := entry.marker
+	mySeq := entry.seq
+	p.mu.Unlock()
+
+	// SLOW: write the keep-marker on the router OUTSIDE mu (it can take an SSH round
+	// trip). On failure surface a 502 and LEAVE the pending entry so the operator can
+	// retry until the window elapses -- never swallowed.
+	if err := p.rc.KeepExitNode(ctx, addr, marker); err != nil {
+		return store.RouterView{}, routerControlError(err)
+	}
+
+	// Reconcile to ok under mu. Re-check not-superseded: a newer set may have started
+	// while we wrote the marker (writing the OLD marker is harmless -- it is a stale
+	// path -- but the newer op owns the published state).
+	var updated store.RouterView
+	p.mu.Lock()
+	if p.setSeq[addr] != mySeq {
+		p.mu.Unlock()
+		return store.RouterView{}, &controlError{status: statusConflict, msg: "a newer exit-node change superseded this one"}
+	}
+	p.setGen[addr]++ // keep activity: a concurrent poll mid-dial must not clobber the ok we publish
+	final, ok := p.withRouter(addr, func(rv *store.RouterView) {
+		rv.State = store.RouterOK
+		rv.RevertAt = time.Time{}
+		rv.LastError = ""
+		updated = *rv
+	})
+	delete(p.pendingKeep, addr)
+	if ok {
+		p.store.Store(final)
+	}
+	p.mu.Unlock()
+	if !ok {
+		return store.RouterView{}, &controlError{
+			status: statusBadGateway,
+			msg:    "router state unavailable",
+			detail: fmt.Sprintf("router %q vanished from the snapshot before its keep could be reconciled", routerID),
+		}
+	}
+	p.bc.Broadcast(final)
+	return updated, nil
 }
 
 // routerControlError maps a router-layer failure to the 502 the api surfaces,
@@ -602,12 +788,44 @@ func (p *Poller) refreshOnce(ctx context.Context) error {
 	cur := p.store.Load()
 	for i, addr := range addrs {
 		if p.setGen[addr] != genAt[addr] {
-			// A SetExitNode touched this router while we were dialing (started OR
-			// confirmed during the window): its reconcile owns the published state.
+			// A SetExitNode/Keep touched this router while we were dialing (started OR
+			// confirmed/kept during the window): its reconcile owns the published state.
 			// Keep the current view; don't clobber it with our possibly-stale read.
 			if curRV := findRouterView(cur, addr); curRV != nil {
 				routers[i] = *curRV
 			}
+			continue
+		}
+		// AWAITING-KEEP gate (docs/design/keep-egress.md stage 2). A confirmed-but-
+		// unkept set holds the device on the target with the keep-marker UNWRITTEN, so
+		// a plain Status read looks "ok" and reconcileState would clear the gate
+		// prematurely. While the pending entry is live, force awaiting-keep + the
+		// countdown; once its window has passed the device has reverted, so drop the
+		// stale entry and let the fresh (reverted) read settle normally to ok.
+		e, hasKeep := p.pendingKeep[addr]
+		if !hasKeep {
+			continue
+		}
+		if time.Now().After(e.revertAt) {
+			delete(p.pendingKeep, addr)
+			if routers[i].State == store.RouterAwaitingKeep {
+				// Only a carried-forward (never-dialed, fallback) router reaches here: a
+				// managed router's fresh dial already settled to ok+actual. The device has
+				// reverted to a now-unknown selection, and the fallback set is never
+				// re-dialed -- so marking it ok would PERSIST a false-confirm on the
+				// reverted-away target (Finding B). Drop to "not probed" (state unknown
+				// until a manual Test SSH / set) instead.
+				routers[i].State = store.RouterUnprobed
+				routers[i].RevertAt = time.Time{}
+				routers[i].CurrentExitNode = nil
+				routers[i].Desired = nil
+				routers[i].Reachable = false
+			}
+			continue
+		}
+		if routers[i].Reachable {
+			routers[i].State = store.RouterAwaitingKeep
+			routers[i].RevertAt = e.revertAt
 		}
 	}
 	snap := &store.Snapshot{
@@ -726,10 +944,11 @@ func (p *Poller) buildListedRouterView(addr string, nodes []store.NodeView, prev
 	// back online (devices in the fallback set flap constantly). Reset it to unprobed
 	// so a flapped device recovers (picker re-enabled, re-probeable).
 	switch prevState(prevRV) {
-	case store.RouterOK, store.RouterUnconfirmed, store.RouterPending:
+	case store.RouterOK, store.RouterUnconfirmed, store.RouterPending, store.RouterAwaitingKeep:
 		rv.State = prevRV.State
 		rv.Reachable = prevRV.Reachable
 		rv.LastError = prevRV.LastError
+		rv.RevertAt = prevRV.RevertAt // carry the countdown for an awaiting-keep listed router
 		return rv
 	}
 	rv.State = store.RouterUnprobed

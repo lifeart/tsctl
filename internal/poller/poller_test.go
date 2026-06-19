@@ -24,24 +24,32 @@ type fakeNM struct {
 func (f *fakeNM) Inventory(ctx context.Context) ([]store.NodeView, error) { return f.nodes, f.err }
 
 type fakeRC struct {
-	mu            sync.Mutex
-	statusRT      store.RouterRuntime
-	statusErr     error
-	statusCalls   int
-	setRT         store.RouterRuntime
-	setErr        error
-	setCalls      int
-	lastAddr      string
-	lastTarget    *store.ExitNodeRef
-	lastPrev      *store.ExitNodeRef
-	probeOut      string
-	probeErr      error
-	probeCalls    int
-	egressOK      bool
-	egressDet     string
-	egressErr     error
-	egressCalls   int
-	lastEgressURL string
+	mu          sync.Mutex
+	statusRT    store.RouterRuntime
+	statusErr   error
+	statusCalls int
+	setRT       store.RouterRuntime
+	setErr      error
+	setCalls    int
+	lastAddr    string
+	lastTarget  *store.ExitNodeRef
+	lastPrev    *store.ExitNodeRef
+	// keep-egress stage 2: ApplyExitNode returns applyMarker; lastAutoKeep records
+	// the autoKeep arg; KeepExitNode records keepCalls/lastKeepMarker and returns keepErr.
+	applyMarker    string
+	lastAutoKeep   bool
+	keepCalls      int
+	keepErr        error
+	lastKeepAddr   string
+	lastKeepMarker string
+	probeOut       string
+	probeErr       error
+	probeCalls     int
+	egressOK       bool
+	egressDet      string
+	egressErr      error
+	egressCalls    int
+	lastEgressURL  string
 }
 
 func (f *fakeRC) Status(ctx context.Context, addr string) (store.RouterRuntime, error) {
@@ -51,12 +59,21 @@ func (f *fakeRC) Status(ctx context.Context, addr string) (store.RouterRuntime, 
 	return f.statusRT, f.statusErr
 }
 
-func (f *fakeRC) SetExitNode(ctx context.Context, addr string, target, prev *store.ExitNodeRef) (store.RouterRuntime, error) {
+func (f *fakeRC) ApplyExitNode(ctx context.Context, addr string, target, prev *store.ExitNodeRef, autoKeep bool) (store.RouterRuntime, string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.setCalls++
 	f.lastAddr, f.lastTarget, f.lastPrev = addr, target, prev
-	return f.setRT, f.setErr
+	f.lastAutoKeep = autoKeep
+	return f.setRT, f.applyMarker, f.setErr
+}
+
+func (f *fakeRC) KeepExitNode(ctx context.Context, addr, marker string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.keepCalls++
+	f.lastKeepAddr, f.lastKeepMarker = addr, marker
+	return f.keepErr
 }
 
 func (f *fakeRC) Probe(ctx context.Context, addr string) (string, error) {
@@ -78,6 +95,9 @@ func (f *fakeRC) calls() int           { f.mu.Lock(); defer f.mu.Unlock(); retur
 func (f *fakeRC) statusCallCount() int { f.mu.Lock(); defer f.mu.Unlock(); return f.statusCalls }
 func (f *fakeRC) probeCallCount() int  { f.mu.Lock(); defer f.mu.Unlock(); return f.probeCalls }
 func (f *fakeRC) egressCallCount() int { f.mu.Lock(); defer f.mu.Unlock(); return f.egressCalls }
+func (f *fakeRC) keepCallCount() int   { f.mu.Lock(); defer f.mu.Unlock(); return f.keepCalls }
+func (f *fakeRC) autoKeepArg() bool    { f.mu.Lock(); defer f.mu.Unlock(); return f.lastAutoKeep }
+func (f *fakeRC) keepMarker() string   { f.mu.Lock(); defer f.mu.Unlock(); return f.lastKeepMarker }
 
 type fakeBC struct {
 	mu    sync.Mutex
@@ -294,10 +314,11 @@ func (f *blockStatusRC) Status(ctx context.Context, addr string) (store.RouterRu
 	<-f.release
 	return store.RouterRuntime{Online: true}, nil // a STALE read: device on Direct
 }
-func (f *blockStatusRC) SetExitNode(ctx context.Context, addr string, target, prev *store.ExitNodeRef) (store.RouterRuntime, error) {
-	return f.setRT, nil
+func (f *blockStatusRC) ApplyExitNode(ctx context.Context, addr string, target, prev *store.ExitNodeRef, autoKeep bool) (store.RouterRuntime, string, error) {
+	return f.setRT, "", nil
 }
-func (f *blockStatusRC) Probe(ctx context.Context, addr string) (string, error) { return "", nil }
+func (f *blockStatusRC) KeepExitNode(ctx context.Context, addr, marker string) error { return nil }
+func (f *blockStatusRC) Probe(ctx context.Context, addr string) (string, error)      { return "", nil }
 func (f *blockStatusRC) EgressProbe(ctx context.Context, addr, url string) (bool, string, error) {
 	return true, "", nil
 }
@@ -363,12 +384,13 @@ func (f *orchRC) Status(ctx context.Context, addr string) (store.RouterRuntime, 
 	<-f.dialGate
 	return store.RouterRuntime{Online: true}, nil // STALE read: device still on Direct
 }
-func (f *orchRC) SetExitNode(ctx context.Context, addr string, target, prev *store.ExitNodeRef) (store.RouterRuntime, error) {
+func (f *orchRC) ApplyExitNode(ctx context.Context, addr string, target, prev *store.ExitNodeRef, autoKeep bool) (store.RouterRuntime, string, error) {
 	f.applyEntered <- struct{}{}
 	<-f.applyGate
-	return store.RouterRuntime{Online: true, Current: f.target}, nil // confirms the target
+	return store.RouterRuntime{Online: true, Current: f.target}, "", nil // confirms the target
 }
-func (f *orchRC) Probe(ctx context.Context, addr string) (string, error) { return "", nil }
+func (f *orchRC) KeepExitNode(ctx context.Context, addr, marker string) error { return nil }
+func (f *orchRC) Probe(ctx context.Context, addr string) (string, error)      { return "", nil }
 func (f *orchRC) EgressProbe(ctx context.Context, addr, url string) (bool, string, error) {
 	return true, "", nil
 }
@@ -480,18 +502,19 @@ type seqRC struct {
 func (f *seqRC) Status(ctx context.Context, addr string) (store.RouterRuntime, error) {
 	return store.RouterRuntime{Online: true}, nil
 }
-func (f *seqRC) Probe(ctx context.Context, addr string) (string, error) { return "", nil }
+func (f *seqRC) KeepExitNode(ctx context.Context, addr, marker string) error { return nil }
+func (f *seqRC) Probe(ctx context.Context, addr string) (string, error)      { return "", nil }
 func (f *seqRC) EgressProbe(ctx context.Context, addr, url string) (bool, string, error) {
 	return true, "", nil
 }
-func (f *seqRC) SetExitNode(ctx context.Context, addr string, target, prev *store.ExitNodeRef) (store.RouterRuntime, error) {
+func (f *seqRC) ApplyExitNode(ctx context.Context, addr string, target, prev *store.ExitNodeRef, autoKeep bool) (store.RouterRuntime, string, error) {
 	ip := ""
 	if target != nil {
 		ip = target.IP
 	}
 	f.started <- ip
 	<-f.gate[ip]
-	return store.RouterRuntime{Online: true, Current: target}, nil
+	return store.RouterRuntime{Online: true, Current: target}, "", nil
 }
 
 func TestSetExitNode_ConcurrentSameRouterNoFalseConfirm(t *testing.T) {
@@ -537,6 +560,135 @@ func TestSetExitNode_ConcurrentSameRouterNoFalseConfirm(t *testing.T) {
 	}
 	if rv.CurrentExitNode.IP != exit2IP {
 		t.Errorf("snapshot shows exit %q, want exit2 %q — a stale concurrent set published a false-confirmed exit node", rv.CurrentExitNode.IP, exit2IP)
+	}
+}
+
+// keepRC returns a distinct marker per ApplyExitNode and records every
+// KeepExitNode marker, so a test can assert the supersede-disarm (Finding A).
+type keepRC struct {
+	mu       sync.Mutex
+	markers  []string
+	idx      int
+	disarmed []string
+}
+
+func (f *keepRC) Status(ctx context.Context, addr string) (store.RouterRuntime, error) {
+	return store.RouterRuntime{Online: true}, nil
+}
+func (f *keepRC) Probe(ctx context.Context, addr string) (string, error) { return "", nil }
+func (f *keepRC) EgressProbe(ctx context.Context, addr, url string) (bool, string, error) {
+	return true, "", nil
+}
+func (f *keepRC) ApplyExitNode(ctx context.Context, addr string, target, prev *store.ExitNodeRef, autoKeep bool) (store.RouterRuntime, string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	m := ""
+	if !autoKeep && f.idx < len(f.markers) {
+		m = f.markers[f.idx]
+		f.idx++
+	}
+	return store.RouterRuntime{Online: true, Current: target}, m, nil // confirms the target
+}
+func (f *keepRC) KeepExitNode(ctx context.Context, addr, marker string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.disarmed = append(f.disarmed, marker)
+	return nil
+}
+
+func TestKeepGate_SupersedeDisarmsPriorRevert(t *testing.T) {
+	// Finding A: a confirmed set that supersedes a prior awaiting-keep set must DISARM
+	// the prior set's orphaned router-side revert (write its marker), else that timer
+	// fires later and reverts the device away from the new (possibly Kept) selection.
+	const routerIP, exit1IP, exit2IP = "100.64.0.10", "100.64.0.20", "100.64.0.21"
+	st := store.New()
+	seedSnapshot2(st, routerIP, exit1IP, exit2IP)
+	rc := &keepRC{markers: []string{"M1", "M2"}}
+	p := New(st, &fakeNM{}, rc, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+	p.ConfigureKeep(true)
+
+	if _, err := p.SetExitNode(context.Background(), "router1", "exit1"); err != nil {
+		t.Fatalf("set1: %v", err)
+	}
+	if _, err := p.SetExitNode(context.Background(), "router1", "exit2"); err != nil {
+		t.Fatalf("set2: %v", err)
+	}
+	rc.mu.Lock()
+	disarmed := append([]string(nil), rc.disarmed...)
+	rc.mu.Unlock()
+	if len(disarmed) != 1 || disarmed[0] != "M1" {
+		t.Errorf("supersede must disarm the prior marker M1, got %v", disarmed)
+	}
+}
+
+func TestRefresh_AwaitingKeepOverlayNotClearedByPoll(t *testing.T) {
+	// The poll must OVERLAY awaiting-keep: a confirmed-but-unkept set holds the device
+	// on the target (marker unwritten), so a plain Status read looks "ok" and would
+	// clear the gate prematurely.
+	const routerIP, exitIP = "100.64.0.10", "100.64.0.20"
+	nm := &fakeNM{nodes: []store.NodeView{
+		{StableID: "router1", TailscaleIPs: []string{routerIP}, Online: true, Type: store.NodeRouter},
+		{StableID: "exit1", TailscaleIPs: []string{exitIP}, Online: true, ExitNodeOption: true, Type: store.NodeExitNode},
+	}}
+	cur := &store.ExitNodeRef{StableID: "exit1", IP: exitIP}
+	rc := &fakeRC{setRT: store.RouterRuntime{Online: true, Current: cur}, applyMarker: "M1", statusRT: store.RouterRuntime{Online: true, Current: cur}}
+	st := store.New()
+	seedSnapshot(st, routerIP, exitIP, true, true) // router1 must be in the snapshot for SetExitNode to resolve it
+	p := New(st, nm, rc, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+	p.ConfigureKeep(true)
+
+	if _, err := p.SetExitNode(context.Background(), "router1", "exit1"); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	if got := findRouterViewByStableID(st.Load(), "router1").State; got != store.RouterAwaitingKeep {
+		t.Fatalf("after set: state=%q, want awaiting-keep", got)
+	}
+	if err := p.Refresh(context.Background()); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if got := findRouterViewByStableID(st.Load(), "router1").State; got != store.RouterAwaitingKeep {
+		t.Errorf("poll cleared the keep gate: state=%q, want awaiting-keep (overlay)", got)
+	}
+}
+
+func TestRefresh_FallbackAwaitingKeepExpiresToUnprobed(t *testing.T) {
+	// Finding B: a fallback (never-dialed) router carrying awaiting-keep past its window
+	// must drop to "unprobed" (state unknown after the auto-revert), NOT a persistent
+	// false ok+stale-target.
+	const piIP, exitIP = "100.64.0.30", "100.64.0.20"
+	nm := &fakeNM{nodes: []store.NodeView{
+		{StableID: "pi", TailscaleIPs: []string{piIP}, Online: true, Type: store.NodeGeneric},
+		{StableID: "exit1", TailscaleIPs: []string{exitIP}, Online: true, ExitNodeOption: true, Type: store.NodeExitNode},
+	}}
+	st := store.New()
+	p := New(st, nm, &fakeRC{}, nil, nil /* fallback: never dialed */, newFakeBC(), make(chan int), time.Second, nopLogf)
+	p.ConfigureKeep(true)
+	st.Store(&store.Snapshot{Routers: []store.RouterView{{
+		Node:            store.NodeView{StableID: "pi", TailscaleIPs: []string{piIP}, Online: true, Type: store.NodeGeneric},
+		CurrentExitNode: &store.ExitNodeRef{StableID: "exit1", IP: exitIP},
+		State:           store.RouterAwaitingKeep,
+		RevertAt:        time.Now().Add(-time.Minute),
+		LastConfirmedAt: time.Now(),
+	}}})
+	p.mu.Lock()
+	p.pendingKeep[piIP] = keepEntry{marker: "M1", revertAt: time.Now().Add(-time.Minute), seq: 0}
+	p.mu.Unlock()
+
+	if err := p.Refresh(context.Background()); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	got := findRouterViewByStableID(st.Load(), "pi")
+	if got.State != store.RouterUnprobed {
+		t.Errorf("expired fallback awaiting-keep: state=%q, want unprobed", got.State)
+	}
+	if got.CurrentExitNode != nil {
+		t.Errorf("expired fallback must clear the reverted-away target, got %+v", got.CurrentExitNode)
+	}
+	p.mu.Lock()
+	_, stillPending := p.pendingKeep[piIP]
+	p.mu.Unlock()
+	if stillPending {
+		t.Error("expired pending-keep entry must be deleted")
 	}
 }
 
@@ -1013,6 +1165,233 @@ func TestSetExitNode_Egress(t *testing.T) {
 	})
 }
 
+// --- explicit-Keep gate (docs/design/keep-egress.md stage 2) -----------------
+
+func (p *Poller) pendingKeepEntry(addr string) (keepEntry, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.pendingKeep[addr]
+	return e, ok
+}
+
+func TestSetExitNode_RequireKeepOff_AutoKeepUnchanged(t *testing.T) {
+	// Default (-require-keep OFF): a confirmed set auto-keeps -> RouterOK, ApplyExitNode
+	// is called with autoKeep=true, NO marker is deferred, and NO pending entry exists.
+	routerIP, exitIP := "100.64.0.10", "100.64.0.20"
+	st := store.New()
+	seedSnapshot(st, routerIP, exitIP, true, true)
+	rc := &fakeRC{setRT: store.RouterRuntime{Online: true, Current: &store.ExitNodeRef{StableID: "exit1", IP: exitIP}}, applyMarker: "should-be-ignored"}
+	p := New(st, &fakeNM{}, rc, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+	// No ConfigureKeep -> requireKeep false (zero value).
+
+	rv, err := p.SetExitNode(context.Background(), "router1", "exit1")
+	if err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	if rv.State != store.RouterOK {
+		t.Errorf("state = %q, want ok (auto-keep)", rv.State)
+	}
+	if !rv.RevertAt.IsZero() {
+		t.Errorf("RevertAt = %v, want zero when auto-keeping", rv.RevertAt)
+	}
+	if !rc.autoKeepArg() {
+		t.Error("ApplyExitNode must be called with autoKeep=true when -require-keep is off")
+	}
+	if rc.keepCallCount() != 0 {
+		t.Errorf("KeepExitNode must NOT be called separately under auto-keep, calls = %d", rc.keepCallCount())
+	}
+	if _, ok := p.pendingKeepEntry(routerIP); ok {
+		t.Error("auto-keep must NOT record a pending-keep entry")
+	}
+}
+
+func TestSetExitNode_RequireKeepOn_AwaitsKeep(t *testing.T) {
+	// -require-keep ON: a confirmed set is held in awaiting-keep with a RevertAt and a
+	// pending entry; ApplyExitNode is called with autoKeep=false and the marker is NOT
+	// written yet (KeepExitNode untouched).
+	routerIP, exitIP := "100.64.0.10", "100.64.0.20"
+	st := store.New()
+	seedSnapshot(st, routerIP, exitIP, true, true)
+	rc := &fakeRC{setRT: store.RouterRuntime{Online: true, Current: &store.ExitNodeRef{StableID: "exit1", IP: exitIP}}, applyMarker: "/tmp/tsctl-keep-xyz"}
+	p := New(st, &fakeNM{}, rc, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+	p.ConfigureKeep(true)
+
+	before := time.Now()
+	rv, err := p.SetExitNode(context.Background(), "router1", "exit1")
+	if err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	if rv.State != store.RouterAwaitingKeep {
+		t.Errorf("state = %q, want awaiting-keep", rv.State)
+	}
+	if rv.CurrentExitNode == nil || rv.CurrentExitNode.IP != exitIP {
+		t.Errorf("currentExitNode = %+v, want the confirmed target (device IS on it)", rv.CurrentExitNode)
+	}
+	if rv.RevertAt.Before(before.Add(p.revertWindow)) || rv.RevertAt.After(time.Now().Add(p.revertWindow)) {
+		t.Errorf("RevertAt = %v, want ~now+revertWindow (%v)", rv.RevertAt, p.revertWindow)
+	}
+	if rc.autoKeepArg() {
+		t.Error("ApplyExitNode must be called with autoKeep=false when -require-keep is on")
+	}
+	if rc.keepCallCount() != 0 {
+		t.Errorf("the marker must NOT be written until an explicit Keep, KeepExitNode calls = %d", rc.keepCallCount())
+	}
+	e, ok := p.pendingKeepEntry(routerIP)
+	if !ok {
+		t.Fatal("a pending-keep entry must be recorded")
+	}
+	if e.marker != "/tmp/tsctl-keep-xyz" {
+		t.Errorf("pending marker = %q, want the ApplyExitNode marker", e.marker)
+	}
+}
+
+func TestKeep_Success(t *testing.T) {
+	// awaiting-keep -> Keep -> ok: KeepExitNode is called with the recorded marker, the
+	// pending entry is cleared, and the RouterView settles to ok.
+	routerIP, exitIP := "100.64.0.10", "100.64.0.20"
+	st := store.New()
+	seedSnapshot(st, routerIP, exitIP, true, true)
+	rc := &fakeRC{setRT: store.RouterRuntime{Online: true, Current: &store.ExitNodeRef{StableID: "exit1", IP: exitIP}}, applyMarker: "/tmp/tsctl-keep-abc"}
+	bc := newFakeBC()
+	p := New(st, &fakeNM{}, rc, nil, []string{routerIP}, bc, make(chan int), time.Second, nopLogf)
+	p.ConfigureKeep(true)
+
+	if _, err := p.SetExitNode(context.Background(), "router1", "exit1"); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	rv, err := p.Keep(context.Background(), "router1")
+	if err != nil {
+		t.Fatalf("keep: %v", err)
+	}
+	if rv.State != store.RouterOK {
+		t.Errorf("state after keep = %q, want ok", rv.State)
+	}
+	if !rv.RevertAt.IsZero() {
+		t.Errorf("RevertAt must clear on keep, got %v", rv.RevertAt)
+	}
+	if rv.CurrentExitNode == nil || rv.CurrentExitNode.IP != exitIP {
+		t.Errorf("currentExitNode = %+v, want exit kept", rv.CurrentExitNode)
+	}
+	if rc.keepCallCount() != 1 {
+		t.Errorf("KeepExitNode calls = %d, want 1", rc.keepCallCount())
+	}
+	if rc.keepMarker() != "/tmp/tsctl-keep-abc" {
+		t.Errorf("KeepExitNode marker = %q, want the recorded marker", rc.keepMarker())
+	}
+	if _, ok := p.pendingKeepEntry(routerIP); ok {
+		t.Error("pending entry must be cleared after a successful keep")
+	}
+}
+
+func TestKeep_AfterWindowIs409(t *testing.T) {
+	// Keep after the revert window has elapsed -> 409 and the stale entry is dropped.
+	routerIP, exitIP := "100.64.0.10", "100.64.0.20"
+	st := store.New()
+	seedSnapshot(st, routerIP, exitIP, true, true)
+	rc := &fakeRC{setRT: store.RouterRuntime{Online: true, Current: &store.ExitNodeRef{StableID: "exit1", IP: exitIP}}, applyMarker: "m"}
+	p := New(st, &fakeNM{}, rc, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+	p.ConfigureKeep(true)
+	p.revertWindow = time.Millisecond // tiny window so it elapses immediately
+
+	if _, err := p.SetExitNode(context.Background(), "router1", "exit1"); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	time.Sleep(5 * time.Millisecond) // let the window elapse
+	_, err := p.Keep(context.Background(), "router1")
+	assertControlStatus(t, err, 409)
+	if rc.keepCallCount() != 0 {
+		t.Errorf("KeepExitNode must NOT run after the window elapsed, calls = %d", rc.keepCallCount())
+	}
+	if _, ok := p.pendingKeepEntry(routerIP); ok {
+		t.Error("an elapsed pending entry must be dropped")
+	}
+}
+
+func TestKeep_SupersededIs409(t *testing.T) {
+	// A newer set bumped setSeq past the pending entry's seq -> Keep is 409 and never
+	// writes the (now superseded) marker.
+	routerIP, exitIP := "100.64.0.10", "100.64.0.20"
+	st := store.New()
+	seedSnapshot(st, routerIP, exitIP, true, true)
+	rc := &fakeRC{setRT: store.RouterRuntime{Online: true, Current: &store.ExitNodeRef{StableID: "exit1", IP: exitIP}}, applyMarker: "m"}
+	p := New(st, &fakeNM{}, rc, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+	p.ConfigureKeep(true)
+
+	if _, err := p.SetExitNode(context.Background(), "router1", "exit1"); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	// Simulate a newer set having started (step 1 bumps setSeq) but not yet reconciled:
+	// the pending entry's seq now trails setSeq.
+	p.mu.Lock()
+	p.setSeq[routerIP]++
+	p.mu.Unlock()
+
+	_, err := p.Keep(context.Background(), "router1")
+	assertControlStatus(t, err, 409)
+	if rc.keepCallCount() != 0 {
+		t.Errorf("a superseded Keep must NOT write the marker, calls = %d", rc.keepCallCount())
+	}
+}
+
+func TestKeep_UnknownIs404(t *testing.T) {
+	routerIP, exitIP := "100.64.0.10", "100.64.0.20"
+	st := store.New()
+	seedSnapshot(st, routerIP, exitIP, true, true)
+	p := New(st, &fakeNM{}, &fakeRC{}, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+	p.ConfigureKeep(true)
+	_, err := p.Keep(context.Background(), "ghost")
+	assertControlStatus(t, err, 404)
+}
+
+func TestKeep_NoPendingIs409(t *testing.T) {
+	// Keep on a router with no awaiting-keep (e.g. default auto-keep mode) -> 409.
+	routerIP, exitIP := "100.64.0.10", "100.64.0.20"
+	st := store.New()
+	seedSnapshot(st, routerIP, exitIP, true, true)
+	rc := &fakeRC{}
+	p := New(st, &fakeNM{}, rc, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+	_, err := p.Keep(context.Background(), "router1")
+	assertControlStatus(t, err, 409)
+	if rc.keepCallCount() != 0 {
+		t.Errorf("Keep with no pending entry must NOT touch the router, calls = %d", rc.keepCallCount())
+	}
+}
+
+func TestKeep_RouterFailureIs502LeavesEntry(t *testing.T) {
+	// KeepExitNode failing -> 502, and the pending entry is LEFT so the operator can
+	// retry until the window elapses.
+	routerIP, exitIP := "100.64.0.10", "100.64.0.20"
+	st := store.New()
+	seedSnapshot(st, routerIP, exitIP, true, true)
+	rc := &fakeRC{
+		setRT:       store.RouterRuntime{Online: true, Current: &store.ExitNodeRef{StableID: "exit1", IP: exitIP}},
+		applyMarker: "m",
+		keepErr:     &router.CommandError{Addr: routerIP, Cmd: "keep marker", StderrText: "disk full", Exit: 1},
+	}
+	p := New(st, &fakeNM{}, rc, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+	p.ConfigureKeep(true)
+
+	if _, err := p.SetExitNode(context.Background(), "router1", "exit1"); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	_, err := p.Keep(context.Background(), "router1")
+	assertControlStatus(t, err, 502)
+	if _, ok := p.pendingKeepEntry(routerIP); !ok {
+		t.Error("a failed Keep must LEAVE the pending entry for retry")
+	}
+}
+
+func assertControlStatus(t *testing.T, err error, want int) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("expected a control error with status %d, got nil", want)
+	}
+	var hs interface{ HTTPStatus() int }
+	if !errors.As(err, &hs) || hs.HTTPStatus() != want {
+		t.Fatalf("expected status %d, got %v", want, err)
+	}
+}
+
 func TestSetExitNode_PreflightRefusals(t *testing.T) {
 	routerIP, exitIP := "100.64.0.10", "100.64.0.20"
 
@@ -1191,12 +1570,13 @@ func (d *dropMidOpRC) Status(ctx context.Context, addr string) (store.RouterRunt
 	return d.rt, nil
 }
 
-func (d *dropMidOpRC) Probe(ctx context.Context, addr string) (string, error) { return "", nil }
+func (d *dropMidOpRC) Probe(ctx context.Context, addr string) (string, error)      { return "", nil }
+func (d *dropMidOpRC) KeepExitNode(ctx context.Context, addr, marker string) error { return nil }
 func (d *dropMidOpRC) EgressProbe(ctx context.Context, addr, url string) (bool, string, error) {
 	return true, "", nil
 }
 
-func (d *dropMidOpRC) SetExitNode(ctx context.Context, addr string, target, prev *store.ExitNodeRef) (store.RouterRuntime, error) {
+func (d *dropMidOpRC) ApplyExitNode(ctx context.Context, addr string, target, prev *store.ExitNodeRef, autoKeep bool) (store.RouterRuntime, string, error) {
 	// Same IP, empty StableID -- the buildRouterView fallback for a configured
 	// router missing from inventory.
 	d.st.Store(&store.Snapshot{
@@ -1204,7 +1584,7 @@ func (d *dropMidOpRC) SetExitNode(ctx context.Context, addr string, target, prev
 			{Node: store.NodeView{TailscaleIPs: []string{d.routerIP}, Type: store.NodeRouter}},
 		},
 	})
-	return d.rt, nil
+	return d.rt, "", nil
 }
 
 func TestSetExitNode_RouterDropsFromNetmapMidOp(t *testing.T) {

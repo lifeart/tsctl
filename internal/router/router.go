@@ -286,25 +286,34 @@ func (c *Client) status(ctx context.Context, addr string) (store.RouterRuntime, 
 	return ParseStatus(stdout)
 }
 
-// SetExitNode applies the dead-man's-switch sequence (DESIGN §8, PHASE_B §6):
-// ARM a self-reverting timer on the router, APPLY the change, CONFIRM the actual
-// selection by re-reading status, and KEEP (cancel the revert) only on success.
-// On any failure the keep-marker is left untouched so the armed revert fires and
-// the router self-heals; the runtime we could read is returned with a non-nil
-// error (never swallowed). target/prev nil or empty IP means "clear".
-func (c *Client) SetExitNode(ctx context.Context, addr string, target *store.ExitNodeRef, prev *store.ExitNodeRef) (store.RouterRuntime, error) {
+// ApplyExitNode runs the dead-man's-switch up to confirmation (DESIGN §8, PHASE_B
+// §6): ARM a self-reverting timer on the router, APPLY the change, and CONFIRM the
+// actual selection by re-reading status. The KEEP step (cancelling the revert) is
+// SPLIT OUT (docs/design/keep-egress.md stage 2) so it can be deferred:
+//   - autoKeep=true: on confirm it writes the keep-marker inline (v1 behavior) and
+//     returns marker=="".
+//   - autoKeep=false: on confirm it returns the keep-marker WITHOUT writing it, so
+//     the caller can issue KeepExitNode(marker) later (the explicit-Keep gate). If
+//     no Keep arrives within RevertWindow the armed revert fires (the strongest
+//     dead-man's-switch).
+//
+// On ANY failure the keep-marker is left UNWRITTEN (so the armed revert fires and
+// the router self-heals to prev) and marker=="" is returned alongside the error
+// (never swallowed); the runtime we could read is returned too. target/prev nil or
+// empty IP means "clear".
+func (c *Client) ApplyExitNode(ctx context.Context, addr string, target *store.ExitNodeRef, prev *store.ExitNodeRef, autoKeep bool) (store.RouterRuntime, string, error) {
 	targetArg, err := exitArg(target)
 	if err != nil {
-		return store.RouterRuntime{}, fmt.Errorf("router %s: target: %w", addr, err)
+		return store.RouterRuntime{}, "", fmt.Errorf("router %s: target: %w", addr, err)
 	}
 	prevArg, err := exitArg(prev)
 	if err != nil {
-		return store.RouterRuntime{}, fmt.Errorf("router %s: prev: %w", addr, err)
+		return store.RouterRuntime{}, "", fmt.Errorf("router %s: prev: %w", addr, err)
 	}
 	setting := targetArg != ""
 	marker := c.newMarker()
 
-	// Serialize the whole arm→apply→confirm→keep sequence against any other
+	// Serialize the whole arm→apply→confirm(→keep) sequence against any other
 	// command to this router (DESIGN §6). Acquired after the pure arg validation
 	// (which never touches the router). The confirm read below uses c.status, the
 	// UNLOCKED core, so it does not relock and deadlock.
@@ -315,49 +324,70 @@ func (c *Client) SetExitNode(ctx context.Context, addr string, target *store.Exi
 	// appears within the window. Backend can't revert if the link dies, so this
 	// runs locally on the router.
 	if _, stderr, exit, err := c.runner.run(ctx, addr, armCmd(marker, prevArg)); err != nil {
-		return store.RouterRuntime{}, fmt.Errorf("router %s: arm revert: %w", addr, err)
+		return store.RouterRuntime{}, "", fmt.Errorf("router %s: arm revert: %w", addr, err)
 	} else if exit != 0 {
-		return store.RouterRuntime{}, &CommandError{Addr: addr, Cmd: "arm revert", StderrText: string(stderr), Exit: exit}
+		return store.RouterRuntime{}, "", &CommandError{Addr: addr, Cmd: "arm revert", StderrText: string(stderr), Exit: exit}
 	}
 
 	// 2. APPLY (step 3). The marker is NOT written yet, so if anything below
 	// fails the armed revert fires and the router self-heals to prev.
 	if _, stderr, exit, err := c.runner.run(ctx, addr, applyCmd(targetArg, setting, c.lanAccess)); err != nil {
-		return store.RouterRuntime{}, fmt.Errorf("router %s: apply exit-node: %w", addr, err)
+		return store.RouterRuntime{}, "", fmt.Errorf("router %s: apply exit-node: %w", addr, err)
 	} else if exit != 0 {
-		return store.RouterRuntime{}, &CommandError{Addr: addr, Cmd: "apply exit-node", StderrText: string(stderr), Exit: exit}
+		return store.RouterRuntime{}, "", &CommandError{Addr: addr, Cmd: "apply exit-node", StderrText: string(stderr), Exit: exit}
 	}
 
 	// 3. CONFIRM (step 4): re-read the actual selection over the tailnet (an
 	// exit-node change does not sever the control path). Uses the unlocked core
-	// since we already hold the per-router lock.
-	//
-	// KNOWN LIMITATION (v1, Sec-M4 — deferred, see README "Known limitations"):
-	// "confirmed" here means the device REPORTS the target exit node selected and
-	// is reachable over the tailnet (a selection + tailnet-reachability match). It
-	// does NOT verify actual internet EGRESS through the exit node. And there is
-	// no explicit user "Keep" (DESIGN §8 step 5): we auto-KEEP on confirmation, so
-	// the armed revert only fires if the device cannot be confirmed AT ALL (apply
-	// failed, confirm read failed, or the selection didn't take). An explicit-user
-	// "Keep" within the window plus an egress reachability probe are planned, not
-	// implemented in v1.
+	// since we already hold the per-router lock. "confirmed" means the device
+	// REPORTS the target selected and is reachable; the optional egress probe + the
+	// explicit-Keep gate are layered on by the poller (docs/design/keep-egress.md).
 	rt, statusErr := c.status(ctx, addr)
 	if statusErr != nil {
-		return rt, fmt.Errorf("router %s: confirm read failed (revert will fire): %w", addr, statusErr)
+		return rt, "", fmt.Errorf("router %s: confirm read failed (revert will fire): %w", addr, statusErr)
 	}
 	if !confirmed(rt, targetArg, setting) {
-		return rt, fmt.Errorf("router %s: exit-node not confirmed (revert will fire): want %s, got %s",
+		return rt, "", fmt.Errorf("router %s: exit-node not confirmed (revert will fire): want %s, got %s",
 			addr, describeArg(targetArg), describeCurrent(rt))
 	}
 
-	// 4. KEEP (step 5): only on confirmed success drop the marker so the sleeping
-	// revert sees it and exits without reverting.
-	if _, stderr, exit, err := c.runner.run(ctx, addr, keepCmd(marker)); err != nil {
-		return rt, fmt.Errorf("router %s: keep marker (revert may fire): %w", addr, err)
-	} else if exit != 0 {
-		return rt, &CommandError{Addr: addr, Cmd: "keep marker (revert may fire)", StderrText: string(stderr), Exit: exit}
+	// 4. KEEP (step 5). Deferred when autoKeep=false: return the marker so the
+	// caller can KeepExitNode(marker) after an explicit operator decision; the
+	// armed revert fires meanwhile if no Keep arrives. autoKeep=true preserves v1:
+	// drop the marker now so the sleeping revert sees it and exits without reverting.
+	if !autoKeep {
+		return rt, marker, nil
 	}
-	return rt, nil
+	if _, stderr, exit, err := c.runner.run(ctx, addr, keepCmd(marker)); err != nil {
+		return rt, "", fmt.Errorf("router %s: keep marker (revert may fire): %w", addr, err)
+	} else if exit != 0 {
+		return rt, "", &CommandError{Addr: addr, Cmd: "keep marker (revert may fire)", StderrText: string(stderr), Exit: exit}
+	}
+	return rt, "", nil
+}
+
+// KeepExitNode writes the keep-marker for a prior ApplyExitNode(autoKeep=false),
+// cancelling the armed revert (docs/design/keep-egress.md stage 2). It takes the
+// per-router lock (like every other router command) and surfaces a non-zero exit as
+// a *CommandError carrying stderr; a transport failure is returned verbatim. Never
+// swallowed -- on error the marker is unwritten and the revert will still fire.
+func (c *Client) KeepExitNode(ctx context.Context, addr, marker string) error {
+	unlock := c.lockAddr(addr)
+	defer unlock()
+	if _, stderr, exit, err := c.runner.run(ctx, addr, keepCmd(marker)); err != nil {
+		return fmt.Errorf("router %s: keep marker (revert may fire): %w", addr, err)
+	} else if exit != 0 {
+		return &CommandError{Addr: addr, Cmd: "keep marker (revert may fire)", StderrText: string(stderr), Exit: exit}
+	}
+	return nil
+}
+
+// SetExitNode is the v1 synchronous arm→apply→confirm→keep: a thin wrapper over
+// ApplyExitNode with autoKeep=true (the marker is written inline on confirm), kept
+// so callers that do not opt into the explicit-Keep gate are unchanged.
+func (c *Client) SetExitNode(ctx context.Context, addr string, target *store.ExitNodeRef, prev *store.ExitNodeRef) (store.RouterRuntime, error) {
+	rt, _, err := c.ApplyExitNode(ctx, addr, target, prev, true)
+	return rt, err
 }
 
 // Probe runs a READ-ONLY diagnostic on the router over the SAME transport/runner
@@ -633,6 +663,12 @@ func (b *cappedBuffer) Bytes() []byte    { return b.buf.Bytes() }
 func (b *cappedBuffer) overflowed() bool { return b.overflow }
 
 // --- command strings (DESIGN §8 / PHASE_B §6) ---------------------------------
+
+// RevertWindow is the dead-man's-switch window as a duration: after ARM, the
+// router self-reverts to prev unless the keep-marker appears within it. Exported
+// (docs/design/keep-egress.md stage 2) so the poller computes the awaiting-keep
+// RevertAt deadline from this single source of truth -- it matches armCmd's sleep.
+const RevertWindow = revertWindowSeconds * time.Second
 
 const (
 	statusCmd           = "tailscale status --json"

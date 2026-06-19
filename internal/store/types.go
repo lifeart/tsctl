@@ -51,6 +51,13 @@ const (
 	RouterPending     RouterState = "pending"
 	RouterUnconfirmed RouterState = "unconfirmed"
 	RouterUnreachable RouterState = "unreachable"
+	// RouterAwaitingKeep is a CONFIRMED exit-node selection within the dead-man's-
+	// switch revert window whose keep-marker has NOT yet been written (the
+	// explicit-Keep gate, docs/design/keep-egress.md stage 2, behind -require-keep).
+	// It is NOT success: the armed revert WILL fire unless the operator calls Keep
+	// before RevertAt. The UI shows a live countdown + a Keep button; success is
+	// only RouterOK after Keep (or after auto-keep in the default mode).
+	RouterAwaitingKeep RouterState = "awaiting-keep"
 	// RouterUnprobed is a router that is LISTED but has never been contacted:
 	// the non-exit-node auto-discovery fallback surfaces every device as a
 	// consumer WITHOUT auto-SSHing it (a tailnet can have many nodes), so its
@@ -96,6 +103,12 @@ type RouterView struct {
 	Reachable       bool
 	LastError       string // "" = healthy; NEVER swallow -- surface here
 	LastConfirmedAt time.Time
+
+	// RevertAt is the instant the armed dead-man's-switch revert fires for a
+	// confirmed-but-not-yet-kept selection (docs/design/keep-egress.md stage 2). It
+	// is ONLY meaningful while State == RouterAwaitingKeep -- the UI counts down to
+	// it and shows the Keep button. Zero in every other state.
+	RevertAt time.Time
 
 	// Egress probe result (docs/design/keep-egress.md, stage 1). After a CONFIRMED
 	// exit-node SET the poller can run a read-only outbound request FROM the router

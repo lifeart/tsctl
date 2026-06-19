@@ -7,13 +7,14 @@
 //   - the Mapper: it implements poller.Netmapper (Inventory) AND api.WhoIser
 //     (WhoIs returns a fixed demo owner so RequireOwner passes -- there is no
 //     real tailnet identity to check against);
-//   - the RouterClient: it implements poller.RouterClient (Status / SetExitNode)
-//     with SCRIPTED, TIME-VARYING behavior so every UI state is reachable.
+//   - the RouterClient: it implements poller.RouterClient (Status / ApplyExitNode /
+//     KeepExitNode / Probe / EgressProbe) with SCRIPTED, TIME-VARYING behavior so
+//     every UI state is reachable.
 //
 // It is the single source of truth for the demo and is safe for concurrent use.
-// Never-optimistic semantics are preserved: SetExitNode only reports a confirmed
+// Never-optimistic semantics are preserved: ApplyExitNode only reports a confirmed
 // change after it has actually mutated the (in-memory) device state, exactly like
-// the real router client's arm->apply->confirm->keep sequence.
+// the real router client's arm->apply->confirm(->keep) sequence.
 package demo
 
 import (
@@ -272,11 +273,17 @@ func (w *World) EgressProbe(ctx context.Context, addr, url string) (bool, string
 	return true, "HTTP/1.1 204 No Content", nil
 }
 
-// SetExitNode implements poller.RouterClient with the three scripted outcomes
-// (DESIGN §8 failure-mode table). It honours (target, prev): on success current
-// becomes target; on any failure current is left at prev (i.e. the armed revert
-// would restore it), and the error is surfaced, never swallowed.
-func (w *World) SetExitNode(ctx context.Context, addr string, target, prev *store.ExitNodeRef) (store.RouterRuntime, error) {
+// ApplyExitNode implements poller.RouterClient with the three scripted outcomes
+// (DESIGN §8 failure-mode table). It honours (target, prev): on a confirmed apply
+// current becomes target; on any failure current is left at prev (i.e. the armed
+// revert would restore it), and the error is surfaced, never swallowed.
+//
+// On a confirmed apply it mirrors the real client's keep split: autoKeep=true keeps
+// inline and returns marker=="" (v1 behavior); autoKeep=false returns a scripted
+// marker WITHOUT keeping, so `tsctl demo` (which runs with -require-keep ON) shows
+// the awaiting-keep gate + a later KeepExitNode. The device IS on the target during
+// awaiting-keep (the apply happened; only the marker is deferred).
+func (w *World) ApplyExitNode(ctx context.Context, addr string, target, prev *store.ExitNodeRef, autoKeep bool) (store.RouterRuntime, string, error) {
 	unlock := w.lockAddr(addr)
 	defer unlock()
 
@@ -284,7 +291,7 @@ func (w *World) SetExitNode(ctx context.Context, addr string, target, prev *stor
 	select {
 	case <-time.After(ApplyLatency):
 	case <-ctx.Done():
-		return store.RouterRuntime{}, ctx.Err()
+		return store.RouterRuntime{}, "", ctx.Err()
 	}
 
 	w.mu.Lock()
@@ -293,22 +300,22 @@ func (w *World) SetExitNode(ctx context.Context, addr string, target, prev *stor
 	rn := w.findByIPLocked(addr)
 	rs := w.routers[addr]
 	if rn == nil || rs == nil {
-		return store.RouterRuntime{}, fmt.Errorf("demo: no router configured at %s", addr)
+		return store.RouterRuntime{}, "", fmt.Errorf("demo: no router configured at %s", addr)
 	}
 	if !rn.online {
-		return store.RouterRuntime{}, fmt.Errorf("dial %s:22: connect: host is down (demo: router offline)", addr)
+		return store.RouterRuntime{}, "", fmt.Errorf("dial %s:22: connect: host is down (demo: router offline)", addr)
 	}
 
 	switch {
 	case target == nil || target.IP == "": // clear → confirmed Direct
 		rs.currentExitIP = ""
 		rs.rx, rs.tx, rs.lastHandshake = 0, 0, time.Time{}
-		return w.runtimeLocked(addr), nil
+		return w.runtimeLocked(addr), "", nil
 
 	case target.IP == flakyIP:
 		// Applied but NOT confirmed: leave current at prev, report online but
 		// return a non-nil (non-CommandError) error → poller marks unconfirmed.
-		return w.runtimeLocked(addr), fmt.Errorf(
+		return w.runtimeLocked(addr), "", fmt.Errorf(
 			"router %s: exit-node not confirmed (revert will fire): want %s, got %s",
 			addr, target.IP, currentArg(rs))
 
@@ -319,16 +326,41 @@ func (w *World) SetExitNode(ctx context.Context, addr string, target, prev *stor
 		// runtime we return (and any re-read via Status) reflects that unchanged
 		// state, not a contradictory one. The poller surfaces the error and shows
 		// the actual, unchanged selection (no misleading "unconfirmed/auto-revert").
-		return w.runtimeLocked(addr), &router.CommandError{
+		return w.runtimeLocked(addr), "", &router.CommandError{
 			Addr: addr, Cmd: "apply exit-node", StderrText: "permission denied", Exit: 1,
 		}
 
-	default: // normal target → confirmed
+	default: // normal target → confirmed apply
 		rs.currentExitIP = target.IP
 		rs.rx, rs.tx = 96_000, 24_000 // a fresh tunnel starts with a little traffic
 		rs.lastHandshake = time.Now()
-		return w.runtimeLocked(addr), nil
+		marker := ""
+		if !autoKeep {
+			// Deferred keep: hand back a scripted marker the poller records and later
+			// passes to KeepExitNode.
+			marker = fmt.Sprintf("/tmp/tsctl-keep-demo-%d-%x", time.Now().UnixNano(), mrand.Uint32())
+		}
+		return w.runtimeLocked(addr), marker, nil
 	}
+}
+
+// KeepExitNode implements poller.RouterClient: the demo device is already on the
+// target after a confirmed ApplyExitNode, so Keep just "cancels the revert" — a
+// no-op success (offline/unknown still error like a failed dial, never swallowed).
+func (w *World) KeepExitNode(ctx context.Context, addr, marker string) error {
+	unlock := w.lockAddr(addr)
+	defer unlock()
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	rn := w.findByIPLocked(addr)
+	if rn == nil {
+		return fmt.Errorf("demo: no router configured at %s", addr)
+	}
+	if !rn.online {
+		return fmt.Errorf("dial %s:22: connect: host is down (demo: router offline)", addr)
+	}
+	return nil
 }
 
 // --- time variation ----------------------------------------------------------

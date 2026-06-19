@@ -513,6 +513,51 @@ body {
 }
 .egress-when { margin-top: 0.25rem; color: var(--text-tertiary); font-size: 0.75rem; }
 
+/* explicit-Keep gate (stage 2, docs/design/keep-egress.md): shown only while the
+   router is "awaiting-keep" (a confirmed-but-not-kept selection in the revert
+   window). Amber/attention block with a live countdown + a prominent Keep button —
+   explicitly NOT a success treatment; not keeping in time auto-reverts. */
+.keep-gate {
+  margin-top: 0.6rem;
+  padding: 0.7rem 0.8rem;
+  border-radius: var(--radius);
+  background: var(--amber-tint);
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+.keep-gate.hidden { display: none; }
+.keep-note {
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--c-amber);
+  line-height: 1.35;
+  font-variant-numeric: tabular-nums;   /* steady width as the countdown ticks */
+}
+.keep-btn {
+  font: inherit;
+  font-size: 0.9375rem;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  align-self: flex-start;
+  min-height: 38px;
+  padding: 0 1.4rem;
+  color: #fff;
+  background: var(--accent);
+  border: none;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background var(--t), opacity var(--t);
+}
+.keep-btn:hover { opacity: 0.9; }
+.keep-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+.keep-btn .spinner { width: 0.85rem; height: 0.85rem; }
+.keep-err { font-size: 0.8125rem; color: var(--c-red); line-height: 1.35; word-break: break-word; }
+.keep-err.hidden { display: none; }
+
 /* ----------------------------------------------- dots & icons ---------- */
 .dot {
   display: inline-block;
@@ -553,6 +598,9 @@ body {
 .state-ok { background: var(--green-tint); color: var(--c-green); }
 .state-pending { background: var(--amber-tint); color: var(--c-amber); }
 .state-unconfirmed { background: var(--amber-tint); color: var(--c-amber); }
+/* awaiting-keep (stage 2): a CONFIRMED-but-not-yet-kept selection inside the revert
+   window. Amber = attention/decision-needed — explicitly NOT the green success state. */
+.state-awaiting-keep { background: var(--amber-tint); color: var(--c-amber); }
 .state-unreachable { background: var(--red-tint); color: var(--c-red); }
 .state-unknown { background: var(--fill); color: var(--text-secondary); }
 /* Online in the netmap but tsctl can't control it: amber (a problem that needs

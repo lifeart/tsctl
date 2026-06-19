@@ -59,6 +59,12 @@ type Config struct {
 	EgressCheck bool
 	EgressURL   string
 
+	// RequireKeep gates the explicit-Keep step (docs/design/keep-egress.md stage 2).
+	// Default FALSE = backward-compatible auto-keep. When true, a confirmed exit-node
+	// change is held in "awaiting-keep" within the revert window until the operator
+	// issues an explicit Keep (the strongest dead-man's-switch).
+	RequireKeep bool
+
 	// --- router command transport (DEFAULT: tailscale-ssh) ---------------------
 	// RouterTransport selects how tsctl reaches a router to run commands:
 	//   - "tailscale-ssh" (default): SSH over the tailnet, `none` auth (ACL-gated).
@@ -141,6 +147,12 @@ func loadConfig(args []string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Explicit-Keep gate defaults to FALSE (backward-compatible auto-keep); a
+	// set-but-invalid env value is a hard error, like the bools above.
+	requireKeepDef, err := envBool("TSCTL_REQUIRE_KEEP", false)
+	if err != nil {
+		return nil, err
+	}
 
 	// StateDir default: systemd's STATE_DIRECTORY when present, else local dir.
 	defStateDir := env("TSCTL_STATE_DIR", env("STATE_DIRECTORY", "./tsnet-state"))
@@ -164,6 +176,8 @@ func loadConfig(args []string) (*Config, error) {
 		"after a confirmed exit-node change, run a read-only egress probe ON the router (default true)")
 	fs.StringVar(&c.EgressURL, "egress-url", env("TSCTL_EGRESS_URL", defaultEgressURL),
 		"URL the egress probe fetches from the router (http(s) only, no shell metacharacters)")
+	fs.BoolVar(&c.RequireKeep, "require-keep", requireKeepDef,
+		"require an explicit operator Keep within the revert window after a confirmed exit-node change (default false = auto-keep)")
 	fs.StringVar(&c.RouterTransport, "router-transport", env("TSCTL_ROUTER_TRANSPORT", "tailscale-ssh"),
 		"router command transport: tailscale-ssh (default) | ip-password (opt-in, host-key-verified, LAN-trusted)")
 	fs.StringVar(&c.RouterHostKeyMode, "router-hostkey-mode", env("TSCTL_ROUTER_HOSTKEY_MODE", "tofu"),

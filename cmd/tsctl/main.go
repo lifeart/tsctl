@@ -218,6 +218,7 @@ func runServe(args []string, lg *log.Logger) error {
 	hub := sse.New(st, api.EncodeSnapshot)
 	pol := poller.New(st, mapper, rc, grpStore, cfg.Routers, hub, hub.Transitions(), cfg.PollInterval, lg.Printf)
 	pol.ConfigureEgress(cfg.EgressCheck, cfg.EgressURL) // post-confirm egress probe (keep-egress stage 1)
+	pol.ConfigureKeep(cfg.RequireKeep)                  // explicit-Keep gate (keep-egress stage 2); default OFF = auto-keep
 	apiH := api.New(st, mapper, pol, api.Config{
 		Owner:        cfg.Owner,
 		UIPassword:   cfg.UIPassword,
@@ -539,6 +540,7 @@ func runDemo(lg *log.Logger) error {
 	// are visibly streamed to the browser.
 	pol := poller.New(st, world, world, dgroups, world.RouterIPs(), hub, hub.Transitions(), demo.TickInterval, lg.Printf)
 	pol.ConfigureEgress(true, defaultEgressURL) // exercise the egress ✓/✗ indicator in the demo
+	pol.ConfigureKeep(true)                     // demo runs with the explicit-Keep gate ON so the UI shows it
 	demoCfg := api.Config{Owner: demo.Owner, AllowedHosts: world.AllowedHosts(), Groups: dgroups}
 	// Optional password-preview: with TSCTL_UI_PASSWORD set, disable the auto-owner
 	// path so the login overlay (the host-port/session UI) is exercised offline.
