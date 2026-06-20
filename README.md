@@ -18,8 +18,9 @@ See [DESIGN.md](DESIGN.md) — the locked single source of truth.
 > inventory (netmap) + per-router exit-node control over SSH with a dead-man's
 > switch (poller/router); a live SPA with a **zone graph** as the default view;
 > **server-side zones** (groups) with enforced allowed-exit-nodes; auth on **two
-> paths** (tailnet `WhoIs` owner *and* an optional password-protected host port);
-> two router transports (**Tailscale SSH** default, opt-in **ip-password**);
+> paths** (tailnet `WhoIs` owner *and* an optional password-protected host port),
+> plus opt-in per-zone **guest credentials** ([guest mode](#guest-mode)); two
+> router transports (**Tailscale SSH** default, opt-in **ip-password**);
 > router auto-discovery. `go build ./...`, `go vet ./...`, and `go test -race ./...`
 > pass, including a full-stack integration test (`internal/integration`). The
 > **live** UI→router→UI flow needs a real tailnet — see
@@ -185,6 +186,11 @@ shown the login form. A failed auth is **401** (the SPA shows a login form);
 **403** is reserved for Host/CSRF (DNS-rebinding) failures. Sessions are signed
 with a random per-process secret, so a restart invalidates them (sign in again).
 
+Both of those auth paths yield a **full-access admin**. There is also a second,
+lower-privilege access level — per-zone **guest** credentials — see
+[Guest mode](#guest-mode) below. It needs no config (it's managed in the UI) and
+nothing changes until you create a guest.
+
 After first enrollment the node key lives in the state dir and `TS_AUTHKEY` is no
 longer needed — drop it.
 
@@ -267,6 +273,54 @@ Health check (loopback only, never exposed to the tailnet or LAN):
 ```sh
 curl http://127.0.0.1:8088/healthz
 ```
+
+### Guest mode
+
+Both auth paths above make you a **full-access admin**. **Guest mode** adds a
+second, lower-privilege access level so you can **hand someone a password for one
+zone without admin concerns** — they can flip that zone's routers between its
+allowed exit nodes, and see and do nothing else on the fleet. There is **no flag
+or config** for it: it's managed in the UI, and behavior is unchanged until you
+create the first guest. Full design: [docs/design/guest-mode.md](docs/design/guest-mode.md).
+
+**Create / revoke a guest (admin, in the UI).** As an admin, open the **Guests**
+panel and create a guest with a **label**, the **one zone** it manages, and a
+**password** (8–72 chars). The password is bcrypt-hashed on the server
+(`$STATE_DIR/guests.json`, 0600) and the hash never leaves the server or appears
+in any response — so the list only ever shows label / zone / created date /
+enabled-or-disabled status (never a password or hash).
+**Disable** (toggle) or **delete** a guest to revoke it; either takes effect on
+the guest's very next request (you can't delete a zone while a guest is still
+assigned to it — reassign or remove the guest first).
+
+**Signing in as a guest.** On the login form, enter the **guest label** and its
+password (leaving the label empty is the admin/`UIPassword` path). A guest then
+sees a single-zone view:
+
+- **Can:** see only their zone — its routers and that zone's allowed exit nodes —
+  and change those routers' exit nodes (restricted to the allowed list; the
+  current exit node is auto-resolved, so there's no manual *Test SSH*).
+- **Can't:** see or touch any other zone or router, edit zones, manage guests, or
+  use the device tools. Those affordances are hidden, but the **server**, not the
+  UI, is what enforces it.
+
+**Security properties.** Enforcement is **server-side**: every guest write is
+re-checked against the guest's *own* live zone (allowed routers + allowed exit
+nodes — stricter than the cross-zone poller check), all zone/guest management is
+admin-only (403 for a guest), and out-of-zone reads are filtered or return a 404
+with no oracle. The role is carried unforgeably inside the signed session cookie
+(a tampered role fails the HMAC; a guest cookie can never assert admin), and the
+zone binding is re-resolved from the store on every request, so a disable/delete
+revokes access immediately (within one heartbeat, ~20s, for the live event
+stream). Passwords are bcrypt (cost 12); the hash never reaches the wire or the
+logs.
+
+> ⚠️ **Plain-HTTP caveat (same as the admin's).** Guest passwords and session
+> cookies travel exactly like the admin's: over the tailnet WireGuard protects
+> them, but the optional **host port is plain HTTP** — on any shared/untrusted
+> network, front the host port with a **TLS reverse proxy** (see the host-port
+> note under [Run on a NAS](#run-on-a-nas-docker)). Guest mode does not
+> change the transport; it relies on the same protection.
 
 ## `tsctl spike` — prove the router transport on your real network
 

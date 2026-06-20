@@ -1,8 +1,9 @@
 # tsctl — handoff
 
-State as of `978daaa`. Released tag: **v0.1.0** (on GHCR + GitHub Release). Current
-HEAD is materially ahead; a **v0.2.0** image is built **locally** (not tagged/pushed
-yet — see "Build & release").
+State as of `816f32a`. Last published tag: **v0.1.0** (on GHCR + GitHub Release).
+The v0.2.x line shipped as **local images only** (Synology Container Manager).
+**v0.3.0 (guest mode) is being released now** — the orchestrator tags + pushes it
+after this handoff (see "Build, run, release").
 
 ## What it is
 
@@ -16,10 +17,10 @@ default view) over the tailnet and, optionally, a password-protected host port.
 Nothing runs on the routers but the Tailscale they already have.
 
 Authoritative specs: **`DESIGN.md`** (locked), **`PHASE_B.md`** (§3 wire contract,
-§4 types), and `docs/design/{zones,ip-password-ssh,keep-egress}.md`. **Read those
-before changing the seam** — interface/field names are a frozen contract.
+§4 types), and `docs/design/{zones,ip-password-ssh,keep-egress,guest-mode}.md`.
+**Read those before changing the seam** — interface/field names are a frozen contract.
 
-Toolchain: **Go 1.26.4**, **tailscale.com v1.100.0**. 122 test funcs; CI runs
+Toolchain: **Go 1.26.4**, **tailscale.com v1.100.0**. 149 test funcs; CI runs
 gofmt / vet / build / `go test -race` / `go mod tidy` check on every push.
 
 ## Architecture (the load-bearing invariants — do not break these)
@@ -47,10 +48,30 @@ gofmt / vet / build / `go test -race` / `go mod tidy` check on every push.
   self-heals. The split is `ApplyExitNode(autoKeep)` + `KeepExitNode(marker)`.
 - **Auth (fail-closed, DESIGN §7):** tailnet `WhoIs`==owner OR a signed session
   cookie (password path); every request Host-pinned (anti-rebinding) + CSRF on
-  writes. 401 = login, 403 = Host/CSRF.
+  writes. 401 = login, 403 = Host/CSRF. **Two roles** resolved per request into an
+  `authz.Subject`: full-access **admin** (owner or `UIPassword`) or a zone-scoped
+  **guest** (guest mode, below); the role rides inside the cookie's HMAC region.
 
 ## Features (what shipped this cycle, newest first)
 
+- **Guest mode** (per-zone scoped credentials, `docs/design/guest-mode.md`): an
+  admin-managed, **bcrypt(cost 12)** credential type (persisted
+  `$STATE_DIR/guests.json`, 0600; hash never leaves `internal/guests`) layered on
+  the existing admin auth. A guest = `{label, one zone, password}`, signs in with
+  `{label,password}`, and may ONLY see + re-exit that one zone (server-filtered),
+  within its allowed list. Server-side authz is the source of truth: `RequireAdmin`
+  on all group/guest CRUD, `authorizeRouterWrite` on set/keep/probe vs the guest's
+  OWN zone (stricter than the poller's cross-zone union → closes shared-router
+  escalation), zone-filtered reads (404/no-oracle). Role rides inside the signed
+  cookie's HMAC region; the zone is re-resolved live each request → instant
+  revocation (one SSE heartbeat for the live stream). Default = byte-for-byte
+  unchanged when no guests exist; **no flag**. An independent security gate + a
+  zone-escape audit (two findings fixed: SSE read-revocation lag, fail-open reads).
+- **`tailnet-password` transport** (`TSCTL_ROUTER_TRANSPORT=tailnet-password` +
+  `TSCTL_SSH_PASSWORD`): password SSH to the router's `100.x` over the tailnet —
+  no Tailscale SSH, no LAN-endpoint map. Works from a bridged Docker container
+  (NAS) that can't route `100.x` with a plain dialer. Needs a `tcp` ACL grant to
+  `:22` + a router root password.
 - **Explicit-Keep gate** (`keep-egress` stage 2, **opt-in `-require-keep`, default
   OFF**): a confirmed set holds the router armed (`awaiting-keep` + countdown) until
   the operator `POST /api/routers/{id}/keep` within the window, else it auto-reverts.
@@ -78,11 +99,12 @@ go build ./... && go vet ./... && go test -race ./...   # must stay green
   compiled binaries + a multi-arch image (no push unless `PUSH=1`). For Synology I
   build per-arch + rewrite the tarball `RepoTags` to a bare `tsctl:<ver>` (no
   registry → `pull_policy: never` works) into `./dist/` (gitignored). Current local
-  build: **v0.2.0** (`dist/tsctl-v0.2.0-linux-{amd64,arm64}-image.tar.gz`).
+  build: **v0.3.0** (`dist/tsctl-v0.3.0-linux-{amd64,arm64}-image.tar.gz`; the
+  Synology compose already points at the v0.3.0 local image).
 - **Publish a release:** `git tag vX.Y.Z && git push --tags` → `.github/workflows/
   release.yml` builds + pushes `ghcr.io/lifeart/tsctl:<tag>`+`:latest` and attaches
-  binaries to a GitHub Release. **v0.2.0 is NOT yet tagged/pushed** — do this when
-  ready to publish the current HEAD.
+  binaries to a GitHub Release. **v0.3.0 (guest mode) is being tagged/pushed now**
+  to publish the current HEAD.
 - **Deploy:** `deploy/tsctl.service` (hardened systemd, `LoadCredential` for the
   auth key) or `docker-compose.yml` (NAS) / `deploy/docker-compose.synology.yml`
   (Container Manager, UI on :8087, runs as root for the state-volume perms, loads
@@ -136,12 +158,14 @@ internal/store/   immutable Snapshot + atomic Store (frozen contract)
 internal/netmap/  inventory + WhoIs over LocalClient
 internal/router/  SSH transport (tailscale-ssh | tailnet-password | ip-password); dead-man's-switch; Probe; EgressProbe
 internal/poller/  the refresh loop + SetExitNode/Keep/RefreshGroups; setSeq/setGen guards
-internal/sse/     single-goroutine, latest-wins broadcast hub
-internal/api/     handlers + fail-closed auth/CSRF/Host middleware; wire DTOs
+internal/sse/     single-goroutine, latest-wins broadcast hub (per-connection guest zone filter + heartbeat revalidation)
+internal/api/     handlers + fail-closed auth/CSRF/Host middleware; wire DTOs; RequireAdmin + authorizeRouterWrite + guest CRUD
+internal/authz/   cross-cutting Subject (admin|guest) + context + pure FilterSnapshotToZone (shared by api + sse, no cycle)
 internal/groups/  persisted zone store (atomic JSON)
+internal/guests/  persisted guest-credential store ($STATE_DIR/guests.json, 0600; bcrypt cost 12; hash never leaves the package)
 internal/demo/    scripted offline World for `tsctl demo`
 web/              embedded SPA (app.js, index.html, style.css)
 demo/             GitHub-Pages live demo (mock.js monkeypatches fetch+EventSource)
 deploy/           systemd unit + Synology compose
-docs/design/      zones, ip-password-ssh, keep-egress
+docs/design/      zones, ip-password-ssh, keep-egress, guest-mode
 ```
