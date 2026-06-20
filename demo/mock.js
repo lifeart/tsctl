@@ -973,23 +973,47 @@
     }
 
     // Exit-node mutation.
+    // Guest write-authorization, mirroring the Go authorizeRouterWrite: a guest may
+    // act ONLY on routers in its OWN zone, and (for a set) only target that zone's
+    // allowed exit nodes (or clear). Admin is unrestricted. 403 (uniform, no oracle)
+    // otherwise -- so the demo faithfully shows the server sandbox, not just the UI.
+    function guestWriteDenied(routerID, target) {
+      if (session.role !== "guest") return null;
+      var g = groups[findGroupIndex(session.zoneId)];
+      if (!g || (g.consumers || []).indexOf(routerID) === -1) {
+        return json(403, errBody("forbidden", "", ""));
+      }
+      if (target && (g.allowedExitNodes || []).indexOf(target) === -1) {
+        return json(403, errBody("forbidden", "", ""));
+      }
+      return null;
+    }
+
     var rm = path.match(/^\/api\/routers\/([^/]+)\/exit-node$/);
     if (rm && method === "POST") {
       var routerID = decodeURIComponent(rm[1]);
       var target = (body && typeof body.exitNode === "string") ? body.exitNode : "";
+      var dEx = guestWriteDenied(routerID, target);
+      if (dEx) return Promise.resolve(dEx);
       return setExitNode(routerID, target);
     }
 
     // SSH probe ("Test SSH").
     var pm = path.match(/^\/api\/routers\/([^/]+)\/probe$/);
     if (pm && method === "POST") {
-      return probeRouter(decodeURIComponent(pm[1]));
+      var probeID = decodeURIComponent(pm[1]);
+      var dPr = guestWriteDenied(probeID, "");
+      if (dPr) return Promise.resolve(dPr);
+      return probeRouter(probeID);
     }
 
     // Explicit-Keep gate (stage 2): confirm an awaiting-keep selection.
     var km = path.match(/^\/api\/routers\/([^/]+)\/keep$/);
     if (km && method === "POST") {
-      return keepRouter(decodeURIComponent(km[1]));
+      var keepID = decodeURIComponent(km[1]);
+      var dKp = guestWriteDenied(keepID, "");
+      if (dKp) return Promise.resolve(dKp);
+      return keepRouter(keepID);
     }
 
     // Any other /api/ path: 404 (mirrors the backend's unknown-route behavior).
