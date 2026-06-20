@@ -1,9 +1,9 @@
 # tsctl — handoff
 
-State as of `816f32a`. Last published tag: **v0.1.0** (on GHCR + GitHub Release).
-The v0.2.x line shipped as **local images only** (Synology Container Manager).
-**v0.3.0 (guest mode) is being released now** — the orchestrator tags + pushes it
-after this handoff (see "Build, run, release").
+State at the **v0.3.0** release (guest mode). Published tags (GHCR + GitHub
+Release): **v0.1.0**, **v0.2.4**, **v0.3.0**; the intermediate v0.2.0–v0.2.3 builds
+were local images only (Synology Container Manager). The Synology compose tracks
+the latest local `tsctl:v0.3.0` tarball.
 
 ## What it is
 
@@ -103,8 +103,8 @@ go build ./... && go vet ./... && go test -race ./...   # must stay green
   Synology compose already points at the v0.3.0 local image).
 - **Publish a release:** `git tag vX.Y.Z && git push --tags` → `.github/workflows/
   release.yml` builds + pushes `ghcr.io/lifeart/tsctl:<tag>`+`:latest` and attaches
-  binaries to a GitHub Release. **v0.3.0 (guest mode) is being tagged/pushed now**
-  to publish the current HEAD.
+  binaries to a GitHub Release. **v0.3.0 (guest mode) is published** (tag pushed);
+  bump the minor for the next feature.
 - **Deploy:** `deploy/tsctl.service` (hardened systemd, `LoadCredential` for the
   auth key) or `docker-compose.yml` (NAS) / `deploy/docker-compose.synology.yml`
   (Container Manager, UI on :8087, runs as root for the state-volume perms, loads
