@@ -28,8 +28,20 @@
 //   POST   /api/routers/{id}/probe         -> SSH probe: 200 {ok,durationMs,output|
 //                                             error,checkedAt} (online OK / control-
 //                                             error / offline) | 404 unknown id
-//   POST   /api/login, /api/logout         -> 200 (no auth in the demo)
+//   GET    /api/me                         -> {role, zoneId, zoneName} (admin/guest)
+//   POST   /api/login                      -> body {label,password}: empty label =
+//                                             admin; a label = guest (matched by
+//                                             label) -> sets the demo session role
+//   POST   /api/logout                     -> 200, clears the demo session (401 next)
+//   GET    /api/guests                     -> GuestDTO[] (admin; NO password hash)
+//   POST   /api/guests                     -> create {label,zoneId,password} (201|422)
+//   POST   /api/guests/{id}/disabled       -> toggle {disabled} (200|404)
+//   DELETE /api/guests/{id}                -> 204 | 404
 //   (anything else under /api/)            -> 404
+//
+// Guest session: when "logged in as a guest" the snapshot + /api/nodes are
+// zone-FILTERED (filterSnapshotToZone mirrors Go authz.FilterSnapshotToZone) so the
+// gh-pages demo shows guest mode end to end (gating + one-zone view + auto-resolve).
 //   EventSource /api/events                -> full Snapshot frame on connect, then
 //                                             a fresh frame every ~3s (stats tick,
 //                                             one generic node flips online/offline)
@@ -212,6 +224,41 @@
       allowedExitNodes: ["n-exit-tokyo", "n-exit-frankfurt", "n-exit-flaky", "n-exit-broken"] },
   ];
 
+  // ---------------------------------------------------------- guest mode ----
+  // In-memory guest credentials (guest mode). The DTO is HASH-FREE — mirroring the
+  // Go store.Guest / GuestDTO, the demo never models or exposes a password hash. One
+  // seeded guest so the admin panel shows a populated list and a visitor can sign in
+  // as "contractor-alex" (any password) to try the guest view end to end.
+  var guests = [
+    { id: "guest-seed-1", label: "contractor-alex", zoneId: "zone-work",
+      disabled: false, createdAt: rfc3339(ago(2 * 24 * 60 * 60000)) },
+  ];
+
+  // The demo "session": who the SPA is currently signed in as. Default ADMIN so the
+  // demo loads straight into the full UI (no login wall) — matching the prior demo.
+  //   role : "admin" | "guest" | null (signed out, after /api/logout)
+  //   zoneId / zoneName : the bound zone for a guest session
+  var session = { role: "admin", zoneId: "", zoneName: "" };
+
+  function zoneNameById(id) {
+    for (var i = 0; i < groups.length; i++) if (groups[i].id === id) return groups[i].name;
+    return "";
+  }
+  function findGuestIndex(id) {
+    for (var i = 0; i < guests.length; i++) if (guests[i].id === id) return i;
+    return -1;
+  }
+  function newGuestID() {
+    var hex = "guest-";
+    for (var i = 0; i < 12; i++) hex += Math.floor(Math.random() * 16).toString(16);
+    for (var j = 0; j < guests.length; j++) if (guests[j].id === hex) return newGuestID();
+    return hex;
+  }
+  // Hash-free wire shape, matching the Go GuestDTO (api.go:1140).
+  function guestDTO(g) {
+    return { id: g.id, label: g.label, zoneId: g.zoneId, disabled: g.disabled, createdAt: g.createdAt };
+  }
+
   // ---------------------------------------------------------- lookups ------
   function nodeByID(id) {
     for (var i = 0; i < nodes.length; i++) if (nodes[i].stableID === id) return nodes[i];
@@ -373,9 +420,34 @@
     };
   }
 
+  // Zone-filter a full snapshot down to one zone — the client-side mirror of the Go
+  // authz.FilterSnapshotToZone (Phase 4): Groups = [that one zone]; allowed set =
+  // its Consumers ∪ AllowedExitNodes; Nodes = nodes in that set (offline allowed
+  // exits kept so the picker matches admin); Routers = routers whose node is a
+  // Consumer. Never mutates the inputs; carries netmapAt/Err/builtAt through.
+  function filterSnapshotToZone(snap, zoneID) {
+    var raw = null;
+    for (var i = 0; i < groups.length; i++) if (groups[i].id === zoneID) raw = groups[i];
+    if (!raw) {
+      // Zone gone (the guest would be revoked server-side): an empty filtered view.
+      return { nodes: [], routers: [], groups: [], netmapAt: snap.netmapAt, netmapErr: snap.netmapErr, builtAt: snap.builtAt };
+    }
+    var allow = {}, cons = {};
+    (raw.consumers || []).forEach(function (id) { allow[id] = true; cons[id] = true; });
+    (raw.allowedExitNodes || []).forEach(function (id) { allow[id] = true; });
+    return {
+      nodes: snap.nodes.filter(function (n) { return allow[n.stableID]; }),
+      routers: snap.routers.filter(function (rv) { return rv.node && cons[rv.node.stableID]; }),
+      groups: snap.groups.filter(function (gv) { return gv.id === zoneID; }),
+      netmapAt: snap.netmapAt,
+      netmapErr: snap.netmapErr,
+      builtAt: snap.builtAt,
+    };
+  }
+
   function buildSnapshot() {
     var iso = rfc3339(new Date());
-    return {
+    var full = {
       nodes: nodes.map(nodeDTO),
       routers: ROUTER_IPS.map(routerViewDTO),
       groups: groupViewDTOs(),
@@ -383,6 +455,9 @@
       netmapErr: "",
       builtAt: iso,
     };
+    // A guest session sees ONLY its zone (server-side filtering in the real backend).
+    if (session.role === "guest") return filterSnapshotToZone(full, session.zoneId);
+    return full;
   }
 
   // ----------------------------------------------- zone enforcement set ----
@@ -747,6 +822,48 @@
     });
   }
 
+  // --- guest CRUD (admin-only; guest mode) --------------------------------
+  // Mirrors the Go handlers: POST {label,zoneId,password} -> 201 GuestDTO (no hash)
+  // | 422 validation; the password is accepted but NEVER stored as a hash here (the
+  // demo authenticates a guest by label alone). An unknown zoneId is rejected.
+  function createGuest(body) {
+    var label = String((body && body.label) || "").trim();
+    var zoneId = String((body && body.zoneId) || "").trim();
+    var password = String((body && body.password) || "");
+    if (!label) return Promise.resolve(json(422, errBody("invalid guest", "label must not be empty", "")));
+    if (password.length < 8) return Promise.resolve(json(422, errBody("invalid guest", "password must be at least 8 characters", "")));
+    if (!zoneId || findGroupIndex(zoneId) === -1) {
+      return Promise.resolve(json(422, errBody("invalid guest", "no zone with id " + zoneId, "")));
+    }
+    for (var i = 0; i < guests.length; i++) {
+      if (guests[i].label.toLowerCase() === label.toLowerCase()) {
+        return Promise.resolve(json(422, errBody("invalid guest", 'a guest labeled "' + label + '" already exists', "")));
+      }
+    }
+    var created = { id: newGuestID(), label: label, zoneId: zoneId, disabled: false, createdAt: rfc3339(new Date()) };
+    return delay(GROUP_MS, null).then(function () {
+      guests.push(created);
+      return json(201, guestDTO(created));
+    });
+  }
+  function setGuestDisabled(id, body) {
+    var idx = findGuestIndex(id);
+    if (idx === -1) return Promise.resolve(json(404, errBody("guest not found", "no guest with id " + id, "")));
+    var disabled = !!(body && body.disabled);
+    return delay(GROUP_MS, null).then(function () {
+      guests[idx].disabled = disabled;
+      return json(200, guestDTO(guests[idx]));
+    });
+  }
+  function deleteGuest(id) {
+    var idx = findGuestIndex(id);
+    if (idx === -1) return Promise.resolve(json(404, errBody("guest not found", "no guest with id " + id, "")));
+    return delay(GROUP_MS, null).then(function () {
+      guests.splice(idx, 1);
+      return noContent();
+    });
+  }
+
   // --- router table -------------------------------------------------------
   function route(method, path, bodyText) {
     var body = null;
@@ -759,15 +876,62 @@
       return Promise.resolve(json(200, { token: "demo" }));
     }
     if (path === "/api/nodes" && method === "GET") {
-      return Promise.resolve(json(200, {
-        nodes: nodes.map(nodeDTO), builtAt: rfc3339(new Date()), netmapErr: "",
-      }));
+      // Signed out -> 401 (the SPA shows the login overlay), as the real backend does.
+      if (!session.role) return Promise.resolve(json(401, errBody("login required", "", "")));
+      // buildSnapshot already zone-filters for a guest session.
+      var snap = buildSnapshot();
+      return Promise.resolve(json(200, { nodes: snap.nodes, builtAt: snap.builtAt, netmapErr: snap.netmapErr }));
     }
+    // Who am I: role + (for a guest) the bound zone. Mirrors GET /api/me (MeResponse).
+    if (path === "/api/me" && method === "GET") {
+      if (session.role === "guest") {
+        return Promise.resolve(json(200, { role: "guest", zoneId: session.zoneId, zoneName: session.zoneName }));
+      }
+      if (session.role === "admin") {
+        return Promise.resolve(json(200, { role: "admin", zoneId: "", zoneName: "" }));
+      }
+      return Promise.resolve(json(401, errBody("login required", "", "")));
+    }
+    // Login: body {label, password}. Empty label = ADMIN (any password in the demo);
+    // a non-empty label = GUEST (matched by label against a non-disabled guest; the
+    // demo ignores the password). An unknown/disabled label -> uniform 401.
     if (path === "/api/login" && method === "POST") {
+      var label = (body && typeof body.label === "string") ? body.label.trim() : "";
+      if (label === "") {
+        session = { role: "admin", zoneId: "", zoneName: "" };
+        return Promise.resolve(json(200, { ok: true }));
+      }
+      var g = null;
+      for (var gi = 0; gi < guests.length; gi++) {
+        if (guests[gi].label === label && !guests[gi].disabled) { g = guests[gi]; break; }
+      }
+      if (!g) return delay(PREFLIGHT_MS, json(401, errBody("invalid credentials", "", "")));
+      session = { role: "guest", zoneId: g.zoneId, zoneName: zoneNameById(g.zoneId) };
       return Promise.resolve(json(200, { ok: true }));
     }
     if (path === "/api/logout" && method === "POST") {
+      session = { role: null, zoneId: "", zoneName: "" };
       return Promise.resolve(json(200, { ok: true }));
+    }
+
+    // Guest CRUD (admin-only -> 403 for a guest session, mirroring RequireAdmin).
+    if (path === "/api/guests" && method === "GET") {
+      if (session.role !== "admin") return Promise.resolve(json(403, errBody("admin only", "", "")));
+      return Promise.resolve(json(200, guests.map(guestDTO)));
+    }
+    if (path === "/api/guests" && method === "POST") {
+      if (session.role !== "admin") return Promise.resolve(json(403, errBody("admin only", "", "")));
+      return createGuest(body);
+    }
+    var gdm = path.match(/^\/api\/guests\/([^/]+)\/disabled$/);
+    if (gdm && method === "POST") {
+      if (session.role !== "admin") return Promise.resolve(json(403, errBody("admin only", "", "")));
+      return setGuestDisabled(decodeURIComponent(gdm[1]), body);
+    }
+    var gxm = path.match(/^\/api\/guests\/([^/]+)$/);
+    if (gxm && method === "DELETE") {
+      if (session.role !== "admin") return Promise.resolve(json(403, errBody("admin only", "", "")));
+      return deleteGuest(decodeURIComponent(gxm[1]));
     }
 
     // Zone (group) CRUD.

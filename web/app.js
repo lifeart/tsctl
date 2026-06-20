@@ -66,6 +66,18 @@
     selectedZone: null,   // selected zone id, or UNGROUPED, or null (= default)
     pendingZoneId: null,  // a just-created zone id awaiting its first snapshot (don't reset)
     graphDrag: null,      // active drag descriptor while rewiring by drag
+    // --- guest mode (Phase 5/6) ---------------------------------------------
+    role: null,           // "admin" | "guest" | null (until GET /api/me resolves)
+    zoneId: null,         // guest: bound zone id (from /api/me)
+    zoneName: "",         // guest: bound zone name (from /api/me)
+    guestResolved: false, // guest: the once-per-load auto-resolve probe has fired
+    guestList: [],        // admin: GuestDTO[] from GET /api/guests (NEVER a hash)
+    guestListLoaded: false,
+    guestListError: "",
+    guestModeDisabled: false, // admin: /api/guests 404 -> no guest store on the server
+    guestBusy: false,     // admin: a POST /api/guests (create) is in flight
+    guestRowBusy: {},     // admin: guestId -> true while disable/delete is in flight
+    guestFormError: "",   // admin: inline create-form error
   };
 
   var nodeEls = {};       // stableID -> node card record
@@ -889,6 +901,16 @@
   function renderProbe(rec, sid) {
     var p = state.probes[sid];
     var btn = rec.probeBtn, box = rec.probeResult;
+    // Guests never get the manual "Test SSH" affordance (their zone auto-resolves
+    // once on load). Hide the button (the card view is hidden for guests anyway --
+    // belt-and-braces so a stray render can't expose it).
+    if (isGuest()) {
+      show(btn, false);
+      setText(box, "");
+      box.className = "probe-result hidden";
+      return;
+    }
+    show(btn, true);
     if (!p) {
       btn.disabled = false;
       setText(btn, "Test SSH");
@@ -1832,10 +1854,16 @@
   }
 
   function renderZoneActions(zone) {
+    // Guests get NO zone-management affordances: no New / Edit / Delete and no
+    // manual "Test SSH all" (their zone auto-resolves on load). Admin is unchanged.
+    var guest = isGuest();
     var isGroup = !!(zone && zone.id !== UNGROUPED && zone.group);
+    var newBtn = $("#zone-new");
+    if (newBtn) { show(newBtn, !guest); newBtn.hidden = guest; }
+    var canEdit = isGroup && !guest;
     var editBtn = $("#zone-edit"), delBtn = $("#zone-delete");
-    if (editBtn) { show(editBtn, isGroup); editBtn.hidden = !isGroup; }
-    if (delBtn) { show(delBtn, isGroup); delBtn.hidden = !isGroup; }
+    if (editBtn) { show(editBtn, canEdit); editBtn.hidden = !canEdit; }
+    if (delBtn) { show(delBtn, canEdit); delBtn.hidden = !canEdit; }
 
     // "Test SSH all": probe every ONLINE consumer in this zone (manual, never
     // automatic). Shown only when there's at least one online consumer to probe.
@@ -1843,7 +1871,7 @@
     if (btn) {
       var n = probeableConsumers(zone).length;
       var running = !!(state.probeAll && state.probeAll.running);
-      var has = n > 0 || running;
+      var has = (n > 0 || running) && !guest;
       show(btn, has); btn.hidden = !has;
       btn.disabled = running || n === 0;
       if (running) setText(btn, "Probing " + state.probeAll.done + "/" + state.probeAll.total + "…");
@@ -2148,8 +2176,349 @@
     nameInput.focus();
   }
 
+  // ============================================================ guest mode ===
+  // Role-aware affordance gating (Phase 5) + the admin "Guests" management panel
+  // (Phase 6). The SERVER is the source of truth: every router write is
+  // independently authorized and a guest's snapshot is zone-filtered server-side.
+  // This layer only hides affordances a guest can't use and offers admins the CRUD
+  // UI -- it can never GRANT anything the backend hasn't already allowed.
+
+  function isGuest() { return state.role === "guest"; }
+  function isAdmin() { return state.role === "admin"; }
+
+  // GET /api/me -> MeResponse {role, zoneId, zoneName} (api.go:1132). Resolves the
+  // caller's role; for a guest it pins the zone-graph view + the bound zone and
+  // re-arms the once-per-load auto-resolve. Called on first paint (init) and after
+  // a successful login (resumeAfterLogin). Auth failures route to the usual overlays.
+  function fetchMe() {
+    return fetch("/api/me", { headers: { Accept: "application/json" } })
+      .then(function (r) {
+        if (r.status === 401 || r.status === 403) {
+          return r.json().catch(function () { return {}; }).then(function (b) { handleAuthFailure(r.status, b); });
+        }
+        if (!r.ok) throw new Error("me HTTP " + r.status);
+        return r.json().then(function (d) { applyMe(d); });
+      })
+      .catch(function (e) {
+        // Role unknown: fall back to admin affordances (the server still rejects any
+        // non-admin write/read), but surface the failure rather than swallow it.
+        state.globalError = "Could not determine your access role: "
+          + ((e && e.message) || e) + " — some controls may be hidden.";
+        renderGlobalError();
+      });
+  }
+
+  function applyMe(d) {
+    d = d || {};
+    state.role = d.role === "guest" ? "guest" : "admin"; // unknown -> admin (server enforces)
+    state.zoneId = d.zoneId || null;
+    state.zoneName = d.zoneName || "";
+    if (state.role === "guest") {
+      // The server already filters the snapshot to one zone; pin the view + zone so
+      // the SPA shows exactly that, and re-arm the per-login auto-resolve.
+      state.view = "graph";
+      if (state.zoneId) state.selectedZone = state.zoneId;
+      state.guestResolved = false;
+    } else {
+      // Admin: load the guest-management list for the panel.
+      state.guestModeDisabled = false;
+      state.guestListLoaded = false;
+      fetchGuests();
+    }
+    render();
+    maybeGuestAutoResolve();
+  }
+
+  // Auto-resolve (Phase 5): on a guest's FIRST live snapshot, probe the zone's
+  // online consumers ONCE to resolve their current exit nodes (no button) -- reuses
+  // probeZone, which honors probeableConsumers + the existing concurrency cap. The
+  // guard fires exactly once per page load (even if nothing is probeable).
+  function maybeGuestAutoResolve() {
+    if (state.role !== "guest" || state.guestResolved) return;
+    if (!state.gotSseFrame || !state.snapshot) return;
+    state.guestResolved = true;
+    var zone = resolveSelectedZone();
+    if (zone) probeZone(zone);
+  }
+
+  // Small topbar hint shown only to a guest: "Managing <zone> · guest".
+  function renderGuestHint() {
+    var h = $("#guest-zone-hint");
+    if (!h) return;
+    if (isGuest()) {
+      var nm = state.zoneName || zoneNameForId(state.zoneId) || "your zone";
+      setText(h, "Managing " + nm + " · guest");
+      show(h, true); h.hidden = false;
+    } else {
+      setText(h, ""); show(h, false); h.hidden = true;
+    }
+  }
+
+  // --- admin Guests panel (role === "admin") ------------------------------
+  function zoneNameForId(id) {
+    if (!id) return "";
+    var gs = snapGroups();
+    for (var i = 0; i < gs.length; i++) if (gs[i].id === id) return gs[i].name || "";
+    return "";
+  }
+  function hasSelectableZone() { return snapGroups().length > 0; }
+
+  // GET /api/guests -> GuestDTO[] {id,label,zoneId,disabled,createdAt} (api.go:1140;
+  // ADMIN-only via RequireAdmin). A 404 means the server has no guest store wired
+  // (guest mode off) -> the panel shows a note instead of the form.
+  function fetchGuests() {
+    if (!isAdmin()) return;
+    apiWrite("GET", "/api/guests", null)
+      .then(function (res) {
+        if (!res) return; // 401 -> login overlay took over
+        if (res.status === 404) {
+          state.guestModeDisabled = true;
+          state.guestListLoaded = true;
+          state.guestListError = "";
+          renderGuests();
+          return;
+        }
+        if (res.status === 403) {
+          state.guestListError = "Only an admin can manage guests.";
+          state.guestListLoaded = true;
+          renderGuests();
+          return;
+        }
+        if (!res.ok) {
+          state.guestListError = (res.data && (res.data.error || res.data.detail)) || ("HTTP " + res.status);
+          state.guestListLoaded = true;
+          renderGuests();
+          return;
+        }
+        state.guestList = Array.isArray(res.data) ? res.data : [];
+        state.guestModeDisabled = false;
+        state.guestListLoaded = true;
+        state.guestListError = "";
+        renderGuests();
+      })
+      .catch(function (err) {
+        state.guestListError = "Network error: " + ((err && err.message) || err);
+        state.guestListLoaded = true;
+        renderGuests();
+      });
+  }
+
+  function setGuestFormError(msg) {
+    state.guestFormError = msg || "";
+    var e = $("#guest-form-error");
+    if (e) { setText(e, state.guestFormError); show(e, !!state.guestFormError); }
+  }
+
+  function renderGuestCreateBusy() {
+    var btn = $("#guest-create");
+    if (!btn) return;
+    btn.disabled = state.guestBusy || !hasSelectableZone();
+    setText(btn, state.guestBusy ? "Adding…" : "Add guest");
+  }
+
+  // Populate the zone <select> from the snapshot's groups (real zones only -- a
+  // guest must bind to a real zone, never "Ungrouped"). Signature-guarded so a
+  // half-made selection isn't reset on every 1s render tick.
+  function syncGuestZoneOptions() {
+    var sel = $("#guest-zone");
+    if (!sel) return;
+    var gs = snapGroups();
+    var sig = gs.map(function (g) { return g.id + ":" + (g.name || ""); }).join("|");
+    if (sel._optSig === sig) return;
+    sel._optSig = sig;
+    var prev = sel.value;
+    while (sel.firstChild) sel.removeChild(sel.firstChild);
+    if (!gs.length) {
+      var o0 = document.createElement("option");
+      o0.value = ""; o0.textContent = "No zones — create one first";
+      sel.appendChild(o0);
+      sel.disabled = true;
+      return;
+    }
+    sel.disabled = false;
+    gs.forEach(function (g) {
+      var o = document.createElement("option");
+      o.value = g.id; o.textContent = g.name || "(unnamed zone)";
+      sel.appendChild(o);
+    });
+    if (prev) {
+      for (var i = 0; i < sel.options.length; i++) {
+        if (sel.options[i].value === prev) { sel.value = prev; break; }
+      }
+    }
+  }
+
+  // Render the guest rows (label, zone name, disabled, created -- NEVER a hash) with
+  // a disable-toggle + delete. Rebuilt each call (the list is small); row busy state
+  // is re-applied from state.guestRowBusy so an in-flight action stays disabled.
+  function renderGuestList() {
+    var list = $("#guests-list");
+    if (!list) return;
+    list.textContent = "";
+    (state.guestList || []).forEach(function (g) {
+      var row = el("div", "member-item" + (g.disabled ? " is-missing" : ""));
+      var txt = el("div", "member-text");
+      var nameLine = el("span", "member-name", g.label + (g.disabled ? " (disabled)" : ""));
+      txt.appendChild(nameLine);
+      var zoneName = zoneNameForId(g.zoneId) || g.zoneId || "(zone removed)";
+      txt.appendChild(el("span", "member-sub", "Zone: " + zoneName + " · added " + relTime(g.createdAt)));
+      row.appendChild(txt);
+
+      var actions = el("div", "zone-actions");
+      var busy = !!state.guestRowBusy[g.id];
+      var toggleBtn = el("button", "text-btn", g.disabled ? "Enable" : "Disable");
+      toggleBtn.type = "button";
+      toggleBtn.disabled = busy;
+      toggleBtn.addEventListener("click", function () { setGuestDisabledReq(g.id, !g.disabled); });
+      var delBtn = el("button", "text-btn zone-delete", "Delete");
+      delBtn.type = "button";
+      delBtn.disabled = busy;
+      delBtn.addEventListener("click", function () { confirmDeleteGuest(g); });
+      actions.appendChild(toggleBtn);
+      actions.appendChild(delBtn);
+      row.appendChild(actions);
+      list.appendChild(row);
+    });
+  }
+
+  // The panel is admin-only and lives in the zone-graph (Zones) view, beside the
+  // zones the guests are bound to. Manages its own visibility (called from render).
+  function renderGuests() {
+    var sec = $("#guests-section");
+    if (!sec) return;
+    var hasData = state.gotSseFrame || !!state.nodesOnly;
+    var visible = isAdmin() && state.view === "graph" && hasData;
+    sec.hidden = !visible;
+    if (!visible) return;
+
+    var form = $("#guest-form");
+    var listBox = $("#guests-list");
+    var emptyEl = $("#guests-empty");
+    var countEl = $("#guests-count");
+
+    if (state.guestModeDisabled) {
+      if (form) show(form, false);
+      if (listBox) show(listBox, false);
+      if (countEl) setText(countEl, "");
+      if (emptyEl) {
+        setText(emptyEl, "Guest mode is not enabled on this server (no guest store configured).");
+        show(emptyEl, true);
+      }
+      return;
+    }
+    if (form) show(form, true);
+    if (listBox) show(listBox, true);
+
+    syncGuestZoneOptions();
+    renderGuestCreateBusy();
+    setGuestFormError(state.guestFormError);
+    renderGuestList();
+
+    var gl = state.guestList || [];
+    if (countEl) setText(countEl, gl.length ? String(gl.length) : "");
+    if (emptyEl) {
+      if (!state.guestListLoaded) { setText(emptyEl, "Loading guests…"); show(emptyEl, true); }
+      else if (state.guestListError) { setText(emptyEl, state.guestListError); show(emptyEl, true); }
+      else if (!gl.length) {
+        setText(emptyEl, "No guests yet. Add one above to let someone manage a single zone’s exit nodes.");
+        show(emptyEl, true);
+      } else show(emptyEl, false);
+    }
+  }
+
+  // POST /api/guests {label, zoneId, password} (api.go:980; ADMIN-only). 201 ->
+  // created (no hash); 422 -> validation {error,detail}; 404 -> guest mode off. The
+  // password is sent in the JSON body (never the URL) via the CSRF-protected apiWrite.
+  function submitCreateGuest() {
+    if (state.guestBusy) return;
+    var labelEl = $("#guest-label"), zoneEl = $("#guest-zone"), pwEl = $("#guest-password");
+    var label = ((labelEl && labelEl.value) || "").trim();
+    var zoneId = zoneEl ? zoneEl.value : "";
+    var password = pwEl ? pwEl.value : "";
+    if (!hasSelectableZone()) { setGuestFormError("Create a zone first — a guest must be bound to one."); return; }
+    if (!label) { setGuestFormError("Enter a label for the guest."); if (labelEl) labelEl.focus(); return; }
+    if (!zoneId) { setGuestFormError("Choose a zone for the guest."); if (zoneEl) zoneEl.focus(); return; }
+    if (!password) { setGuestFormError("Enter a password for the guest."); if (pwEl) pwEl.focus(); return; }
+    state.guestBusy = true;
+    setGuestFormError("");
+    renderGuestCreateBusy();
+    apiWrite("POST", "/api/guests", { label: label, zoneId: zoneId, password: password })
+      .then(function (res) {
+        if (!res) return; // login overlay took over
+        if (res.status === 404) {
+          state.guestModeDisabled = true;
+          setGuestFormError("Guest mode is not enabled on this server.");
+          renderGuests();
+          return;
+        }
+        if (res.ok) {
+          toast("ok", "Guest added", label + " can now manage " + (zoneNameForId(zoneId) || "its zone") + ".");
+          if (labelEl) labelEl.value = "";
+          if (pwEl) pwEl.value = "";
+          setGuestFormError("");
+          fetchGuests();
+          return;
+        }
+        setGuestFormError(groupErrText(res)); // 422 {error/detail}, 400, etc.
+      })
+      .catch(function (err) { setGuestFormError("Network error: " + ((err && err.message) || err)); })
+      .then(function () { state.guestBusy = false; renderGuestCreateBusy(); });
+  }
+
+  // POST /api/guests/{id}/disabled {disabled:bool} (api.go:1010). Revokes/restores a
+  // guest on its very next request (the server re-loads the guest each request).
+  function setGuestDisabledReq(id, disabled) {
+    if (state.guestRowBusy[id]) return;
+    state.guestRowBusy[id] = true;
+    renderGuestList();
+    apiWrite("POST", "/api/guests/" + encodeURIComponent(id) + "/disabled", { disabled: disabled })
+      .then(function (res) {
+        if (!res) return;
+        if (res.ok) { toast("ok", disabled ? "Guest disabled" : "Guest enabled", ""); fetchGuests(); return; }
+        if (res.status === 404) { toast("warn", "Guest already gone", "It may have been deleted elsewhere."); fetchGuests(); return; }
+        toast("err", "Couldn’t update guest", groupErrText(res));
+      })
+      .catch(function (err) { toast("err", "Network error", String((err && err.message) || err)); })
+      .then(function () { delete state.guestRowBusy[id]; renderGuestList(); });
+  }
+
+  function confirmDeleteGuest(g) {
+    var body = el("div");
+    body.appendChild(document.createTextNode("Delete the guest "));
+    body.appendChild(el("strong", null, g.label));
+    body.appendChild(document.createTextNode("? They will lose access immediately (signed out on their next action)."));
+    openModal({
+      title: "Delete guest?",
+      body: body,
+      confirmLabel: "Delete guest",
+      confirmBusyLabel: "Deleting…",
+      cancelLabel: "Cancel",
+      onConfirm: function () { return deleteGuestReq(g.id); },
+    });
+  }
+
+  // DELETE /api/guests/{id} (api.go:1028) -> 204. Revokes the guest on its next request.
+  function deleteGuestReq(id) {
+    return apiWrite("DELETE", "/api/guests/" + encodeURIComponent(id), null)
+      .then(function (res) {
+        if (!res) return; // login overlay took over
+        if (res.ok || res.status === 204) { toast("ok", "Guest deleted", ""); fetchGuests(); return; }
+        if (res.status === 404) { toast("warn", "Guest already gone", "It may have been deleted elsewhere."); fetchGuests(); return; }
+        toast("err", "Couldn’t delete guest", groupErrText(res));
+      })
+      .catch(function (err) { toast("err", "Network error", String((err && err.message) || err)); });
+  }
+
+  function wireGuests() {
+    var form = $("#guest-form");
+    if (form) {
+      form.addEventListener("submit", function (e) { e.preventDefault(); submitCreateGuest(); });
+    }
+  }
+
   // --- view toggle (graph <-> cards) --------------------------------------
   function setView(view) {
+    if (isGuest()) view = "graph"; // guests are confined to the zone-graph view
     if (view !== "graph" && view !== "cards") return;
     if (state.view === view) return;
     state.view = view;
@@ -2525,21 +2894,26 @@
       setBackgroundInert(false); // restore normal interaction once signed in
       var clear = $("#login-password");
       if (clear) clear.value = "";
+      var clearLabel = $("#login-label");
+      if (clearLabel) clearLabel.value = "";
       return;
     }
     setBackgroundInert(true); // make the background inert BEFORE moving focus in
     ov.hidden = false; show(ov, true);
     var desc = $("#login-desc");
+    var labelEl = $("#login-label");
     var input = $("#login-password");
     var submit = $("#login-submit");
     var errEl = $("#login-error");
     if (state.loginDisabled) {
       setText(desc, "Password sign-in is disabled on this server. Access requires signing in to the tailnet as the configured owner.");
+      if (labelEl) labelEl.disabled = true;
       if (input) input.disabled = true;
       if (submit) { submit.disabled = true; setText(submit, "Sign in"); }
       setText(errEl, "");
     } else {
-      setText(desc, "Enter the tsctl password to continue.");
+      setText(desc, "Enter the tsctl password to continue. To sign in as a guest, add your guest label.");
+      if (labelEl) labelEl.disabled = state.loginBusy;
       if (input) input.disabled = state.loginBusy;
       if (submit) { submit.disabled = state.loginBusy; setText(submit, state.loginBusy ? "Signing in…" : "Sign in"); }
       setText(errEl, state.loginError || "");
@@ -2574,11 +2948,14 @@
     renderFallbackBanner();
     renderNetmapErr();
     renderStale();
+    renderGuestHint();
 
     var hasData = state.gotSseFrame || !!state.nodesOnly;
     $("#loading").hidden = hasData;
     var viewbar = $("#viewbar");
-    if (viewbar) { show(viewbar, hasData); viewbar.hidden = !hasData; }
+    // Guests have a single view (the zone graph), so the view switcher is hidden.
+    var showViewbar = hasData && !isGuest();
+    if (viewbar) { show(viewbar, showViewbar); viewbar.hidden = !showViewbar; }
     if (!hasData) {
       $("#graph-section").hidden = true;
       $("#routers-section").hidden = true;
@@ -2586,6 +2963,7 @@
       return;
     }
 
+    if (isGuest() && state.view !== "graph") state.view = "graph"; // guests: zone-graph only
     pruneTransientState(); // reclaim per-router transient maps in EVERY view (S3)
     renderViewToggle();
     var graphView = state.view === "graph";
@@ -2598,6 +2976,7 @@
       renderRouters();
       renderNodes();
     }
+    renderGuests(); // admin-only Guests panel (manages its own visibility)
   }
 
   // Reclaim transient per-router DISPLAY state (probe results, action errors,
@@ -2673,9 +3052,11 @@
     render();
   }
 
-  // POST the password to /api/login (CSRF-protected). On success, drop the
-  // overlay and resume the normal data flow; on failure, explain in the overlay.
-  function submitLogin(password) {
+  // POST {label, password} to /api/login (CSRF-protected; api.go:460). An EMPTY
+  // label is the ADMIN path (unchanged); a non-empty label is the GUEST path. On
+  // success, drop the overlay and resume the normal data flow; on failure, explain
+  // in the overlay. The label/password go in the JSON body, never the URL.
+  function submitLogin(label, password) {
     state.loginBusy = true;
     state.loginError = "";
     state.loginDisabled = false;
@@ -2689,7 +3070,7 @@
             "Accept": "application/json",
             "X-Tsctl-CSRF": state.csrfToken || "",
           },
-          body: JSON.stringify({ password: password }),
+          body: JSON.stringify({ label: label || "", password: password }),
         });
       })
       .then(function (resp) {
@@ -2709,7 +3090,9 @@
             state.loginDisabled = true;
             state.loginError = "";
           } else if (resp.status === 401) {
-            state.loginError = "Incorrect password.";
+            state.loginError = (label && label.trim())
+              ? "Incorrect guest label or password."
+              : "Incorrect password.";
           } else if (resp.status === 403) {
             state.loginError = (data && data.error) || "Request blocked.";
           } else {
@@ -2730,6 +3113,7 @@
   function resumeAfterLogin() {
     state.reconnectDelay = RECONNECT_MIN; // fresh backoff after a successful login
     render();
+    fetchMe();      // resolve the (possibly guest) role for the new session
     fetchNodes();   // first paint with the new session
     connectSSE();   // re-open the live stream (cancels any stale reconnect; see S1)
   }
@@ -2859,6 +3243,7 @@
       stopPollFallback();
       state.snapshot = snap;
       render();
+      maybeGuestAutoResolve(); // guest: probe the zone once on the first live frame
     };
     es.onerror = function () {
       if (blocked()) return;
@@ -2933,8 +3318,10 @@
       loginForm.addEventListener("submit", function (e) {
         e.preventDefault();
         if (state.loginBusy || state.loginDisabled) return;
+        var labelInput = $("#login-label");
         var input = $("#login-password");
-        submitLogin(input ? input.value : "");
+        // Empty label = admin sign-in (unchanged); a label = guest sign-in.
+        submitLogin(labelInput ? labelInput.value : "", input ? input.value : "");
       });
       // Tab-cycle focus trap (matches the modal/editor helpers): Tab cycles between
       // the password field and Sign-in; the inert background can't be reached.
@@ -2965,8 +3352,10 @@
     buildChips();    // chips read state.filter.status (possibly set by the hash)
     wireControls();
     wireGraph();
+    wireGuests();    // admin Guests panel: form submit -> create
     render();
     fetchCSRF();
+    fetchMe();      // resolve the caller's role (admin/guest) for affordance gating
     fetchNodes();   // first paint (also the no-SSE fallback seed)
     connectSSE();
     setInterval(render, TICK_MS); // keep relative times / countdowns fresh

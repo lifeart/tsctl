@@ -16,6 +16,8 @@
         <div class="brand">
           <h1 class="topbar-title">tsctl</h1>
           <p class="topbar-subtitle">Choose each router’s exit node, live.</p>
+          <!-- Guest-only hint: which single zone this guest is managing. -->
+          <p id="guest-zone-hint" class="topbar-subtitle hidden" role="status" hidden></p>
         </div>
         <div class="topbar-right">
           <span id="updated" class="updated" aria-live="off"></span>
@@ -171,6 +173,54 @@
         <div id="nodes" class="list-group"></div>
         <p id="nodes-empty" class="empty hidden"></p>
       </section>
+
+      <!-- Admin-only "Guests" panel (shown only when GET /api/me reports role
+           "admin", in the Zones view). A guest signs in with a label + password and
+           can manage exit nodes for ONE zone — no zone editing, no other zones, no
+           device tools. The list NEVER carries a password hash. -->
+      <section class="section" id="guests-section" hidden>
+        <div class="section-head">
+          <h2 class="section-title">Guests</h2>
+          <span id="guests-count" class="section-count" aria-live="off"></span>
+        </div>
+        <p id="guests-desc" class="graph-hint">
+          A guest signs in with a label and password and can change exit nodes for a
+          single zone only — no zone editing, no other zones, no device tools.
+        </p>
+        <form id="guest-form" class="editor-body" novalidate>
+          <div class="editor-field">
+            <label class="editor-label" for="guest-label">Label</label>
+            <input
+              id="guest-label"
+              class="editor-input"
+              type="text"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="e.g. contractor-alex"
+            />
+          </div>
+          <div class="editor-field">
+            <label class="editor-label" for="guest-zone">Zone</label>
+            <select id="guest-zone" class="editor-input"></select>
+          </div>
+          <div class="editor-field">
+            <label class="editor-label" for="guest-password">Password</label>
+            <input
+              id="guest-password"
+              class="editor-input"
+              type="password"
+              autocomplete="new-password"
+              placeholder="At least 8 characters"
+            />
+          </div>
+          <div id="guest-form-error" class="editor-error hidden" role="alert"></div>
+          <div class="modal-actions">
+            <button id="guest-create" class="btn btn-primary" type="submit">Add guest</button>
+          </div>
+        </form>
+        <div id="guests-list" class="member-list"></div>
+        <p id="guests-empty" class="empty hidden"></p>
+      </section>
     </main>
 
     <!-- Login overlay: shown on a 401 (authenticate). The SPA fetches a CSRF
@@ -191,6 +241,19 @@
         </svg>
         <h2 id="login-title">Sign in</h2>
         <p id="login-desc" class="login-desc">Enter the tsctl password to continue.</p>
+        <!-- Optional guest label: empty = admin sign-in (unchanged); a label = guest. -->
+        <label class="login-label" for="login-label">Guest label (optional)</label>
+        <input
+          id="login-label"
+          class="login-input"
+          type="text"
+          name="label"
+          autocomplete="username"
+          autocapitalize="off"
+          spellcheck="false"
+          placeholder="Leave blank for admin sign-in"
+          aria-describedby="login-desc"
+        />
         <label class="login-label" for="login-password">Password</label>
         <input
           id="login-password"
