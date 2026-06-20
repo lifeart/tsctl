@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lifeart/tsctl/internal/authz"
 	"github.com/lifeart/tsctl/internal/groups"
 	"github.com/lifeart/tsctl/internal/store"
 )
@@ -75,6 +76,20 @@ func (e *ctrlErr) HTTPStatus() int { return e.status }
 func (e *ctrlErr) Detail() string  { return e.det }
 func (e *ctrlErr) Stderr() string  { return e.serr }
 
+// adminReq returns r carrying an admin Subject in its context, simulating
+// RequireAuth having authenticated an admin. Isolated handler tests that call a
+// handler DIRECTLY (bypassing the Routes middleware) need this so the
+// authorizeRouterWrite choke point sees an authorized caller; through the real
+// Routes() chain RequireAuth injects the Subject for them.
+func adminReq(r *http.Request) *http.Request {
+	return r.WithContext(authz.WithSubject(r.Context(), authz.Subject{Admin: true}))
+}
+
+// guestReq returns r carrying a guest Subject bound to zoneID.
+func guestReq(r *http.Request, guestID, zoneID string) *http.Request {
+	return r.WithContext(authz.WithSubject(r.Context(), authz.Subject{GuestID: guestID, ZoneID: zoneID}))
+}
+
 // --- middleware ---------------------------------------------------------------
 
 func TestRequireAuth(t *testing.T) {
@@ -118,7 +133,7 @@ func TestRequireAuth(t *testing.T) {
 	t.Run("valid session allows (non-owner whois)", func(t *testing.T) {
 		a := New(store.New(), fakeWhoIs{login: "intruder@example.com"}, &fakeController{},
 			Config{Owner: "alice@example.com", UIPassword: "hunter2"})
-		val, err := a.newSessionValue()
+		val, err := a.newSessionValue(authz.Subject{Admin: true})
 		if err != nil {
 			t.Fatalf("newSessionValue: %v", err)
 		}
@@ -149,18 +164,24 @@ func TestSessionSignVerify(t *testing.T) {
 		r.AddCookie(&http.Cookie{Name: sessionCookieName, Value: v})
 		return r
 	}
+	// valid is the post-rename predicate over parseSession (admin cookies don't
+	// need the live-store re-load that resolveSubject adds for guests).
+	valid := func(r *http.Request) bool {
+		_, ok := a.parseSession(r)
+		return ok
+	}
 
-	val, err := a.newSessionValue()
+	val, err := a.newSessionValue(authz.Subject{Admin: true})
 	if err != nil {
 		t.Fatalf("newSessionValue: %v", err)
 	}
-	if !a.validSession(withCookie(val)) {
+	if !valid(withCookie(val)) {
 		t.Error("freshly minted session should validate")
 	}
-	if a.validSession(httptest.NewRequest(http.MethodGet, "/api/nodes", nil)) {
+	if valid(httptest.NewRequest(http.MethodGet, "/api/nodes", nil)) {
 		t.Error("missing cookie should not validate")
 	}
-	if a.validSession(withCookie("not valid base64 $$")) {
+	if valid(withCookie("not valid base64 $$")) {
 		t.Error("garbage cookie should not validate")
 	}
 
@@ -170,22 +191,24 @@ func TestSessionSignVerify(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 	raw[len(raw)-1] ^= 0xFF
-	if a.validSession(withCookie(base64.RawURLEncoding.EncodeToString(raw))) {
+	if valid(withCookie(base64.RawURLEncoding.EncodeToString(raw))) {
 		t.Error("tampered MAC should not validate")
 	}
 
 	// A cookie signed by a different per-process secret must be rejected.
 	other := New(store.New(), fakeWhoIs{}, &fakeController{}, Config{UIPassword: "pw"})
-	if other.validSession(withCookie(val)) {
+	if _, ok := other.parseSession(withCookie(val)); ok {
 		t.Error("cookie from a different secret should not validate")
 	}
 
-	// Expired but correctly signed → reject.
-	expired := make([]byte, sessionRawLen)
+	// Expired but correctly signed → reject (admin layout: header + MAC, no gid).
+	expired := make([]byte, sessionHeaderLen+sessionMACLen)
 	binary.BigEndian.PutUint64(expired[:sessionExpiryLen], uint64(time.Now().Add(-time.Hour).Unix()))
-	mac := a.sessionMAC(expired[:sessionExpiryLen+sessionNonceLen])
-	copy(expired[sessionExpiryLen+sessionNonceLen:], mac)
-	if a.validSession(withCookie(base64.RawURLEncoding.EncodeToString(expired))) {
+	expired[sessionExpiryLen+sessionNonceLen] = roleAdmin // role
+	expired[sessionExpiryLen+sessionNonceLen+sessionRoleLen] = 0
+	mac := a.sessionMAC(expired[:sessionHeaderLen])
+	copy(expired[sessionHeaderLen:], mac)
+	if valid(withCookie(base64.RawURLEncoding.EncodeToString(expired))) {
 		t.Error("expired session should not validate")
 	}
 }
@@ -229,7 +252,7 @@ func TestHandleLogin(t *testing.T) {
 	}
 	rv := httptest.NewRequest(http.MethodGet, "/", nil)
 	rv.AddCookie(sc)
-	if !a.validSession(rv) {
+	if _, ok := a.parseSession(rv); !ok {
 		t.Error("issued session cookie should validate")
 	}
 
@@ -458,7 +481,11 @@ func TestHandleNodes(t *testing.T) {
 	})
 	a := New(st, fakeWhoIs{login: "alice"}, &fakeController{}, Config{Owner: "alice"})
 	rec := httptest.NewRecorder()
-	a.handleNodes(rec, httptest.NewRequest(http.MethodGet, "/api/nodes", nil))
+	// In production these read handlers always run behind RequireAuth, which injects
+	// the Subject; an admin subject yields the full (unfiltered) view.
+	req := httptest.NewRequest(http.MethodGet, "/api/nodes", nil)
+	req = req.WithContext(authz.WithSubject(req.Context(), authz.Subject{Admin: true}))
+	a.handleNodes(rec, req)
 	if rec.Code != 200 {
 		t.Fatalf("code = %d", rec.Code)
 	}
@@ -506,6 +533,7 @@ func TestHandleRouter(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/routers/r1", nil)
 	req.SetPathValue("id", "r1")
+	req = req.WithContext(authz.WithSubject(req.Context(), authz.Subject{Admin: true}))
 	a.handleRouter(rec, req)
 	if rec.Code != 200 {
 		t.Fatalf("code = %d body=%s", rec.Code, rec.Body)
@@ -530,13 +558,24 @@ func TestHandleRouter(t *testing.T) {
 		t.Errorf("desired should be null, got %v", got["desired"])
 	}
 
-	// 404 for an unknown id.
+	// 404 for an unknown id (admin subject, so it reaches the not-found path).
 	rec2 := httptest.NewRecorder()
 	req2 := httptest.NewRequest(http.MethodGet, "/api/routers/nope", nil)
 	req2.SetPathValue("id", "nope")
+	req2 = req2.WithContext(authz.WithSubject(req2.Context(), authz.Subject{Admin: true}))
 	a.handleRouter(rec2, req2)
 	if rec2.Code != 404 {
 		t.Errorf("unknown router code = %d want 404", rec2.Code)
+	}
+
+	// Fail-closed: NO subject in context (must not happen behind RequireAuth) -> 401,
+	// never the unfiltered view.
+	rec3 := httptest.NewRecorder()
+	req3 := httptest.NewRequest(http.MethodGet, "/api/routers/r1", nil)
+	req3.SetPathValue("id", "r1")
+	a.handleRouter(rec3, req3)
+	if rec3.Code != 401 {
+		t.Errorf("no-subject router code = %d want 401 (fail-closed)", rec3.Code)
 	}
 }
 
@@ -588,7 +627,7 @@ func TestHandleSetExitNode_OK(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/routers/r1/exit-node", strings.NewReader(`{"exitNode":"n2"}`))
 	req.SetPathValue("id", "r1")
-	a.handleSetExitNode(rec, req)
+	a.handleSetExitNode(rec, adminReq(req))
 	if rec.Code != 200 {
 		t.Fatalf("code = %d body=%s", rec.Code, rec.Body)
 	}
@@ -608,7 +647,7 @@ func TestHandleSetExitNode_ErrorStatusAndBody(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/routers/r1/exit-node", strings.NewReader(`{"exitNode":"n2"}`))
 	req.SetPathValue("id", "r1")
-	a.handleSetExitNode(rec, req)
+	a.handleSetExitNode(rec, adminReq(req))
 	if rec.Code != 400 {
 		t.Fatalf("code = %d want 400", rec.Code)
 	}
@@ -625,7 +664,7 @@ func TestHandleSetExitNode_GenericErrorIs502(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/routers/r1/exit-node", strings.NewReader(`{}`))
 	req.SetPathValue("id", "r1")
-	a.handleSetExitNode(rec, req)
+	a.handleSetExitNode(rec, adminReq(req))
 	if rec.Code != http.StatusBadGateway {
 		t.Errorf("code = %d want 502", rec.Code)
 	}
@@ -671,7 +710,7 @@ func TestHandleKeep_OK(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/routers/r1/keep", nil)
 	req.SetPathValue("id", "r1")
-	a.handleKeep(rec, req)
+	a.handleKeep(rec, adminReq(req))
 	if rec.Code != 200 {
 		t.Fatalf("code = %d body=%s", rec.Code, rec.Body)
 	}
@@ -702,7 +741,7 @@ func TestHandleKeep_ErrorStatuses(t *testing.T) {
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest(http.MethodPost, "/api/routers/r1/keep", nil)
 			req.SetPathValue("id", "r1")
-			a.handleKeep(rec, req)
+			a.handleKeep(rec, adminReq(req))
 			if rec.Code != tc.want {
 				t.Fatalf("code = %d want %d body=%s", rec.Code, tc.want, rec.Body)
 			}
@@ -754,7 +793,7 @@ func TestHandleProbe_OK(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/routers/r1/probe", nil)
 	req.SetPathValue("id", "r1")
-	a.handleProbe(rec, req)
+	a.handleProbe(rec, adminReq(req))
 
 	if rec.Code != 200 {
 		t.Fatalf("code = %d body=%s", rec.Code, rec.Body)
@@ -795,7 +834,7 @@ func TestHandleProbe_SSHFailIs200(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/routers/r1/probe", nil)
 	req.SetPathValue("id", "r1")
-	a.handleProbe(rec, req)
+	a.handleProbe(rec, adminReq(req))
 
 	if rec.Code != 200 {
 		t.Fatalf("ssh-fail probe code = %d want 200 (result, not error)", rec.Code)
@@ -820,7 +859,7 @@ func TestHandleProbe_NotFoundIs404(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/routers/ghost/probe", nil)
 	req.SetPathValue("id", "ghost")
-	a.handleProbe(rec, req)
+	a.handleProbe(rec, adminReq(req))
 
 	if rec.Code != 404 {
 		t.Fatalf("code = %d want 404", rec.Code)
@@ -1230,5 +1269,558 @@ func TestRoutes_FullChain(t *testing.T) {
 	a2.Routes().ServeHTTP(rec2, req2)
 	if rec2.Code != http.StatusUnauthorized {
 		t.Errorf("non-owner POST code = %d want 401", rec2.Code)
+	}
+}
+
+// --- guest mode ---------------------------------------------------------------
+
+// fakeGuests is an in-memory api.GuestStore for the guest-mode tests. The plain
+// passwords are stored alongside (test-only) so Authenticate can verify without
+// bcrypt; the real timing/hashing parity lives in internal/guests.
+type fakeGuests struct {
+	byID map[string]store.Guest
+	pw   map[string]string // id -> plaintext (test only)
+}
+
+func newFakeGuests() *fakeGuests {
+	return &fakeGuests{byID: map[string]store.Guest{}, pw: map[string]string{}}
+}
+
+func (f *fakeGuests) add(g store.Guest, password string) {
+	f.byID[g.ID] = g
+	f.pw[g.ID] = password
+}
+
+func (f *fakeGuests) List() []store.Guest {
+	out := make([]store.Guest, 0, len(f.byID))
+	for _, g := range f.byID {
+		out = append(out, g)
+	}
+	return out
+}
+
+func (f *fakeGuests) Get(id string) (store.Guest, bool) {
+	g, ok := f.byID[id]
+	return g, ok
+}
+
+func (f *fakeGuests) Create(label, zoneID, pw string) (store.Guest, error) {
+	if strings.TrimSpace(label) == "" {
+		return store.Guest{}, &ctrlErr{status: 422, msg: "invalid guest", det: "label must not be empty"}
+	}
+	id := "g-" + label
+	g := store.Guest{ID: id, Label: label, ZoneID: zoneID, CreatedAt: time.Now()}
+	f.add(g, pw)
+	return g, nil
+}
+
+func (f *fakeGuests) SetDisabled(id string, disabled bool) (store.Guest, error) {
+	g, ok := f.byID[id]
+	if !ok {
+		return store.Guest{}, &ctrlErr{status: 404, msg: "guest not found"}
+	}
+	g.Disabled = disabled
+	f.byID[id] = g
+	return g, nil
+}
+
+func (f *fakeGuests) Delete(id string) error {
+	if _, ok := f.byID[id]; !ok {
+		return &ctrlErr{status: 404, msg: "guest not found"}
+	}
+	delete(f.byID, id)
+	delete(f.pw, id)
+	return nil
+}
+
+func (f *fakeGuests) Authenticate(label, pw string) (store.Guest, bool) {
+	for id, g := range f.byID {
+		if strings.EqualFold(g.Label, label) {
+			if f.pw[id] == pw && !g.Disabled {
+				return g, true
+			}
+			return store.Guest{}, false
+		}
+	}
+	return store.Guest{}, false
+}
+
+var _ GuestStore = (*fakeGuests)(nil)
+
+// newGuestAPI wires an API over a REAL groups.Store (temp file) plus a fakeGuests,
+// with one zone "Work" (consumers [r1], allowed exits [e1]) and one guest bound to
+// it. It returns the API, the zone id, and the guest id.
+func newGuestAPI(t *testing.T) (*API, *groups.Store, *fakeGuests, string, string) {
+	t.Helper()
+	gs, err := groups.New(filepath.Join(t.TempDir(), "guests-groups.json"))
+	if err != nil {
+		t.Fatalf("groups.New: %v", err)
+	}
+	zone, err := gs.Create(store.Group{Name: "Work", Consumers: []string{"r1"}, AllowedExitNodes: []string{"e1"}})
+	if err != nil {
+		t.Fatalf("create zone: %v", err)
+	}
+	fg := newFakeGuests()
+	fg.add(store.Guest{ID: "guest-1", Label: "alice-guest", ZoneID: zone.ID}, "guest-password")
+	a := New(store.New(), fakeWhoIs{login: "nobody"}, &fakeController{},
+		Config{Owner: "admin@example.com", UIPassword: "adminpw", AllowedHosts: []string{"tsctl"}, Groups: gs, Guests: fg})
+	return a, gs, fg, zone.ID, "guest-1"
+}
+
+// guestCookieReq builds a request carrying a signed guest session cookie for gid.
+func guestCookieReq(t *testing.T, a *API, method, target, gid string) *http.Request {
+	t.Helper()
+	val, err := a.newSessionValue(authz.Subject{GuestID: gid})
+	if err != nil {
+		t.Fatalf("newSessionValue(guest): %v", err)
+	}
+	req := httptest.NewRequest(method, target, nil)
+	req.Host = "tsctl"
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: val})
+	return req
+}
+
+// TestGuestSessionRoundTripAndTamper proves a signed guest cookie round-trips
+// through resolveSubject (resolving the live zone) and that flipping the role byte
+// to admin fails the MAC (no privilege forgery).
+func TestGuestSessionRoundTripAndTamper(t *testing.T) {
+	a, _, _, zoneID, gid := newGuestAPI(t)
+
+	val, err := a.newSessionValue(authz.Subject{GuestID: gid})
+	if err != nil {
+		t.Fatalf("newSessionValue: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/me", nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: val})
+
+	sub, ok := a.resolveSubject(req)
+	if !ok {
+		t.Fatal("guest cookie should resolve")
+	}
+	if sub.Admin {
+		t.Error("guest subject must not be admin")
+	}
+	if sub.GuestID != gid || sub.ZoneID != zoneID {
+		t.Errorf("resolved subject = %+v want guest %q zone %q", sub, gid, zoneID)
+	}
+
+	// parseSession (pre-store) carries the guest id but no zone yet.
+	psReq := httptest.NewRequest(http.MethodGet, "/api/me", nil)
+	psReq.AddCookie(&http.Cookie{Name: sessionCookieName, Value: val})
+	ps, ok := a.parseSession(psReq)
+	if !ok || ps.Admin || ps.GuestID != gid {
+		t.Errorf("parseSession = %+v ok=%v", ps, ok)
+	}
+
+	// Tamper: flip the role byte to admin -> MAC fails -> denied (no escalation).
+	raw, err := base64.RawURLEncoding.DecodeString(val)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	raw[sessionExpiryLen+sessionNonceLen] = roleAdmin
+	tampered := base64.RawURLEncoding.EncodeToString(raw)
+	treq := httptest.NewRequest(http.MethodGet, "/api/me", nil)
+	treq.AddCookie(&http.Cookie{Name: sessionCookieName, Value: tampered})
+	if _, ok := a.resolveSubject(treq); ok {
+		t.Error("a guest cookie with the role byte flipped to admin must NOT resolve (MAC must reject)")
+	}
+}
+
+// TestLogin_AdminVsGuest exercises both login paths through handleLogin.
+func TestLogin_AdminVsGuest(t *testing.T) {
+	loginFailDelay = 0
+	a, _, _, zoneID, gid := newGuestAPI(t)
+
+	post := func(body string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/login", strings.NewReader(body))
+		a.handleLogin(rec, req)
+		return rec
+	}
+	cookieFrom := func(rec *httptest.ResponseRecorder) *http.Cookie {
+		for _, c := range rec.Result().Cookies() {
+			if c.Name == sessionCookieName && c.Value != "" {
+				return c
+			}
+		}
+		return nil
+	}
+
+	// Admin: empty label + correct UI password.
+	rec := post(`{"password":"adminpw"}`)
+	if rec.Code != 200 {
+		t.Fatalf("admin login = %d body=%s", rec.Code, rec.Body)
+	}
+	ac := cookieFrom(rec)
+	if ac == nil {
+		t.Fatal("admin login set no session cookie")
+	}
+	areq := httptest.NewRequest(http.MethodGet, "/api/me", nil)
+	areq.AddCookie(ac)
+	if sub, ok := a.resolveSubject(areq); !ok || !sub.Admin {
+		t.Errorf("admin cookie resolved to %+v ok=%v", sub, ok)
+	}
+
+	// Guest: label + correct password.
+	rec = post(`{"label":"alice-guest","password":"guest-password"}`)
+	if rec.Code != 200 {
+		t.Fatalf("guest login = %d body=%s", rec.Code, rec.Body)
+	}
+	gc := cookieFrom(rec)
+	if gc == nil {
+		t.Fatal("guest login set no session cookie")
+	}
+	greq := httptest.NewRequest(http.MethodGet, "/api/me", nil)
+	greq.AddCookie(gc)
+	if sub, ok := a.resolveSubject(greq); !ok || sub.Admin || sub.GuestID != gid || sub.ZoneID != zoneID {
+		t.Errorf("guest cookie resolved to %+v ok=%v", sub, ok)
+	}
+
+	// Wrong guest password and unknown label -> 401, no cookie.
+	if rec := post(`{"label":"alice-guest","password":"nope"}`); rec.Code != http.StatusUnauthorized {
+		t.Errorf("wrong guest password = %d want 401", rec.Code)
+	}
+	if rec := post(`{"label":"ghost","password":"whatever"}`); rec.Code != http.StatusUnauthorized {
+		t.Errorf("unknown guest label = %d want 401", rec.Code)
+	}
+	// Admin path with no UI password configured -> 404 (unchanged behavior).
+	aNoPw := New(store.New(), fakeWhoIs{login: "x"}, &fakeController{}, Config{Owner: "o"})
+	rec = httptest.NewRecorder()
+	aNoPw.handleLogin(rec, httptest.NewRequest(http.MethodPost, "/api/login", strings.NewReader(`{"password":"x"}`)))
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("admin login with no UI password = %d want 404", rec.Code)
+	}
+}
+
+// TestGuestRevocation proves the per-request store re-load revokes a guest the
+// instant it is disabled, deleted, or its zone is deleted.
+func TestGuestRevocation(t *testing.T) {
+	a, gs, fg, zoneID, gid := newGuestAPI(t)
+	req := func() *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "/api/me", nil)
+		val, _ := a.newSessionValue(authz.Subject{GuestID: gid})
+		r.AddCookie(&http.Cookie{Name: sessionCookieName, Value: val})
+		return r
+	}
+	if _, ok := a.resolveSubject(req()); !ok {
+		t.Fatal("guest should resolve before revocation")
+	}
+
+	// Disabled -> denied.
+	fg.SetDisabled(gid, true)
+	if _, ok := a.resolveSubject(req()); ok {
+		t.Error("disabled guest must not resolve")
+	}
+	fg.SetDisabled(gid, false)
+	if _, ok := a.resolveSubject(req()); !ok {
+		t.Fatal("re-enabled guest should resolve")
+	}
+
+	// Zone deleted out from under the guest -> denied.
+	if err := gs.Delete(zoneID); err != nil {
+		t.Fatalf("delete zone: %v", err)
+	}
+	if _, ok := a.resolveSubject(req()); ok {
+		t.Error("guest whose zone was deleted must not resolve")
+	}
+
+	// Guest deleted -> denied (re-create the zone first to isolate the cause).
+	gs.Create(store.Group{Name: "Work2"})
+	fg.Delete(gid)
+	if _, ok := a.resolveSubject(req()); ok {
+		t.Error("deleted guest must not resolve")
+	}
+}
+
+// TestRequireAdmin_GuestForbidden proves a guest gets 403 on admin-only routes
+// through the real Routes() chain, while the owner (admin) gets 200.
+func TestRequireAdmin_GuestForbidden(t *testing.T) {
+	a, _, _, _, gid := newGuestAPI(t)
+	h := a.Routes()
+
+	for _, path := range []string{"/api/groups", "/api/guests"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, guestCookieReq(t, a, http.MethodGet, path, gid))
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("guest GET %s = %d want 403", path, rec.Code)
+		}
+	}
+
+	// The owner (admin via WhoIs) is allowed through to the handler (200).
+	gs, _ := groups.New(filepath.Join(t.TempDir(), "g.json"))
+	fg := newFakeGuests()
+	aAdmin := New(store.New(), fakeWhoIs{login: "alice"}, &fakeController{},
+		Config{Owner: "alice", AllowedHosts: []string{"tsctl"}, Groups: gs, Guests: fg})
+	for _, path := range []string{"/api/groups", "/api/guests"} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Host = "tsctl"
+		aAdmin.Routes().ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Errorf("admin GET %s = %d want 200", path, rec.Code)
+		}
+	}
+}
+
+// TestAuthorizeRouterWrite covers the write authorization choke point: in-zone set
+// allowed, out-of-zone denied, and a shared router whose target is allowed only by
+// ANOTHER zone is still denied (the guest's own zone is the stricter source).
+func TestAuthorizeRouterWrite(t *testing.T) {
+	gs, err := groups.New(filepath.Join(t.TempDir(), "g.json"))
+	if err != nil {
+		t.Fatalf("groups.New: %v", err)
+	}
+	// z1: r1 may use e1. z2: r1 (shared) may use e2.
+	z1, _ := gs.Create(store.Group{Name: "z1", Consumers: []string{"r1"}, AllowedExitNodes: []string{"e1"}})
+	gs.Create(store.Group{Name: "z2", Consumers: []string{"r1"}, AllowedExitNodes: []string{"e2"}})
+	fg := newFakeGuests()
+	fg.add(store.Guest{ID: "g1", Label: "g", ZoneID: z1.ID}, "pw")
+	fc := &fakeController{rv: store.RouterView{Node: store.NodeView{StableID: "r1"}, State: store.RouterOK}}
+	a := New(store.New(), fakeWhoIs{login: "nobody"}, fc,
+		Config{Owner: "admin", AllowedHosts: []string{"tsctl"}, Groups: gs, Guests: fg})
+
+	set := func(routerID, target string) int {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/routers/"+routerID+"/exit-node",
+			strings.NewReader(`{"exitNode":"`+target+`"}`))
+		req.SetPathValue("id", routerID)
+		req = guestReq(req, "g1", z1.ID)
+		a.handleSetExitNode(rec, req)
+		return rec.Code
+	}
+
+	// In-zone router + in-zone target -> allowed (controller drives it, 200).
+	if got := set("r1", "e1"); got != 200 {
+		t.Errorf("in-zone set = %d want 200", got)
+	}
+	// In-zone router + clear (Direct) -> allowed.
+	fc2Code := set("r1", "")
+	if fc2Code != 200 {
+		t.Errorf("in-zone clear = %d want 200", fc2Code)
+	}
+	// Out-of-zone router -> 403 (uniform, no oracle).
+	if got := set("r2", "e1"); got != http.StatusForbidden {
+		t.Errorf("out-of-zone router set = %d want 403", got)
+	}
+	// Shared router, target allowed ONLY by another zone (z2) -> 403 (own zone is
+	// the stricter source; deliberately stricter than the poller's cross-zone union).
+	if got := set("r1", "e2"); got != http.StatusForbidden {
+		t.Errorf("shared-router other-zone-target set = %d want 403", got)
+	}
+
+	// Keep + Probe also gate on zone membership (no target).
+	keep := func(routerID string) int {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/routers/"+routerID+"/keep", nil)
+		req.SetPathValue("id", routerID)
+		req = guestReq(req, "g1", z1.ID)
+		a.handleKeep(rec, req)
+		return rec.Code
+	}
+	if got := keep("r2"); got != http.StatusForbidden {
+		t.Errorf("out-of-zone keep = %d want 403", got)
+	}
+	probe := func(routerID string) int {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/routers/"+routerID+"/probe", nil)
+		req.SetPathValue("id", routerID)
+		req = guestReq(req, "g1", z1.ID)
+		a.handleProbe(rec, req)
+		return rec.Code
+	}
+	if got := probe("r2"); got != http.StatusForbidden {
+		t.Errorf("out-of-zone probe = %d want 403", got)
+	}
+	if got := probe("r1"); got != 200 {
+		t.Errorf("in-zone probe = %d want 200", got)
+	}
+}
+
+// TestGuestFilteredReads proves handleNodes is zone-filtered for a guest and
+// handleRouter is 404 for an out-of-zone router (same as missing; no oracle).
+func TestGuestFilteredReads(t *testing.T) {
+	gs, err := groups.New(filepath.Join(t.TempDir(), "g.json"))
+	if err != nil {
+		t.Fatalf("groups.New: %v", err)
+	}
+	z1, _ := gs.Create(store.Group{Name: "z1", Consumers: []string{"r1"}, AllowedExitNodes: []string{"e1"}})
+	fg := newFakeGuests()
+	fg.add(store.Guest{ID: "g1", Label: "g", ZoneID: z1.ID}, "pw")
+
+	st := store.New()
+	st.Store(&store.Snapshot{
+		Nodes: []store.NodeView{
+			{StableID: "r1", Name: "router1"},
+			{StableID: "e1", Name: "exit1"},
+			{StableID: "other", Name: "secret-node"},
+		},
+		Routers: []store.RouterView{
+			{Node: store.NodeView{StableID: "r1", Name: "router1"}, State: store.RouterOK},
+			{Node: store.NodeView{StableID: "r2", Name: "router2"}, State: store.RouterOK},
+		},
+		Groups: []store.GroupView{{
+			ID:               z1.ID,
+			Name:             "z1",
+			Consumers:        []store.GroupMember{{StableID: "r1", Present: true}},
+			AllowedExitNodes: []store.GroupMember{{StableID: "e1", Present: true}},
+		}},
+	})
+	a := New(st, fakeWhoIs{login: "nobody"}, &fakeController{},
+		Config{Owner: "admin", AllowedHosts: []string{"tsctl"}, Groups: gs, Guests: fg})
+
+	// handleNodes for a guest -> only r1 + e1, NOT "other".
+	rec := httptest.NewRecorder()
+	a.handleNodes(rec, guestReq(httptest.NewRequest(http.MethodGet, "/api/nodes", nil), "g1", z1.ID))
+	var nodesBody struct {
+		Nodes []map[string]any `json:"nodes"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &nodesBody); err != nil {
+		t.Fatalf("unmarshal nodes: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, n := range nodesBody.Nodes {
+		seen[n["stableID"].(string)] = true
+	}
+	if !seen["r1"] || !seen["e1"] {
+		t.Errorf("guest nodes should include r1+e1, got %v", seen)
+	}
+	if seen["other"] {
+		t.Error("guest nodes must NOT include out-of-zone node 'other'")
+	}
+
+	// Admin handleNodes (no subject / admin subject) is unfiltered.
+	recA := httptest.NewRecorder()
+	a.handleNodes(recA, adminReq(httptest.NewRequest(http.MethodGet, "/api/nodes", nil)))
+	if !strings.Contains(recA.Body.String(), "other") {
+		t.Error("admin nodes must include all nodes (no filter)")
+	}
+
+	// handleRouter: in-zone r1 -> 200, out-of-zone r2 -> 404 (same as missing).
+	get := func(id string) int {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/routers/"+id, nil)
+		req.SetPathValue("id", id)
+		req = guestReq(req, "g1", z1.ID)
+		a.handleRouter(rec, req)
+		return rec.Code
+	}
+	if got := get("r1"); got != 200 {
+		t.Errorf("guest in-zone router = %d want 200", got)
+	}
+	if got := get("r2"); got != http.StatusNotFound {
+		t.Errorf("guest out-of-zone router = %d want 404", got)
+	}
+}
+
+// TestHandleMe_Shapes locks in the /api/me shapes for admin and guest.
+func TestHandleMe_Shapes(t *testing.T) {
+	a, _, _, zoneID, gid := newGuestAPI(t)
+
+	// Admin.
+	rec := httptest.NewRecorder()
+	a.handleMe(rec, adminReq(httptest.NewRequest(http.MethodGet, "/api/me", nil)))
+	var me map[string]any
+	json.Unmarshal(rec.Body.Bytes(), &me)
+	if me["role"] != "admin" {
+		t.Errorf("admin /api/me role = %v want admin", me["role"])
+	}
+	for _, k := range []string{"role", "zoneId", "zoneName"} {
+		if _, ok := me[k]; !ok {
+			t.Errorf("/api/me missing key %q", k)
+		}
+	}
+
+	// Guest.
+	rec = httptest.NewRecorder()
+	a.handleMe(rec, guestReq(httptest.NewRequest(http.MethodGet, "/api/me", nil), gid, zoneID))
+	json.Unmarshal(rec.Body.Bytes(), &me)
+	if me["role"] != "guest" {
+		t.Errorf("guest /api/me role = %v want guest", me["role"])
+	}
+	if me["zoneId"] != zoneID {
+		t.Errorf("guest /api/me zoneId = %v want %q", me["zoneId"], zoneID)
+	}
+	if me["zoneName"] != "Work" {
+		t.Errorf("guest /api/me zoneName = %v want Work", me["zoneName"])
+	}
+}
+
+// TestGuestCRUD_NoHashAndZoneValidation covers the admin guest CRUD handlers: the
+// list/create DTOs never carry a hash, an unknown zone is rejected, and a valid
+// create succeeds.
+func TestGuestCRUD_NoHashAndZoneValidation(t *testing.T) {
+	a, _, _, zoneID, _ := newGuestAPI(t)
+
+	// List: array, no hash field on any item.
+	rec := httptest.NewRecorder()
+	a.handleListGuests(rec, adminReq(httptest.NewRequest(http.MethodGet, "/api/guests", nil)))
+	if rec.Code != 200 {
+		t.Fatalf("list code = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, bad := range []string{"passwordHash", "\"hash\"", "password"} {
+		if strings.Contains(body, bad) {
+			t.Errorf("guest list body leaks %q: %s", bad, body)
+		}
+	}
+	var list []map[string]any
+	json.Unmarshal(rec.Body.Bytes(), &list)
+	if len(list) != 1 {
+		t.Fatalf("list len = %d want 1", len(list))
+	}
+	for _, k := range []string{"id", "label", "zoneId", "disabled", "createdAt"} {
+		if _, ok := list[0][k]; !ok {
+			t.Errorf("guest DTO missing key %q (got %v)", k, list[0])
+		}
+	}
+
+	// Create with unknown zone -> 422.
+	rec = httptest.NewRecorder()
+	a.handleCreateGuest(rec, adminReq(httptest.NewRequest(http.MethodPost, "/api/guests",
+		strings.NewReader(`{"label":"bob","zoneId":"does-not-exist","password":"longenough"}`))))
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Errorf("create unknown-zone = %d want 422", rec.Code)
+	}
+
+	// Create with a valid zone -> 201, no hash in the response.
+	rec = httptest.NewRecorder()
+	a.handleCreateGuest(rec, adminReq(httptest.NewRequest(http.MethodPost, "/api/guests",
+		strings.NewReader(`{"label":"bob","zoneId":"`+zoneID+`","password":"longenough"}`))))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create valid = %d body=%s", rec.Code, rec.Body)
+	}
+	if strings.Contains(rec.Body.String(), "password") {
+		t.Errorf("create response leaks password material: %s", rec.Body)
+	}
+}
+
+// TestDeleteGroup_409WhenGuestAssigned proves the delete-guard returns 409 while a
+// guest is bound to the zone, and 204 once no guest references it.
+func TestDeleteGroup_409WhenGuestAssigned(t *testing.T) {
+	a, gs, fg, zoneID, gid := newGuestAPI(t)
+	ctrl := a.ctrl.(*fakeController)
+
+	del := func() int {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodDelete, "/api/groups/"+zoneID, nil)
+		req.SetPathValue("id", zoneID)
+		a.handleDeleteGroup(rec, adminReq(req))
+		return rec.Code
+	}
+
+	if got := del(); got != http.StatusConflict {
+		t.Errorf("delete zone with guest assigned = %d want 409", got)
+	}
+	if ctrl.refreshGroupsCalls != 0 {
+		t.Errorf("a blocked delete must NOT RefreshGroups, calls = %d", ctrl.refreshGroupsCalls)
+	}
+
+	// Remove the guest, then the delete succeeds.
+	fg.Delete(gid)
+	if got := del(); got != http.StatusNoContent {
+		t.Errorf("delete zone after removing guest = %d want 204", got)
+	}
+	if _, ok := gs.Get(zoneID); ok {
+		t.Error("zone should be gone after a successful delete")
 	}
 }

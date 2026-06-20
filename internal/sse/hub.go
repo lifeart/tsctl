@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/lifeart/tsctl/internal/authz"
 	"github.com/lifeart/tsctl/internal/store"
 )
 
@@ -26,8 +27,14 @@ type SnapshotEncoder func(*store.Snapshot) ([]byte, error)
 
 // client is one connected browser. ch is cap-1 latest-wins, written ONLY by the
 // Run goroutine and drained by the client's ServeHTTP goroutine.
+//
+// filter, when non-nil, scopes each frame to a guest's zone before encoding. It
+// runs in the per-client ServeHTTP goroutine (writeFrame), never in Run -- so Run
+// keeps broadcasting the single shared snapshot (unchanged single-owner model)
+// and the per-connection filtering adds zero work for admin clients (filter==nil).
 type client struct {
-	ch chan *store.Snapshot
+	ch     chan *store.Snapshot
+	filter func(*store.Snapshot) *store.Snapshot
 }
 
 // Hub fans out Snapshot frames to connected browsers.
@@ -172,6 +179,24 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rc := http.NewResponseController(w)
 	c := &client{ch: make(chan *store.Snapshot, 1)}
 
+	// A guest connection (Subject injected by RequireAuth, which wraps this hub in
+	// main.go) gets a per-connection zone filter applied to every frame, including
+	// the on-connect snapshot. Admin (or no subject) -> nil filter, zero overhead.
+	// It also carries a revalidation hook: a streaming GET authenticates only once
+	// at connect, so without this a disabled/deleted guest's open stream would keep
+	// delivering its zone until the client disconnects. The heartbeat below re-checks
+	// it, ending the stream within one ping interval (writes already revoke instantly).
+	var revalidate authz.Revalidate
+	if sub, ok := authz.SubjectFromContext(r.Context()); ok && !sub.Admin {
+		zoneID := sub.ZoneID
+		c.filter = func(s *store.Snapshot) *store.Snapshot {
+			return authz.FilterSnapshotToZone(s, zoneID)
+		}
+		if fn, ok := authz.RevalidateFromContext(r.Context()); ok {
+			revalidate = fn
+		}
+	}
+
 	// Register (Run pushes the current snapshot into c.ch as it adds us).
 	select {
 	case h.register <- c:
@@ -198,10 +223,16 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case <-h.done:
 			return
 		case snap := <-c.ch:
-			if !h.writeFrame(w, rc, snap) {
+			if !h.writeFrame(w, rc, c, snap) {
 				return
 			}
 		case <-ping.C:
+			// Re-check a guest stream's authorization (disabled/deleted guest or
+			// deleted zone -> drop the stream within one ping interval). Admin streams
+			// have revalidate==nil and are unaffected.
+			if revalidate != nil && !revalidate() {
+				return
+			}
 			// Fresh per-write deadline (M5): a dead peer makes this write block
 			// otherwise; with the deadline it errors and we return + unregister.
 			if err := rc.SetWriteDeadline(time.Now().Add(h.writeTimeout)); err != nil {
@@ -220,8 +251,14 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // writeFrame encodes and writes one `data: <json>\n\n` frame and flushes. It
 // returns false (caller returns, unregisters) on any write/flush error. An
-// encode failure is logged and the frame skipped (the stream survives).
-func (h *Hub) writeFrame(w http.ResponseWriter, rc *http.ResponseController, snap *store.Snapshot) bool {
+// encode failure is logged and the frame skipped (the stream survives). For a
+// guest client (c.filter != nil) the shared snapshot is scoped to the guest's
+// zone HERE, in the per-client goroutine, before encoding -- Run never sees the
+// filtered copy and the shared snapshot is never mutated.
+func (h *Hub) writeFrame(w http.ResponseWriter, rc *http.ResponseController, c *client, snap *store.Snapshot) bool {
+	if c.filter != nil {
+		snap = c.filter(snap)
+	}
 	data, err := h.encode(snap)
 	if err != nil {
 		log.Printf("sse: encode snapshot: %v", err)

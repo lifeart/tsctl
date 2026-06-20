@@ -8,9 +8,11 @@ import (
 	"net/http/httptest"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/lifeart/tsctl/internal/authz"
 	"github.com/lifeart/tsctl/internal/store"
 )
 
@@ -198,5 +200,139 @@ func TestTransitions_ClientCountEdges(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("no 1->0 transition emitted")
+	}
+}
+
+// TestServeHTTP_GuestFrameFiltered proves a guest connection (Subject in context,
+// as RequireAuth would inject) gets a zone-filtered on-connect frame, while an
+// admin (no/admin subject) gets the full snapshot -- and the shared snapshot is
+// never mutated.
+func TestServeHTTP_GuestFrameFiltered(t *testing.T) {
+	st := store.New()
+	st.Store(&store.Snapshot{
+		Nodes: []store.NodeView{
+			{StableID: "r1", Name: "router1"},
+			{StableID: "e1", Name: "exit1"},
+			{StableID: "other", Name: "secret-node"},
+		},
+		Routers: []store.RouterView{
+			{Node: store.NodeView{StableID: "r1"}, State: store.RouterOK},
+			{Node: store.NodeView{StableID: "r2"}, State: store.RouterOK},
+		},
+		Groups: []store.GroupView{{
+			ID:               "z1",
+			Name:             "Work",
+			Consumers:        []store.GroupMember{{StableID: "r1", Present: true}},
+			AllowedExitNodes: []store.GroupMember{{StableID: "e1", Present: true}},
+		}},
+		BuiltAt: time.Now(),
+	})
+	h := New(st, testEncoder)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx)
+
+	// serve injects sub into every request context, as RequireAuth would.
+	serve := func(sub authz.Subject, hasSub bool) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if hasSub {
+				r = r.WithContext(authz.WithSubject(r.Context(), sub))
+			}
+			h.ServeHTTP(w, r)
+		}))
+	}
+	firstFrame := func(srv *httptest.Server) string {
+		reqCtx, reqCancel := context.WithCancel(context.Background())
+		defer reqCancel()
+		req, _ := http.NewRequestWithContext(reqCtx, http.MethodGet, srv.URL, nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET: %v", err)
+		}
+		defer resp.Body.Close()
+		return readFrame(t, bufio.NewReader(resp.Body))
+	}
+
+	// Guest: filtered to r1 + e1, never "other" or r2.
+	gsrv := serve(authz.Subject{GuestID: "g1", ZoneID: "z1"}, true)
+	defer gsrv.Close()
+	gframe := firstFrame(gsrv)
+	if !strings.Contains(gframe, "r1") || !strings.Contains(gframe, "e1") {
+		t.Errorf("guest frame should include r1+e1: %q", gframe)
+	}
+	if strings.Contains(gframe, "secret-node") || strings.Contains(gframe, "\"r2\"") {
+		t.Errorf("guest frame must NOT include out-of-zone data: %q", gframe)
+	}
+
+	// Admin (no subject): full snapshot.
+	asrv := serve(authz.Subject{}, false)
+	defer asrv.Close()
+	aframe := firstFrame(asrv)
+	if !strings.Contains(aframe, "secret-node") || !strings.Contains(aframe, "\"r2\"") {
+		t.Errorf("admin frame should include the full snapshot: %q", aframe)
+	}
+
+	// The shared snapshot was never mutated by the per-connection filtering.
+	cur := st.Load()
+	if len(cur.Nodes) != 3 || len(cur.Routers) != 2 {
+		t.Errorf("shared snapshot mutated: nodes=%d routers=%d", len(cur.Nodes), len(cur.Routers))
+	}
+}
+
+// A guest's long-lived event stream must be DROPPED soon after the guest is
+// disabled/deleted (the heartbeat re-checks authorization), not kept open until the
+// client happens to disconnect. (Security gate finding: SSE read-revocation lag.)
+func TestServeHTTP_GuestStreamClosedOnRevoke(t *testing.T) {
+	st := store.New()
+	st.Store(&store.Snapshot{
+		Nodes:   []store.NodeView{{StableID: "r1"}},
+		Routers: []store.RouterView{{Node: store.NodeView{StableID: "r1"}, State: store.RouterOK}},
+		Groups:  []store.GroupView{{ID: "z1", Consumers: []store.GroupMember{{StableID: "r1", Present: true}}}},
+		BuiltAt: time.Now(),
+	})
+	h := New(st, testEncoder)
+	h.pingInterval = 10 * time.Millisecond // re-check auth fast
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx)
+
+	var authorized atomic.Bool
+	authorized.Store(true)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(authz.WithSubject(r.Context(), authz.Subject{GuestID: "g1", ZoneID: "z1"}))
+		r = r.WithContext(authz.WithRevalidate(r.Context(), func() bool { return authorized.Load() }))
+		h.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+
+	reqCtx, reqCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer reqCancel()
+	req, _ := http.NewRequestWithContext(reqCtx, http.MethodGet, srv.URL, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	br := bufio.NewReader(resp.Body)
+	_ = readFrame(t, br) // on-connect filtered frame -> stream is live
+
+	authorized.Store(false) // the guest is disabled/deleted out from under the stream
+
+	// The next heartbeat re-check fails -> the hub returns -> the body closes -> a
+	// read errors. Must happen well within the request timeout.
+	closed := make(chan struct{})
+	go func() {
+		buf := make([]byte, 256)
+		for {
+			if _, err := br.Read(buf); err != nil {
+				close(closed)
+				return
+			}
+		}
+	}()
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("guest event stream was not closed after revocation")
 	}
 }

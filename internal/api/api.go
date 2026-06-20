@@ -38,6 +38,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lifeart/tsctl/internal/authz"
 	"github.com/lifeart/tsctl/internal/store"
 )
 
@@ -83,6 +84,22 @@ type GroupStore interface {
 	Delete(id string) error
 }
 
+// GuestStore is the CRUD + authentication seam for "guest mode" credentials.
+// Implemented by *guests.Store. Declared here (consumer side) so the api never
+// imports the guests package; the bcrypt hash is encapsulated there and NEVER
+// crosses this interface -- every method returns the hash-free store.Guest.
+// Authenticate verifies a (label,password) and returns the guest on success
+// (false on unknown label / wrong password / disabled). The api re-loads a guest
+// via Get on EVERY request so a delete/disable revokes access on the next call.
+type GuestStore interface {
+	List() []store.Guest
+	Get(id string) (store.Guest, bool)
+	Create(label, zoneID, pw string) (store.Guest, error)
+	SetDisabled(id string, disabled bool) (store.Guest, error)
+	Delete(id string) error
+	Authenticate(label, pw string) (store.Guest, bool)
+}
+
 // Config carries the security configuration the middleware needs (wired from
 // cmd/tsctl). Owner is the tailnet login allowed to control (may be "" when only
 // the password path is used); UIPassword is the shared secret for the
@@ -95,6 +112,10 @@ type Config struct {
 	UIPassword   string
 	AllowedHosts []string
 	Groups       GroupStore
+	// Guests is the optional guest-credential store (may be nil -- when nil the
+	// guest CRUD routes are not registered and only the admin auth path exists, so
+	// behavior is byte-for-byte as before guest mode).
+	Guests GuestStore
 }
 
 // API holds the handler dependencies.
@@ -103,6 +124,7 @@ type API struct {
 	whois         WhoIser
 	ctrl          Controller
 	groups        GroupStore
+	guests        GuestStore
 	owner         string
 	uiPassword    string
 	sessionSecret []byte              // HMAC key for signed session cookies (per-process)
@@ -134,6 +156,7 @@ func New(st *store.Store, who WhoIser, ctrl Controller, cfg Config) *API {
 		whois:         who,
 		ctrl:          ctrl,
 		groups:        cfg.Groups,
+		guests:        cfg.Guests,
 		owner:         cfg.Owner,
 		uiPassword:    cfg.UIPassword,
 		sessionSecret: secret,
@@ -153,6 +176,11 @@ func New(st *store.Store, who WhoIser, ctrl Controller, cfg Config) *API {
 // RequireAuth(RequireHost(...)).)
 func (a *API) Routes() http.Handler {
 	// Data routes: require an authenticated caller (tailnet owner OR session).
+	// RequireAuth (wrapping the whole `data` mux below) injects the resolved
+	// Subject into the context, so the per-request handlers and RequireAdmin can
+	// read it. The router write/probe handlers ADDITIONALLY call
+	// authorizeRouterWrite (the server-side authorization choke point) so a guest
+	// can only act within its own zone.
 	data := http.NewServeMux()
 	data.HandleFunc("GET /api/nodes", a.handleNodes)
 	data.HandleFunc("GET /api/routers/{id}", a.handleRouter)
@@ -166,16 +194,27 @@ func (a *API) Routes() http.Handler {
 	// (here) + RequireHost + RequireCSRF (outer) -- a state-changing POST requires
 	// auth + a valid CSRF token + an allowed Host, exactly like exit-node.
 	data.HandleFunc("POST /api/routers/{id}/probe", a.handleProbe)
-	// Zone/group CRUD (DESIGN docs/design/zones.md). Same middleware as the data
-	// routes: RequireAuth (here) + RequireHost + RequireCSRF (outer). The writes
-	// thus require auth + a valid CSRF token + an allowed Host, like exit-node.
+	// Who am I: role + (for a guest) the bound zone. Behind RequireAuth only (a
+	// guest must be able to read its own role/zone); not admin-gated.
+	data.HandleFunc("GET /api/me", a.handleMe)
+	// Zone/group CRUD (DESIGN docs/design/zones.md). ADMIN ONLY: wrapped in
+	// RequireAdmin so a guest gets 403, not zone-management power. Same outer
+	// middleware as the data routes (RequireAuth + RequireHost + RequireCSRF).
 	// Registered only when a group store is wired (it's optional in narrow unit
 	// tests); otherwise the routes 404 instead of nil-panicking in the handlers.
 	if a.groups != nil {
-		data.HandleFunc("GET /api/groups", a.handleListGroups)
-		data.HandleFunc("POST /api/groups", a.handleCreateGroup)
-		data.HandleFunc("PUT /api/groups/{id}", a.handleUpdateGroup)
-		data.HandleFunc("DELETE /api/groups/{id}", a.handleDeleteGroup)
+		data.Handle("GET /api/groups", a.RequireAdmin(http.HandlerFunc(a.handleListGroups)))
+		data.Handle("POST /api/groups", a.RequireAdmin(http.HandlerFunc(a.handleCreateGroup)))
+		data.Handle("PUT /api/groups/{id}", a.RequireAdmin(http.HandlerFunc(a.handleUpdateGroup)))
+		data.Handle("DELETE /api/groups/{id}", a.RequireAdmin(http.HandlerFunc(a.handleDeleteGroup)))
+	}
+	// Guest CRUD (guest mode). ADMIN ONLY (RequireAdmin). Registered only when a
+	// guest store is wired; the list/create DTOs never carry the password hash.
+	if a.guests != nil {
+		data.Handle("GET /api/guests", a.RequireAdmin(http.HandlerFunc(a.handleListGuests)))
+		data.Handle("POST /api/guests", a.RequireAdmin(http.HandlerFunc(a.handleCreateGuest)))
+		data.Handle("POST /api/guests/{id}/disabled", a.RequireAdmin(http.HandlerFunc(a.handleSetGuestDisabled)))
+		data.Handle("DELETE /api/guests/{id}", a.RequireAdmin(http.HandlerFunc(a.handleDeleteGuest)))
 	}
 
 	mux := http.NewServeMux()
@@ -204,8 +243,11 @@ func (a *API) RequireHost(next http.Handler) http.Handler {
 	})
 }
 
-// Session cookie parameters. The value is base64(expiry||nonce||HMAC); see
-// newSessionValue / validSession. HttpOnly (JS never needs it), SameSite=Strict,
+// Session cookie parameters. The value is base64url(SIGNED || HMAC) where the
+// SIGNED region is expiry(8) || nonce(16) || role(1) || guestIDLen(1) ||
+// guestID(N) and the HMAC-SHA256 covers ALL of SIGNED (so the role + guest id are
+// unforgeable -- a tampered role fails the constant-time MAC). See
+// newSessionValue / parseSession. HttpOnly (JS never needs it), SameSite=Strict,
 // Path=/, Secure=false (the listeners are plain HTTP -- WireGuard encrypts the
 // tailnet transport, and the host-socket path is documented as plain HTTP).
 const (
@@ -213,8 +255,21 @@ const (
 	sessionTTL        = 7 * 24 * time.Hour
 	sessionExpiryLen  = 8  // int64 unix seconds, big-endian
 	sessionNonceLen   = 16 // random, makes each cookie unique
+	sessionRoleLen    = 1  // role byte (see roleAdmin/roleGuest)
+	sessionGIDLenLen  = 1  // length-prefix byte for the guest id
 	sessionMACLen     = 32 // HMAC-SHA256
-	sessionRawLen     = sessionExpiryLen + sessionNonceLen + sessionMACLen
+	// sessionHeaderLen is the fixed-size prefix of the SIGNED region before the
+	// variable-length guest id (admin: guestIDLen=0, no guest id bytes follow).
+	sessionHeaderLen = sessionExpiryLen + sessionNonceLen + sessionRoleLen + sessionGIDLenLen
+)
+
+// Session roles encoded in the cookie's signed region (1 byte). The session can
+// only ASSERT admin via a valid MAC over role==roleAdmin; the tailnet-owner admin
+// path is WhoIs-only and is never expressed through the cookie, so a guest cookie
+// can never escalate by being presented on the tailnet listener.
+const (
+	roleAdmin byte = 0
+	roleGuest byte = 1
 )
 
 // loginFailDelay is a small fixed delay applied to a wrong-password login to
@@ -234,91 +289,215 @@ var loginFailDelay = 500 * time.Millisecond
 // WHICH page asked, not WHO).
 func (a *API) RequireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if a.authenticated(r) {
-			next.ServeHTTP(w, r)
+		sub, ok := a.resolveSubject(r)
+		if !ok {
+			writeErr(w, http.StatusUnauthorized, "login required")
 			return
 		}
-		writeErr(w, http.StatusUnauthorized, "login required")
+		// Inject the Subject + a revalidation closure. The closure re-runs the full
+		// auth resolution for THIS request on demand; the sse hub calls it on its
+		// heartbeat so a guest's long-lived event stream is dropped within one ping
+		// interval after the guest is disabled/deleted (REST writes already revoke
+		// instantly via resolveSubject). Cheap for admin; a guest re-check is two
+		// in-memory store lookups.
+		ctx := authz.WithSubject(r.Context(), sub)
+		ctx = authz.WithRevalidate(ctx, func() bool { _, ok := a.resolveSubject(r); return ok })
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
-// authenticated reports whether the request satisfies either auth path. Tailnet
-// (WhoIs==owner) is tried first; on any failure it falls through to the session
-// cookie -- never granting on a WhoIs error (fail-closed).
-func (a *API) authenticated(r *http.Request) bool {
+// RequireAdmin gates a handler to the full-access admin role. It MUST sit inside
+// RequireAuth (which injects the Subject); a missing subject or a guest subject is
+// 403 ("admin only" -- the resource exists, the caller just isn't allowed; 401 is
+// reserved for "authenticate"). This is the second authorization choke point: it
+// guards all zone/group CRUD and all guest CRUD.
+func (a *API) RequireAdmin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sub, ok := authz.SubjectFromContext(r.Context())
+		if !ok || !sub.Admin {
+			writeErr(w, http.StatusForbidden, "admin only")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// resolveSubject authenticates a request and returns the authorized Subject.
+// Order (fail-closed throughout):
+//
+//   - tailnet owner first: WhoIs identifies the untagged configured owner -> admin
+//     (the tailnet admin is WhoIs-only and never cookie-assertable);
+//   - else the signed session cookie: an admin cookie -> admin; a guest cookie is
+//     re-validated against the LIVE stores on EVERY request -- the guest must still
+//     exist, not be disabled, and its zone must still exist -- which makes a
+//     delete/disable/zone-delete revoke access on the very next request (no TTL).
+//
+// On any failure ok=false (the caller replies 401).
+func (a *API) resolveSubject(r *http.Request) (authz.Subject, bool) {
 	if a.owner != "" {
 		login, tagged, err := a.whois.WhoIs(r.Context(), r.RemoteAddr)
 		if err == nil && !tagged && login != "" && login == a.owner {
-			return true
+			return authz.Subject{Admin: true}, true
 		}
 	}
-	return a.validSession(r)
+	sub, ok := a.parseSession(r)
+	if !ok {
+		return authz.Subject{}, false
+	}
+	if sub.Admin {
+		return sub, true
+	}
+	// Guest cookie: re-load from the live store (instant revocation + live zone
+	// binding). Deny if the guest store is absent, the guest is gone or disabled,
+	// or its bound zone no longer exists.
+	if a.guests == nil {
+		return authz.Subject{}, false
+	}
+	g, ok := a.guests.Get(sub.GuestID)
+	if !ok || g.Disabled {
+		return authz.Subject{}, false
+	}
+	if a.groups == nil {
+		return authz.Subject{}, false
+	}
+	if _, ok := a.groups.Get(g.ZoneID); !ok {
+		return authz.Subject{}, false // zone deleted out from under the guest
+	}
+	return authz.Subject{GuestID: g.ID, ZoneID: g.ZoneID}, true
 }
 
-// newSessionValue mints a signed session cookie value valid for sessionTTL:
-// base64url(expiryUnix(8) || nonce(16) || HMAC-SHA256(secret, expiry||nonce)).
-func (a *API) newSessionValue() (string, error) {
-	raw := make([]byte, sessionRawLen)
+// newSessionValue mints a signed session cookie value valid for sessionTTL for
+// the given Subject. Layout (see the session const block): base64url(expiry(8) ||
+// nonce(16) || role(1) || guestIDLen(1) || guestID(N) || HMAC-SHA256(secret, all
+// preceding bytes)). Only Admin and GuestID are encoded; the zone is re-resolved
+// per request, never trusted from the cookie.
+func (a *API) newSessionValue(sub authz.Subject) (string, error) {
+	role := roleAdmin
+	var gid []byte
+	if !sub.Admin {
+		role = roleGuest
+		gid = []byte(sub.GuestID)
+	}
+	if len(gid) > 255 {
+		return "", errors.New("guest id too long for session cookie")
+	}
+	signedLen := sessionHeaderLen + len(gid)
+	raw := make([]byte, signedLen+sessionMACLen)
 	binary.BigEndian.PutUint64(raw[:sessionExpiryLen], uint64(time.Now().Add(sessionTTL).Unix()))
 	if _, err := rand.Read(raw[sessionExpiryLen : sessionExpiryLen+sessionNonceLen]); err != nil {
 		return "", err
 	}
-	mac := a.sessionMAC(raw[:sessionExpiryLen+sessionNonceLen])
-	copy(raw[sessionExpiryLen+sessionNonceLen:], mac)
+	raw[sessionExpiryLen+sessionNonceLen] = role
+	raw[sessionExpiryLen+sessionNonceLen+sessionRoleLen] = byte(len(gid))
+	copy(raw[sessionHeaderLen:signedLen], gid)
+	mac := a.sessionMAC(raw[:signedLen])
+	copy(raw[signedLen:], mac)
 	return base64.RawURLEncoding.EncodeToString(raw), nil
 }
 
-// sessionMAC is HMAC-SHA256(secret, signed) over the expiry||nonce prefix.
+// sessionMAC is HMAC-SHA256(secret, signed) over the WHOLE signed region.
 func (a *API) sessionMAC(signed []byte) []byte {
 	mac := hmac.New(sha256.New, a.sessionSecret)
 	mac.Write(signed)
 	return mac.Sum(nil)
 }
 
-// validSession constant-time-verifies the tsctl_session cookie's HMAC and that
-// it has not expired. Any decode/length/MAC/expiry problem → false (fail-closed).
-func (a *API) validSession(r *http.Request) bool {
+// parseSession constant-time-verifies the tsctl_session cookie's HMAC and expiry
+// and returns the carried Subject (without resolving the zone -- resolveSubject
+// does that against the live store). Any decode/length/MAC/expiry/role problem ->
+// ok=false (fail-closed). The guestIDLen byte is read only to locate the MAC
+// boundary; a tampered length yields a different signed region whose MAC fails.
+func (a *API) parseSession(r *http.Request) (authz.Subject, bool) {
 	c, err := r.Cookie(sessionCookieName)
 	if err != nil || c.Value == "" {
-		return false
+		return authz.Subject{}, false
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(c.Value)
-	if err != nil || len(raw) != sessionRawLen {
-		return false
+	if err != nil || len(raw) < sessionHeaderLen+sessionMACLen {
+		return authz.Subject{}, false
 	}
-	signed := raw[:sessionExpiryLen+sessionNonceLen]
-	mac := raw[sessionExpiryLen+sessionNonceLen:]
+	gidLen := int(raw[sessionExpiryLen+sessionNonceLen+sessionRoleLen])
+	signedLen := sessionHeaderLen + gidLen
+	if len(raw) != signedLen+sessionMACLen {
+		return authz.Subject{}, false
+	}
+	signed := raw[:signedLen]
+	mac := raw[signedLen:]
 	if subtle.ConstantTimeCompare(mac, a.sessionMAC(signed)) != 1 {
-		return false
+		return authz.Subject{}, false
 	}
 	expiry := int64(binary.BigEndian.Uint64(signed[:sessionExpiryLen]))
-	return time.Now().Unix() < expiry
+	if time.Now().Unix() >= expiry {
+		return authz.Subject{}, false
+	}
+	role := signed[sessionExpiryLen+sessionNonceLen]
+	switch role {
+	case roleAdmin:
+		if gidLen != 0 {
+			return authz.Subject{}, false // admin carries no guest id
+		}
+		return authz.Subject{Admin: true}, true
+	case roleGuest:
+		if gidLen == 0 {
+			return authz.Subject{}, false // guest must carry an id
+		}
+		return authz.Subject{GuestID: string(signed[sessionHeaderLen:signedLen])}, true
+	default:
+		return authz.Subject{}, false
+	}
 }
 
-// handleLogin authenticates the password path. It is mounted WITHOUT RequireAuth
-// (so the SPA can sign in) but WITH RequireHost + RequireCSRF. On a correct
-// password it sets the signed session cookie and returns 200 {"ok":true}; on a
-// wrong password it waits loginFailDelay then returns 401. If password login is
-// disabled (no UIPassword) the endpoint does not exist (404). The password and
-// the cookie value are NEVER logged.
+// handleLogin authenticates a login. It is mounted WITHOUT RequireAuth (so the
+// SPA can sign in) but WITH RequireHost + RequireCSRF. The body is {label?,
+// password}: an EMPTY label is the ADMIN path (constant-time compare vs the shared
+// UIPassword); a non-empty label is the GUEST path (guests.Authenticate, which
+// includes a dummy bcrypt compare on an unknown label for timing parity). On
+// success it sets the signed session cookie carrying the resolved role/guest and
+// returns 200 {"ok":true}; on failure it waits loginFailDelay then returns 401
+// (a uniform message -- no admin-vs-guest oracle). If the admin path is requested
+// while password login is disabled (no UIPassword) the endpoint reports 404, as
+// before. The label, password, and cookie value are NEVER logged.
 func (a *API) handleLogin(w http.ResponseWriter, r *http.Request) {
-	if a.uiPassword == "" {
-		writeErr(w, http.StatusNotFound, "password login is disabled")
-		return
-	}
 	var body struct {
+		Label    string `json:"label"`
 		Password string `json:"password"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
 		writeErrDetail(w, http.StatusBadRequest, "invalid request body", err.Error(), "")
 		return
 	}
-	if subtle.ConstantTimeCompare([]byte(body.Password), []byte(a.uiPassword)) != 1 {
-		time.Sleep(loginFailDelay) // blunt brute force; never log the attempt
-		writeErr(w, http.StatusUnauthorized, "invalid password")
-		return
+
+	var sub authz.Subject
+	if strings.TrimSpace(body.Label) == "" {
+		// Admin path (unchanged): empty label compares against the shared UI password.
+		if a.uiPassword == "" {
+			writeErr(w, http.StatusNotFound, "password login is disabled")
+			return
+		}
+		if subtle.ConstantTimeCompare([]byte(body.Password), []byte(a.uiPassword)) != 1 {
+			time.Sleep(loginFailDelay) // blunt brute force; never log the attempt
+			writeErr(w, http.StatusUnauthorized, "invalid credentials")
+			return
+		}
+		sub = authz.Subject{Admin: true}
+	} else {
+		// Guest path: one bcrypt verify per attempt (no fan-out). guests.Authenticate
+		// rejects unknown label / wrong password / disabled with timing parity.
+		if a.guests == nil {
+			time.Sleep(loginFailDelay)
+			writeErr(w, http.StatusUnauthorized, "invalid credentials")
+			return
+		}
+		g, ok := a.guests.Authenticate(body.Label, body.Password)
+		if !ok {
+			time.Sleep(loginFailDelay)
+			writeErr(w, http.StatusUnauthorized, "invalid credentials")
+			return
+		}
+		sub = authz.Subject{GuestID: g.ID, ZoneID: g.ZoneID}
 	}
-	val, err := a.newSessionValue()
+
+	val, err := a.newSessionValue(sub)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "could not create session")
 		return
@@ -407,9 +586,44 @@ func (a *API) handleCSRF(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"token": tok})
 }
 
+// handleMe reports the caller's role and (for a guest) its bound zone. Behind
+// RequireAuth, so the Subject is always present. Admin -> {role:"admin"} with an
+// empty zone; guest -> {role:"guest", zoneId, zoneName} (the name resolved live
+// from the group store). The shape always carries all three keys.
+func (a *API) handleMe(w http.ResponseWriter, r *http.Request) {
+	sub, ok := authz.SubjectFromContext(r.Context())
+	if !ok {
+		// RequireAuth should make this unreachable; fail closed if it ever isn't.
+		writeErr(w, http.StatusUnauthorized, "login required")
+		return
+	}
+	if sub.Admin {
+		writeJSON(w, http.StatusOK, MeResponse{Role: "admin"})
+		return
+	}
+	zoneName := ""
+	if a.groups != nil {
+		if g, ok := a.groups.Get(sub.ZoneID); ok {
+			zoneName = g.Name
+		}
+	}
+	writeJSON(w, http.StatusOK, MeResponse{Role: "guest", ZoneID: sub.ZoneID, ZoneName: zoneName})
+}
+
 // handleNodes serves the first-paint / no-SSE fallback: {nodes, builtAt, netmapErr}.
+// For a guest it returns the zone-filtered node set (defense-in-depth; writes are
+// independently authorized); for an admin, the full set. A MISSING subject fails
+// closed (401) -- this handler must run behind RequireAuth, which always injects one.
 func (a *API) handleNodes(w http.ResponseWriter, r *http.Request) {
+	sub, ok := authz.SubjectFromContext(r.Context())
+	if !ok {
+		writeErr(w, http.StatusUnauthorized, "login required")
+		return
+	}
 	snap := a.store.Load()
+	if !sub.Admin {
+		snap = authz.FilterSnapshotToZone(snap, sub.ZoneID)
+	}
 	writeJSON(w, http.StatusOK, NodesResponse{
 		Nodes:     nodeDTOs(snap.Nodes),
 		BuiltAt:   rfc3339(snap.BuiltAt),
@@ -417,9 +631,20 @@ func (a *API) handleNodes(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleRouter returns one RouterView by router StableID.
+// handleRouter returns one RouterView by router StableID. For a guest a router
+// outside its zone is 404 -- the SAME response as a truly missing router, so it is
+// not an oracle for which routers exist elsewhere on the fleet.
 func (a *API) handleRouter(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	sub, ok := authz.SubjectFromContext(r.Context())
+	if !ok {
+		writeErr(w, http.StatusUnauthorized, "login required") // fail-closed (must be behind RequireAuth)
+		return
+	}
+	if !sub.Admin && !a.routerInZone(sub.ZoneID, id) {
+		writeErrDetail(w, http.StatusNotFound, "router not found", "no router with id "+id, "")
+		return
+	}
 	snap := a.store.Load()
 	for _, rv := range snap.Routers {
 		if rv.Node.StableID == id {
@@ -440,6 +665,12 @@ func (a *API) handleSetExitNode(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
 		writeErrDetail(w, http.StatusBadRequest, "invalid request body", err.Error(), "")
+		return
+	}
+	// AUTHORIZATION CHOKE POINT (source of truth): a guest may only set an in-zone
+	// router to an exit node in its OWN zone's allowed list (or clear it). Admin is
+	// unrestricted here (the poller still enforces zones as a second layer).
+	if !a.authorizeRouterWrite(w, r, id, body.ExitNode) {
 		return
 	}
 	rv, err := a.ctrl.SetExitNode(r.Context(), id, body.ExitNode)
@@ -474,6 +705,11 @@ func (a *API) handleSetExitNode(w http.ResponseWriter, r *http.Request) {
 // router, 409 no/elapsed/superseded pending keep, 502 router-command failure.
 func (a *API) handleKeep(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// AUTHORIZATION CHOKE POINT: a guest may only Keep an in-zone router (no
+	// target). Admin is unrestricted.
+	if !a.authorizeRouterWrite(w, r, id, "") {
+		return
+	}
 	rv, err := a.ctrl.Keep(r.Context(), id)
 	if err != nil {
 		status := http.StatusBadGateway
@@ -504,6 +740,11 @@ func (a *API) handleKeep(w http.ResponseWriter, r *http.Request) {
 // stderr mapping as handleSetExitNode.
 func (a *API) handleProbe(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// AUTHORIZATION CHOKE POINT: a guest may only probe an in-zone router (the
+	// auto-resolve path). Admin is unrestricted.
+	if !a.authorizeRouterWrite(w, r, id, "") {
+		return
+	}
 	res, err := a.ctrl.Probe(r.Context(), id)
 	if err != nil {
 		status := http.StatusBadGateway
@@ -527,6 +768,75 @@ func (a *API) handleProbe(w http.ResponseWriter, r *http.Request) {
 	// res IS the frozen wire shape (store.ProbeResult carries the JSON tags), so it
 	// is written directly: {ok, durationMs, output?, error?, checkedAt}.
 	writeJSON(w, http.StatusOK, res)
+}
+
+// --- guest authorization (the server-side source of truth) --------------------
+
+// authorizeRouterWrite is the per-request authorization choke point for the
+// router write/probe endpoints (exit-node, keep, probe). It returns true (allow)
+// or writes a UNIFORM 403 and returns false.
+//
+//   - Admin: always allowed (the poller still enforces zones as a second layer).
+//   - Guest: allowed only when routerID is a Consumer of the guest's OWN zone AND,
+//     for a non-empty target, target is in that zone's AllowedExitNodes. Clearing
+//     (target=="") needs only zone membership. The zone is read LIVE from the group
+//     store (a.groups), deliberately STRICTER than the poller's cross-zone allowed
+//     union (poller.allowedExitNodeSet) -- a guest is confined to its single zone.
+//
+// Every denial is an identical 403 with no detail: a guest cannot distinguish
+// "not your router" from "not an allowed target" from "your zone is gone" (no
+// oracle). Authorization here is INDEPENDENT of the snapshot filter, so a filter
+// bug can never grant a write.
+func (a *API) authorizeRouterWrite(w http.ResponseWriter, r *http.Request, routerID, target string) bool {
+	sub, ok := authz.SubjectFromContext(r.Context())
+	if !ok {
+		writeErr(w, http.StatusForbidden, "forbidden")
+		return false
+	}
+	if sub.Admin {
+		return true
+	}
+	if a.groups == nil {
+		writeErr(w, http.StatusForbidden, "forbidden")
+		return false
+	}
+	g, ok := a.groups.Get(sub.ZoneID)
+	if !ok {
+		writeErr(w, http.StatusForbidden, "forbidden")
+		return false
+	}
+	if !containsStr(g.Consumers, routerID) {
+		writeErr(w, http.StatusForbidden, "forbidden")
+		return false
+	}
+	if target != "" && !containsStr(g.AllowedExitNodes, target) {
+		writeErr(w, http.StatusForbidden, "forbidden")
+		return false
+	}
+	return true
+}
+
+// routerInZone reports whether routerID is a Consumer of zoneID, read live from
+// the group store. Used by handleRouter to 404 an out-of-zone router for a guest.
+func (a *API) routerInZone(zoneID, routerID string) bool {
+	if a.groups == nil {
+		return false
+	}
+	g, ok := a.groups.Get(zoneID)
+	if !ok {
+		return false
+	}
+	return containsStr(g.Consumers, routerID)
+}
+
+// containsStr reports whether ss contains s.
+func containsStr(ss []string, s string) bool {
+	for _, x := range ss {
+		if x == s {
+			return true
+		}
+	}
+	return false
 }
 
 // --- group (zone) CRUD handlers (DESIGN docs/design/zones.md) ------------------
@@ -588,9 +898,23 @@ func (a *API) handleUpdateGroup(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, groupDTO(g))
 }
 
-// handleDeleteGroup deletes the group at {id} (204). 404 if missing.
+// handleDeleteGroup deletes the group at {id} (204). 404 if missing. A zone with
+// a guest still assigned to it is 409 (delete/reassign the guest first) -- this
+// guards against orphaning a guest (whose next request would otherwise 401 once
+// its zone vanished); the revocation safety net still holds, but the 409 makes the
+// dependency explicit to the admin.
 func (a *API) handleDeleteGroup(w http.ResponseWriter, r *http.Request) {
-	if err := a.groups.Delete(r.PathValue("id")); err != nil {
+	id := r.PathValue("id")
+	if a.guests != nil {
+		for _, g := range a.guests.List() {
+			if g.ZoneID == id {
+				writeErrDetail(w, http.StatusConflict, "zone in use",
+					"a guest is assigned to this zone; delete or reassign the guest first", "")
+				return
+			}
+		}
+	}
+	if err := a.groups.Delete(id); err != nil {
 		writeGroupErr(w, err)
 		return
 	}
@@ -633,6 +957,80 @@ func asHTTPStatus(err error) (int, bool) {
 		return hs.HTTPStatus(), true
 	}
 	return 0, false
+}
+
+// --- guest (guest mode) CRUD handlers, ADMIN ONLY (RequireAdmin) ---------------
+
+// guestReqLimit caps a guest request body (defense-in-depth).
+const guestReqLimit = 1 << 14 // 16 KiB
+
+// handleListGuests returns every guest as a JSON array (never null). The DTO has
+// NO password-hash field -- the hash never leaves the guests package and never
+// reaches the wire.
+func (a *API) handleListGuests(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, guestDTOs(a.guests.List()))
+}
+
+// handleCreateGuest creates a guest from {label, zoneId, password} and returns
+// the created guest (201, no hash). An unknown zoneId is rejected (422) -- a guest
+// must be bound to a real zone. Validation errors (empty/duplicate label, weak
+// password) are 422 {error,detail}. The password is NEVER logged.
+func (a *API) handleCreateGuest(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Label    string `json:"label"`
+		ZoneID   string `json:"zoneId"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, guestReqLimit)).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeErrDetail(w, http.StatusBadRequest, "invalid request body", err.Error(), "")
+		return
+	}
+	// The zone must exist (the group store is the source of truth). Reject before
+	// hashing so an unknown zone never creates a credential.
+	zoneID := strings.TrimSpace(body.ZoneID)
+	if a.groups == nil {
+		writeErrDetail(w, http.StatusUnprocessableEntity, "invalid guest", "no zones are configured", "")
+		return
+	}
+	if _, ok := a.groups.Get(zoneID); !ok {
+		writeErrDetail(w, http.StatusUnprocessableEntity, "invalid guest", "no zone with id "+body.ZoneID, "")
+		return
+	}
+	g, err := a.guests.Create(body.Label, zoneID, body.Password)
+	if err != nil {
+		writeGroupErr(w, err) // same structural status/detail mapping as groups
+		return
+	}
+	writeJSON(w, http.StatusCreated, guestDTO(g))
+}
+
+// handleSetGuestDisabled toggles a guest's disabled flag from {disabled:bool} and
+// returns the updated guest (200). 404 if missing. Disabling revokes the guest on
+// its very next request (the api re-loads the guest each request).
+func (a *API) handleSetGuestDisabled(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Disabled bool `json:"disabled"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, guestReqLimit)).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeErrDetail(w, http.StatusBadRequest, "invalid request body", err.Error(), "")
+		return
+	}
+	g, err := a.guests.SetDisabled(r.PathValue("id"), body.Disabled)
+	if err != nil {
+		writeGroupErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, guestDTO(g))
+}
+
+// handleDeleteGuest deletes the guest at {id} (204). 404 if missing. Deletion
+// revokes the guest on its very next request.
+func (a *API) handleDeleteGuest(w http.ResponseWriter, r *http.Request) {
+	if err := a.guests.Delete(r.PathValue("id")); err != nil {
+		writeGroupErr(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // --- DTOs (PHASE_B §3, camelCase) ---------------------------------------------
@@ -728,6 +1126,25 @@ type NodesResponse struct {
 	NetmapErr string    `json:"netmapErr"`
 }
 
+// MeResponse is the GET /api/me body: the caller's role and, for a guest, the
+// bound zone. zoneId/zoneName are empty for an admin (the keys are always present
+// so the shape is stable).
+type MeResponse struct {
+	Role     string `json:"role"`
+	ZoneID   string `json:"zoneId"`
+	ZoneName string `json:"zoneName"`
+}
+
+// GuestDTO is the wire shape of a store.Guest (the /api/guests CRUD body). It
+// carries NO password hash -- the hash never leaves the guests package.
+type GuestDTO struct {
+	ID        string `json:"id"`
+	Label     string `json:"label"`
+	ZoneID    string `json:"zoneId"`
+	Disabled  bool   `json:"disabled"`
+	CreatedAt string `json:"createdAt"`
+}
+
 func nodeDTO(n store.NodeView) NodeDTO {
 	ips := n.TailscaleIPs
 	if ips == nil {
@@ -809,6 +1226,25 @@ func groupDTOs(gs []store.Group) []GroupDTO {
 	out := make([]GroupDTO, 0, len(gs))
 	for _, g := range gs {
 		out = append(out, groupDTO(g))
+	}
+	return out
+}
+
+// guestDTO is the hash-free wire shape of one store.Guest.
+func guestDTO(g store.Guest) GuestDTO {
+	return GuestDTO{
+		ID:        g.ID,
+		Label:     g.Label,
+		ZoneID:    g.ZoneID,
+		Disabled:  g.Disabled,
+		CreatedAt: rfc3339(g.CreatedAt),
+	}
+}
+
+func guestDTOs(gs []store.Guest) []GuestDTO {
+	out := make([]GuestDTO, 0, len(gs))
+	for _, g := range gs {
+		out = append(out, guestDTO(g))
 	}
 	return out
 }

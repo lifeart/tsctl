@@ -148,6 +148,23 @@ type Group struct {
 	AllowedExitNodes []string // node StableIDs of the exit nodes the consumers may use
 }
 
+// Guest is the hash-free public projection of a persisted guest credential (the
+// "guest mode" second access level). A guest can manage exactly one zone's exit
+// nodes and see nothing else; the bcrypt password hash NEVER appears here -- it
+// lives only inside internal/guests. This is admin-managed config, not fleet
+// state, so it is deliberately NOT part of Snapshot.
+//
+// Like store.Group it is a leaf data type with no JSON tags: the api package owns
+// the wire DTOs (and omits even these fields where a guest must not see them) and
+// the guests package owns the on-disk format.
+type Guest struct {
+	ID        string    // stable id, server-assigned (random hex)
+	Label     string    // login label (non-empty; unique case-insensitively)
+	ZoneID    string    // the Group.ID this guest is bound to (its one zone)
+	Disabled  bool      // a disabled guest cannot authenticate (instant revocation)
+	CreatedAt time.Time // when the guest was created (UTC)
+}
+
 // GroupMember is one resolved member of a group, ready for rendering. The poller
 // resolves each StableID against the current snapshot nodes: a member present in
 // the netmap carries its display Name/IP/Online; an absent one has Present=false

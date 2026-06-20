@@ -32,6 +32,7 @@ import (
 	"github.com/lifeart/tsctl/internal/api"
 	"github.com/lifeart/tsctl/internal/demo"
 	"github.com/lifeart/tsctl/internal/groups"
+	"github.com/lifeart/tsctl/internal/guests"
 	"github.com/lifeart/tsctl/internal/netmap"
 	"github.com/lifeart/tsctl/internal/poller"
 	"github.com/lifeart/tsctl/internal/router"
@@ -51,6 +52,7 @@ var (
 	_ api.WhoIser         = (*netmap.Mapper)(nil)
 	_ api.Controller      = (*poller.Poller)(nil)
 	_ api.GroupStore      = (*groups.Store)(nil)
+	_ api.GuestStore      = (*guests.Store)(nil)
 
 	// The demo World plays the Mapper (Netmapper+WhoIser) and RouterClient roles
 	// against the SAME frozen seams, so `tsctl demo` exercises the real stack;
@@ -213,6 +215,13 @@ func runServe(args []string, lg *log.Logger) error {
 	if err != nil {
 		return fmt.Errorf("groups store: %w", err)
 	}
+	// Persisted guest-credential store ($STATE_DIR/guests.json, 0600 -- holds
+	// bcrypt hashes). Fail-fast on a corrupt file, exactly like groups (never
+	// silently start empty and risk clobbering the operator's guests).
+	gstStore, err := guests.New(filepath.Join(cfg.StateDir, "guests.json"))
+	if err != nil {
+		return fmt.Errorf("guests store: %w", err)
+	}
 	// hub.Transitions() drives the poller's idle suspension; api.EncodeSnapshot
 	// makes SSE frames identical to the REST Snapshot DTO (PHASE_B §3).
 	hub := sse.New(st, api.EncodeSnapshot)
@@ -224,6 +233,7 @@ func runServe(args []string, lg *log.Logger) error {
 		UIPassword:   cfg.UIPassword,
 		AllowedHosts: allowedHosts(ctx, cfg, lc, lg),
 		Groups:       grpStore,
+		Guests:       gstStore,
 	})
 
 	// Long-lived workers run off appCtx so shutdown can stop them in order.
