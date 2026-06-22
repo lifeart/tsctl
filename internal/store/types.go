@@ -104,6 +104,15 @@ type RouterView struct {
 	LastError       string // "" = healthy; NEVER swallow -- surface here
 	LastConfirmedAt time.Time
 
+	// DesiredSince is when the still-pending Desired was issued (the set's ARM
+	// instant). It bounds the "unconfirmed" state: the device's ACTUAL selection is
+	// the source of truth, so once a FRESH read past one revert window still shows
+	// the device on a different selection (it changed out-of-band, or its dead-man's
+	// switch reverted the set), reconcileState drops the stale Desired and accepts
+	// reality (-> ok). Zero whenever Desired is nil. Internal to the poll machine;
+	// not exposed on the wire.
+	DesiredSince time.Time
+
 	// RevertAt is the instant the armed dead-man's-switch revert fires for a
 	// confirmed-but-not-yet-kept selection (docs/design/keep-egress.md stage 2). It
 	// is ONLY meaningful while State == RouterAwaitingKeep -- the UI counts down to

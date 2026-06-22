@@ -419,7 +419,10 @@ steps in order — each gates the next.
 
    If the change can't be confirmed within the revert window, the router's
    dead-man's-switch self-heals to the previous selection and the UI shows
-   `unconfirmed` / `unreachable` with the error — never a false success.
+   `unconfirmed` / `unreachable` with the error — never a false success. Once the
+   device settles on an actual selection (its previous exit node after a revert, or
+   any node you set on it directly), tsctl **re-reads and adjusts** the view to that
+   selection after one revert window — `unconfirmed` is never a permanent state.
 
 Do not claim e2e success without completing steps 3–5 against a real router.
 

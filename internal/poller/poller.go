@@ -338,6 +338,14 @@ func (p *Poller) SetExitNode(ctx context.Context, routerID, targetStableID strin
 	mySeq := p.setSeq[addr] // this op's sequence; a later set bumps it past mine
 	pending, ok := p.withRouter(addr, func(rv *store.RouterView) {
 		rv.Desired = target
+		// Reset the re-read-&-adjust clock: this is a NEW intent and the dead-man's
+		// switch is not armed yet (armAt is captured later, in the apply section);
+		// step 3 records the real armAt-based DesiredSince if it lands unconfirmed.
+		// Without this the closure would carry the PRIOR op's DesiredSince, and a poll
+		// merging between step 1 and step 3 could find it already past the grace
+		// window and publish a false "ok" on the OLD selection for one window while
+		// this change is genuinely in flight (an unconfirmed-change-shown-as-success).
+		rv.DesiredSince = time.Time{}
 		rv.State = store.RouterPending
 		rv.LastError = ""
 	})
@@ -433,6 +441,7 @@ func (p *Poller) SetExitNode(ctx context.Context, routerID, targetStableID strin
 			rv.Reachable = true
 			rv.CurrentExitNode = rt.Current
 			rv.Desired = nil
+			rv.DesiredSince = time.Time{}
 			rv.LastError = ""
 			rv.LastConfirmedAt = now
 			if autoKeep {
@@ -467,6 +476,7 @@ func (p *Poller) SetExitNode(ctx context.Context, routerID, targetStableID strin
 			// command error in LastError (never swallow) -- the HTTP layer also
 			// returns it (non-2xx) via the return switch below.
 			rv.Desired = nil
+			rv.DesiredSince = time.Time{}
 			rv.LastError = setErr.Error()
 			if rereadOK {
 				// Reachable and simply still on its previous exit node.
@@ -485,12 +495,14 @@ func (p *Poller) SetExitNode(ctx context.Context, routerID, targetStableID strin
 			rv.Reachable = true
 			rv.CurrentExitNode = rt.Current
 			rv.Desired = target
+			rv.DesiredSince = armAt // bounds unconfirmed: re-read & adjust after the window
 			rv.State = store.RouterUnconfirmed
 			rv.LastError = setErr.Error()
 		default: // could not reach / apply (transport failure, not a CommandError)
 			rv.Stats = rt.Stats
 			rv.Reachable = false
 			rv.Desired = target
+			rv.DesiredSince = armAt // carried until it's back online for a fresh re-read
 			rv.State = store.RouterUnreachable
 			rv.LastError = setErr.Error()
 		}
@@ -621,6 +633,7 @@ func (p *Poller) Keep(ctx context.Context, routerID string) (store.RouterView, e
 				rv.RevertAt = time.Time{}
 				rv.CurrentExitNode = nil
 				rv.Desired = nil
+				rv.DesiredSince = time.Time{}
 				rv.Reachable = false
 			}
 		})
@@ -765,7 +778,7 @@ func (p *Poller) resolveAfterProbe(ctx context.Context, addr string) {
 			rv.Stats = rt.Stats
 			rv.LastError = ""
 			rv.LastConfirmedAt = time.Now()
-			reconcileState(rv)
+			reconcileState(rv, time.Now(), p.revertWindow)
 		}); ok {
 			p.setGen[addr]++ // protect this publish from a concurrent poll's stale merge
 			p.store.Store(final)
@@ -898,6 +911,7 @@ func (p *Poller) refreshOnce(ctx context.Context) error {
 				routers[i].RevertAt = time.Time{}
 				routers[i].CurrentExitNode = nil
 				routers[i].Desired = nil
+				routers[i].DesiredSince = time.Time{}
 				routers[i].Reachable = false
 			}
 			continue
@@ -935,6 +949,7 @@ func (p *Poller) buildRouterView(ctx context.Context, addr string, nodes []store
 
 	if prevRV := findRouterView(prev, addr); prevRV != nil {
 		rv.Desired = prevRV.Desired
+		rv.DesiredSince = prevRV.DesiredSince // carry the pending-since clock for re-read & adjust
 		rv.CurrentExitNode = prevRV.CurrentExitNode
 		rv.Stats = prevRV.Stats
 		rv.LastConfirmedAt = prevRV.LastConfirmedAt
@@ -971,7 +986,7 @@ func (p *Poller) buildRouterView(ctx context.Context, addr string, nodes []store
 	rv.Stats = rt.Stats
 	rv.LastError = ""
 	rv.LastConfirmedAt = time.Now()
-	reconcileState(&rv)
+	reconcileState(&rv, time.Now(), p.revertWindow)
 	return rv
 }
 
@@ -1000,6 +1015,7 @@ func (p *Poller) buildListedRouterView(addr string, nodes []store.NodeView, prev
 	if prevRV != nil {
 		// Carry last-confirmed selection/stats forward as stale context regardless.
 		rv.Desired = prevRV.Desired
+		rv.DesiredSince = prevRV.DesiredSince
 		rv.CurrentExitNode = prevRV.CurrentExitNode
 		rv.Stats = prevRV.Stats
 		rv.LastConfirmedAt = prevRV.LastConfirmedAt
@@ -1181,17 +1197,32 @@ func (p *Poller) withRouter(addr string, mutate func(*store.RouterView)) (*store
 	}, matched
 }
 
-// reconcileState derives State from the reachable/desired/current fields.
-func reconcileState(rv *store.RouterView) {
+// reconcileState derives State from the reachable/desired/current fields. It runs
+// ONLY on a FRESH read (managed re-dial / probe), never on the carried-forward
+// fallback path -- so a "re-read and adjust" decision always reflects the device's
+// live selection. now/grace bound the unconfirmed state (grace == one revert window).
+func reconcileState(rv *store.RouterView, now time.Time, grace time.Duration) {
 	if !rv.Reachable {
 		rv.State = store.RouterUnreachable
 		return
 	}
 	if rv.Desired != nil && !sameExitNode(rv.CurrentExitNode, rv.Desired) {
-		rv.State = store.RouterUnconfirmed // a pending change still hasn't landed
-		return
+		// The change hasn't landed. Within the grace window (one revert window from
+		// when the set was issued) keep it "unconfirmed": the device may still
+		// converge to Desired, or its armed dead-man's-switch revert hasn't fired
+		// yet. PAST the window, this FRESH read is the source of truth -- the device
+		// has demonstrably settled on a DIFFERENT selection (changed out-of-band, or
+		// its switch reverted the set), so drop the stale intent and accept reality
+		// (fall through to ok + actual). A zero DesiredSince (a legacy/seeded Desired
+		// with no issue time) is treated as still-pending: never auto-adjust without
+		// knowing how long it's been outstanding.
+		if rv.DesiredSince.IsZero() || now.Sub(rv.DesiredSince) < grace {
+			rv.State = store.RouterUnconfirmed
+			return
+		}
 	}
 	rv.Desired = nil
+	rv.DesiredSince = time.Time{}
 	rv.State = store.RouterOK
 }
 

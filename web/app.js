@@ -604,7 +604,14 @@
     var reachable = rv.reachable !== false && node.online === true;
     var hasBusyTarget = Object.prototype.hasOwnProperty.call(state.busyTarget, sid);
 
-    var showDesired = localBusy || st === "pending" || st === "unconfirmed";
+    // NOTE: "unconfirmed" is deliberately NOT here (mirrors the graph fix). It's a
+    // STUCK terminal state, not in-flight — the server re-derives it every poll with
+    // no armed timer to clear it (poller.reconcileState), so disabling the picker
+    // would trap the user. Fall through to the else branch: show the device's ACTUAL
+    // current selection with the picker ENABLED (unconfirmed implies reachable), so
+    // re-picking it (acceptCurrent in confirmExitNodeChange) or any other node clears
+    // the stuck desired. Only genuinely in-flight states force the disabled desired.
+    var showDesired = localBusy || st === "pending";
 
     // The value is only written when it actually differs (diff guard below), so
     // background frames never disrupt a browsing user unless the device's actual
@@ -972,13 +979,27 @@
   function confirmExitNodeChange(sid, value, returnFocus) {
     var rv = findRouterView(sid);
     var current = rv && rv.currentExitNode ? rv.currentExitNode.stableID : "";
-    if (value === current) return;       // no change
-    if (state.busyRouters[sid]) return;  // a change is already in flight
+    // Re-selecting the device's actual current node is normally a no-op. EXCEPT when
+    // the router is stuck "unconfirmed": a prior set never confirmed and the server
+    // still carries a mismatched "desired" that survives polls AND page reloads
+    // (poller.reconcileState). Re-issuing the set to the node it's ACTUALLY on is the
+    // escape — the never-optimistic machine confirms it (current === desired) and
+    // clears the stuck desired. So don't short-circuit that pick here.
+    var stuck = !!(rv && rv.state === "unconfirmed");
+    var acceptCurrent = stuck && value === current;
+    if (value === current && !stuck) return;  // no change
+    if (state.busyRouters[sid]) return;        // a change is already in flight
 
     var routerName = (rv && rv.node && (rv.node.name || rv.node.hostname)) || sid;
     var targetLabelText = nodeLabelById(state.snapshot, value);
     var body = el("div");
-    if (value === "") {
+    if (acceptCurrent) {
+      body.appendChild(document.createTextNode("Keep "));
+      body.appendChild(el("strong", null, routerName));
+      body.appendChild(document.createTextNode(" on "));
+      body.appendChild(el("strong", null, targetLabelText));
+      body.appendChild(document.createTextNode(" and clear the unconfirmed change."));
+    } else if (value === "") {
       body.appendChild(document.createTextNode("Stop routing "));
       body.appendChild(el("strong", null, routerName));
       body.appendChild(document.createTextNode("’s internet through an exit node (go direct)."));
@@ -989,12 +1010,14 @@
       body.appendChild(el("strong", null, targetLabelText));
       body.appendChild(document.createTextNode("."));
     }
-    body.appendChild(el("p", "modal-note", "This disrupts the router’s internet while it switches. It auto-reverts in ~" + REVERT_WINDOW + "s if the device can’t be confirmed."));
+    if (!acceptCurrent) {
+      body.appendChild(el("p", "modal-note", "This disrupts the router’s internet while it switches. It auto-reverts in ~" + REVERT_WINDOW + "s if the device can’t be confirmed."));
+    }
 
     openModal({
-      title: "Change exit node?",
+      title: acceptCurrent ? "Clear unconfirmed change?" : "Change exit node?",
       body: body,
-      confirmLabel: value === "" ? "Go direct" : "Change exit node",
+      confirmLabel: acceptCurrent ? "Keep current" : (value === "" ? "Go direct" : "Change exit node"),
       cancelLabel: "Cancel",
       returnFocus: returnFocus,
       onConfirm: function () { onPick(sid, value); },
@@ -1341,10 +1364,25 @@
     head.appendChild(grip);
     var sub = el("div", "gnode-sub");
     var stBadge = el("span", "gnode-state");
+    // explicit-Keep gate in the graph (mirrors the Devices card's Keep button, but
+    // reachable from the default graph view — guests live here and never see Devices,
+    // and admins shouldn't be forced out of the graph just to confirm). Shown ONLY
+    // while state is "awaiting-keep" AND the action is live (hidden, not disabled,
+    // once a Keep is in flight or the window has elapsed). Reuses onKeep (role-
+    // agnostic; authorizeRouterWrite gates the POST). Only appears under -require-keep,
+    // since no router enters awaiting-keep otherwise.
+    var keepBtn = el("button", "gnode-keep hidden", "Keep");
+    keepBtn.type = "button";
+    // Keep its gestures off the card (which owns drag/menu): the card is non-
+    // interactive in awaiting-keep, but stop the events anyway so a click never
+    // begins a drag or bubbles a menu-open.
+    keepBtn.addEventListener("pointerdown", function (e) { e.stopPropagation(); });
+    keepBtn.addEventListener("click", function (e) { e.stopPropagation(); onKeep(sid); });
     root.appendChild(head);
     root.appendChild(sub);
     root.appendChild(stBadge);
-    var rec = { root: root, dot: dot, name: name, sub: sub, state: stBadge, sid: sid, interactive: false };
+    root.appendChild(keepBtn);
+    var rec = { root: root, dot: dot, name: name, sub: sub, state: stBadge, keep: keepBtn, sid: sid, interactive: false };
     // Keyboard path (a11y): Enter/Space opens the picker menu. Pointer path:
     // pointerdown may begin a drag, or (no movement) opens the same menu.
     root.addEventListener("keydown", function (e) {
@@ -1378,6 +1416,7 @@
       setText(rec.sub, missLabel);
       setText(rec.state, missBadge);
       rec.state.className = "gnode-state state-unknown";
+      rec.keep.className = "gnode-keep hidden";
       rec.interactive = false;
       rec.root.removeAttribute("tabindex");
       rec.root.removeAttribute("role");
@@ -1399,11 +1438,21 @@
       rec.state.className = "gnode-state state-" + (stMap[s.st] ? s.st : "unknown");
     }
 
-    var subText, ariaConn;
+    var subText, ariaConn, keepActionable = false;
     if (s.localBusy) { subText = "Applying…" + countdownSuffix(item.sid); ariaConn = "applying a change"; }
     else if (s.st === "pending") { subText = "Applying " + shortLabel(rv.desired) + countdownSuffix(item.sid); ariaConn = "applying " + shortLabel(rv.desired); }
-    else if (s.st === "unconfirmed") { subText = "Sent to " + shortLabel(rv.desired) + " — not confirmed"; ariaConn = "sent to " + shortLabel(rv.desired) + ", not confirmed"; }
-    else if (s.st === "awaiting-keep") { subText = "→ " + shortLabel(s.cur) + " — Keep to confirm (Devices)"; ariaConn = "applied to " + shortLabel(s.cur) + ", awaiting keep — Keep it in the Devices tab"; }
+    else if (s.st === "unconfirmed") { subText = "Sent to " + shortLabel(rv.desired) + " — not confirmed. Tap to retry or switch"; ariaConn = "sent to " + shortLabel(rv.desired) + ", not confirmed"; }
+    else if (s.st === "awaiting-keep") {
+      // Live countdown to the armed revert, mirroring the Devices card. The Keep
+      // button is "actionable" only while the window is still running and no Keep is
+      // in flight; otherwise the affordance is hidden (not shown disabled).
+      var kRem = revertRemaining(rv), kReverting = kRem !== null && kRem <= 0, kBusy = !!state.keepBusy[item.sid];
+      var kWhen = kBusy ? "Keeping…" : kReverting ? "reverting…" : kRem === null ? "Keep to confirm" : "Keep within " + fmtMSS(kRem);
+      keepActionable = !kReverting && !kBusy;
+      subText = "→ " + shortLabel(s.cur) + " — " + kWhen;
+      ariaConn = "applied to " + shortLabel(s.cur) + ", awaiting keep"
+        + (kBusy ? ", keeping" : kReverting ? ", reverting" : kRem === null ? "" : ", " + kRem + " seconds left");
+    }
     else if (s.controlError) { subText = "Control error — can’t control"; ariaConn = "control error, tsctl can’t control this router"; }
     else if (s.unprobed) { subText = "Not probed — pick an exit node, or Test SSH in Devices"; ariaConn = "not probed yet"; }
     else if (!s.reachable) { subText = "Offline — control disabled"; ariaConn = "offline, control disabled"; }
@@ -1411,16 +1460,25 @@
     else { subText = "Direct — no exit node"; ariaConn = "direct, no exit node"; }
     setText(rec.sub, subText);
 
-    // Disabled while settling (busy/pending/unconfirmed/awaiting-keep) or offline/
-    // control-error — mirrors the card picker; the never-optimistic machine owns the
-    // transition (and awaiting-keep is resolved by Keep / auto-revert, not a rewire).
-    var settling = s.localBusy || s.st === "pending" || s.st === "unconfirmed" || s.st === "awaiting-keep";
+    // Disabled while a change is genuinely IN FLIGHT (busy/pending/awaiting-keep) or
+    // offline/control-error — the never-optimistic machine owns those transitions
+    // (awaiting-keep is resolved by Keep / auto-revert, not a rewire).
+    //
+    // "unconfirmed" is DIFFERENT: it's a STUCK terminal state, not in-flight. The set
+    // was sent but the device's read-back never matched, and the server re-derives
+    // unconfirmed on every poll with NO armed timer to clear it (poller.reconcileState)
+    // — it even survives a page reload. The only escape is a fresh set, so keep the
+    // card ACTIONABLE: the menu lets the user retry the target, switch to another, or
+    // clear to Direct. authorizeRouterWrite still gates the POST (admin + guest).
+    var inFlight = s.localBusy || s.st === "pending" || s.st === "awaiting-keep";
+    var unconfirmed = s.st === "unconfirmed";
     // Unprobed devices are reachable-UNKNOWN, not unreachable: keep them actionable
     // so the user can set an exit node (which contacts them) without probing first.
-    var interactive = (s.reachable || s.unprobed) && !settling;
+    var interactive = (s.reachable || s.unprobed) && !inFlight;
     rec.interactive = interactive;
     rec.root.className = "gnode gnode-consumer"
-      + (settling ? " is-busy" : "")
+      + (inFlight ? " is-busy" : "")
+      + (unconfirmed ? " is-unconfirmed" : "")
       + (s.controlError ? " is-control-error" : "")
       + (s.unprobed ? " is-unprobed" : (s.reachable ? "" : " is-off"))
       + (interactive ? " is-actionable" : "");
@@ -1434,6 +1492,18 @@
       rec.root.removeAttribute("role");
       rec.root.removeAttribute("aria-haspopup");
       rec.root.setAttribute("aria-label", nm + ", " + ariaConn + ".");
+    }
+
+    // Keep affordance (shown for all roles). "Don't show it if it's disabled": only
+    // render the button while awaiting-keep AND the action is live — hide it (never
+    // grey it out) once a Keep is in flight or the window has elapsed; the sub-text
+    // already conveys "Keeping…" / "reverting…".
+    if (s.st === "awaiting-keep" && keepActionable) {
+      rec.keep.className = "gnode-keep";
+      rec.keep.disabled = false;
+      rec.keep.setAttribute("aria-label", "Keep " + nm + (s.cur ? " on " + shortLabel(s.cur) : "") + " before it auto-reverts");
+    } else {
+      rec.keep.className = "gnode-keep hidden";
     }
   }
 
@@ -2925,11 +2995,16 @@
     }
   }
 
-  // "Sign out" is only meaningful when a password session is in use.
+  // "Sign out" is only meaningful when a password session is in use. sessionActive is
+  // set on a fresh submitLogin but NOT when /api/me resolves an existing cookie session
+  // (e.g. after a page reload), so gate on it OR role: a GUEST is always a password
+  // session (guests authenticate only via label+password — there's no tailnet-guest),
+  // so it's always signed-out-able, including after a reload. Admin may be tailnet-
+  // authenticated (logout meaningless there), so admin keeps the sessionActive gate.
   function renderSignout() {
     var b = $("#signout-btn");
     if (!b) return;
-    var vis = state.sessionActive && !state.needsLogin && !state.authError;
+    var vis = (state.sessionActive || isGuest()) && !state.needsLogin && !state.authError;
     show(b, vis);
     b.hidden = !vis;
   }

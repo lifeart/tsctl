@@ -1101,6 +1101,11 @@ body {
    like genuine-offline (the device is up; the control path is the problem). */
 .gnode.is-control-error { border: 1px solid var(--amber); }
 .gnode.is-control-error .gnode-name { color: var(--text); }
+/* Unconfirmed: a set that never confirmed and stuck (survives polls + reload). Amber
+   edge like control-error, but the card stays ACTIONABLE — the user retries / switches
+   / clears to escape (the only exit; there is no armed timer to clear it). */
+.gnode.is-unconfirmed { border: 1px solid var(--amber); }
+.gnode.is-unconfirmed .gnode-name { color: var(--text); }
 /* Unprobed (fallback-listed, not yet contacted): dashed edge = "unknown, not a
    failure". The device is interactive (set on demand) so the name stays readable. */
 .gnode.is-unprobed { border: 1px dashed var(--separator); }
@@ -1136,6 +1141,27 @@ body {
   padding: 0.1rem 0.45rem;
   border-radius: var(--radius-pill);
 }
+/* Graph Keep button (awaiting-keep): a compact accent pill beside the state badge.
+   Shown only while the Keep action is live; hidden (never greyed) otherwise. */
+.gnode-keep {
+  display: inline-block;
+  margin-top: 0.35rem;
+  margin-left: 0.4rem;
+  vertical-align: middle;
+  font: inherit;
+  font-size: 0.75rem;
+  font-weight: 600;
+  line-height: 1;
+  padding: 0.28rem 0.7rem;
+  color: #fff;
+  background: var(--accent);
+  border: none;
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+  transition: opacity var(--t);
+}
+.gnode-keep:hover { opacity: 0.9; }
+.gnode-keep.hidden { display: none; }
 .gnode-direct {
   border: 1px dashed var(--separator);
   box-shadow: none;
@@ -1232,6 +1258,13 @@ body.graph-dragging { cursor: grabbing; user-select: none; -webkit-user-select: 
 .member-name { font-size: 0.9375rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .member-sub { font-size: 0.75rem; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
 .member-empty { color: var(--text-secondary); font-size: 0.875rem; padding: 0.6rem 0.7rem; margin: 0; }
+/* Guests panel rows reuse .member-item but, unlike the zone-editor checkbox list,
+   carry trailing actions (Disable/Delete) and aren't row-clickable. Let the text grow
+   so the actions hug the right edge, drop the misleading pointer cursor, give the row
+   a touch more breathing room, and separate the list from the create form above. */
+#guests-list { margin-top: 0.85rem; }
+#guests-list .member-item { cursor: default; padding: 0.6rem 0.85rem; gap: 0.85rem; }
+#guests-list .member-text { flex: 1 1 auto; }
 .editor-error { color: var(--c-red); font-size: 0.8125rem; margin-top: 0.25rem; line-height: 1.35; }
 .editor-error.hidden { display: none; }
 .editor-actions { align-items: center; }

@@ -301,6 +301,86 @@ func TestFallback_FailedSetStatePersistsAcrossPoll(t *testing.T) {
 	}
 }
 
+func TestRefresh_UnconfirmedAdjustsToDeviceSelfChangeAfterGrace(t *testing.T) {
+	// "Re-read and adjust": a device may change its own exit node (out-of-band, or
+	// its dead-man's switch reverts an unconfirmed set), and that's legitimate. Once
+	// the grace window (one revert window) has elapsed, a FRESH managed read is the
+	// source of truth -- tsctl drops the stale Desired and accepts the device's
+	// actual selection (-> ok), instead of staying "unconfirmed" forever.
+	routerIP, e1IP, e2IP := "100.64.0.10", "100.64.0.20", "100.64.0.21"
+	nm := &fakeNM{nodes: []store.NodeView{
+		{StableID: "router1", Name: "r1", TailscaleIPs: []string{routerIP}, Online: true, Type: store.NodeRouter},
+		{StableID: "exit1", Name: "e1", TailscaleIPs: []string{e1IP}, Online: true, ExitNodeOption: true, Type: store.NodeExitNode},
+		{StableID: "exit2", Name: "e2", TailscaleIPs: []string{e2IP}, Online: true, ExitNodeOption: true, Type: store.NodeExitNode},
+	}}
+	// Fresh read: the device is now on exit2 -- it changed on its own.
+	rc := &fakeRC{statusRT: store.RouterRuntime{
+		Online:  true,
+		Current: &store.ExitNodeRef{StableID: "exit2", Name: "e2", IP: e2IP},
+	}}
+	st := store.New()
+	// Seed: a prior set to exit1 went unconfirmed, issued LONG ago (past the window).
+	st.Store(&store.Snapshot{Routers: []store.RouterView{{
+		Node:         store.NodeView{StableID: "router1", TailscaleIPs: []string{routerIP}, Online: true, Type: store.NodeRouter},
+		State:        store.RouterUnconfirmed,
+		Desired:      &store.ExitNodeRef{StableID: "exit1", IP: e1IP},
+		DesiredSince: time.Now().Add(-2 * time.Minute), // > revertWindow (60s) ago
+		Reachable:    true,
+	}}})
+	p := New(st, nm, rc, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+	if err := p.Refresh(context.Background()); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	rv := st.Load().Routers[0]
+	if rv.State != store.RouterOK {
+		t.Errorf("state = %q, want ok (device self-change accepted after grace)", rv.State)
+	}
+	if rv.Desired != nil {
+		t.Errorf("stale Desired not cleared after grace: %+v", rv.Desired)
+	}
+	if !rv.DesiredSince.IsZero() {
+		t.Errorf("DesiredSince not cleared with Desired: %v", rv.DesiredSince)
+	}
+	if rv.CurrentExitNode == nil || rv.CurrentExitNode.StableID != "exit2" {
+		t.Errorf("currentExitNode = %+v, want exit2 (the device's actual selection)", rv.CurrentExitNode)
+	}
+}
+
+func TestRefresh_UnconfirmedKeptWithinGraceWindow(t *testing.T) {
+	// Same setup as the adjust test, but the set was issued JUST NOW (within the
+	// grace window): the device may still converge to Desired, or its armed revert
+	// hasn't fired -- so it must stay "unconfirmed" and keep the pending Desired.
+	routerIP, e1IP, e2IP := "100.64.0.10", "100.64.0.20", "100.64.0.21"
+	nm := &fakeNM{nodes: []store.NodeView{
+		{StableID: "router1", Name: "r1", TailscaleIPs: []string{routerIP}, Online: true, Type: store.NodeRouter},
+		{StableID: "exit1", Name: "e1", TailscaleIPs: []string{e1IP}, Online: true, ExitNodeOption: true, Type: store.NodeExitNode},
+		{StableID: "exit2", Name: "e2", TailscaleIPs: []string{e2IP}, Online: true, ExitNodeOption: true, Type: store.NodeExitNode},
+	}}
+	rc := &fakeRC{statusRT: store.RouterRuntime{
+		Online:  true,
+		Current: &store.ExitNodeRef{StableID: "exit2", Name: "e2", IP: e2IP},
+	}}
+	st := store.New()
+	st.Store(&store.Snapshot{Routers: []store.RouterView{{
+		Node:         store.NodeView{StableID: "router1", TailscaleIPs: []string{routerIP}, Online: true, Type: store.NodeRouter},
+		State:        store.RouterUnconfirmed,
+		Desired:      &store.ExitNodeRef{StableID: "exit1", IP: e1IP},
+		DesiredSince: time.Now(), // just issued -- inside the grace window
+		Reachable:    true,
+	}}})
+	p := New(st, nm, rc, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+	if err := p.Refresh(context.Background()); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	rv := st.Load().Routers[0]
+	if rv.State != store.RouterUnconfirmed {
+		t.Errorf("state = %q, want unconfirmed (still within grace window)", rv.State)
+	}
+	if rv.Desired == nil || rv.Desired.StableID != "exit1" {
+		t.Errorf("pending Desired lost within grace window: %+v", rv.Desired)
+	}
+}
+
 // blockStatusRC blocks in Status until released, so a test can hold a poll mid-dial
 // while doing other work; SetExitNode returns immediately.
 type blockStatusRC struct {
@@ -440,6 +520,82 @@ func TestRefresh_SetConfirmingDuringDialNotClobbered(t *testing.T) {
 	rv := findRouterViewByStableID(st.Load(), "router1")
 	if rv == nil || rv.CurrentExitNode == nil || rv.CurrentExitNode.IP != exitIP {
 		t.Errorf("poll clobbered a set that confirmed during its dial (false-confirm): router1 = %+v, want exit %q", rv, exitIP)
+	}
+}
+
+func TestSetExitNode_PendingResetsStaleDesiredSinceNoFalseOK(t *testing.T) {
+	// Regression for the re-read-&-adjust gate's false-"ok": SetExitNode step 1 (the
+	// "pending" RMW) MUST reset DesiredSince. A router already `unconfirmed` from a
+	// PRIOR set >1 window ago carries a stale (past-grace) DesiredSince; without the
+	// step-1 reset, a NEW set's pending view inherits it. If a poll then merges between
+	// this set's step 1 and step 3 (so setGen is unchanged → the merge guard does NOT
+	// trip → the poll publishes its OWN reconcile), reconcileState sees the new Desired
+	// with a past-grace DesiredSince, DROPS it, and publishes a green `ok` on the
+	// device's actual (old) selection — a success shown for a change still in flight.
+	// The complement of TestRefresh_SetConfirmingDuringDialNotClobbered: there step 3
+	// wins the race (guard trips); here the poll merges first (guard does not).
+	const routerIP, e1IP, e2IP = "100.64.0.10", "100.64.0.20", "100.64.0.21"
+	st := store.New()
+	// Seed: unconfirmed for exit1, issued LONG ago (past the 60s grace window). Nodes
+	// must carry router1 + the new target exit2 (online, approved) so SetExitNode's
+	// preflight resolves the target rather than bailing before ApplyExitNode.
+	st.Store(&store.Snapshot{
+		Nodes: []store.NodeView{
+			{StableID: "router1", TailscaleIPs: []string{routerIP}, Online: true, Type: store.NodeRouter},
+			{StableID: "exit2", Name: "e2", TailscaleIPs: []string{e2IP}, Online: true, ExitNodeOption: true, Type: store.NodeExitNode},
+		},
+		Routers: []store.RouterView{{
+			Node:         store.NodeView{StableID: "router1", TailscaleIPs: []string{routerIP}, Online: true, Type: store.NodeRouter},
+			State:        store.RouterUnconfirmed,
+			Desired:      &store.ExitNodeRef{StableID: "exit1", IP: e1IP},
+			DesiredSince: time.Now().Add(-2 * time.Minute), // stale: past the window
+			Reachable:    true,
+		}},
+	})
+	rc := &orchRC{
+		applyEntered: make(chan struct{}), applyGate: make(chan struct{}),
+		dialEntered: make(chan struct{}), dialGate: make(chan struct{}),
+		target: &store.ExitNodeRef{StableID: "exit2", IP: e2IP},
+	}
+	nm := &fakeNM{nodes: []store.NodeView{
+		{StableID: "router1", TailscaleIPs: []string{routerIP}, Online: true, Type: store.NodeRouter},
+		{StableID: "exit2", TailscaleIPs: []string{e2IP}, Online: true, ExitNodeOption: true, Type: store.NodeExitNode},
+	}}
+	p := New(st, nm, rc, nil, []string{routerIP}, newFakeBC(), make(chan int), time.Second, nopLogf)
+
+	// Set(exit2): completes step 1 (seq/gen bump, pending stored) then blocks in apply
+	// (step 3 not yet reached).
+	setDone := make(chan error, 1)
+	go func() { _, err := p.SetExitNode(context.Background(), "router1", "exit2"); setDone <- err }()
+	<-rc.applyEntered
+
+	// Poll starts AFTER step 1 (captures the post-step-1 generation), blocks mid-dial.
+	pollDone := make(chan error, 1)
+	go func() { pollDone <- p.Refresh(context.Background()) }()
+	<-rc.dialEntered
+
+	// Let the poll's read merge BEFORE step 3: setGen is unchanged since the poll's
+	// capture, so the merge guard does NOT trip and the poll publishes its reconcile.
+	close(rc.dialGate)
+	if err := <-pollDone; err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+
+	// A set to exit2 is genuinely in flight and the device is not on it, so the live
+	// state must be unconfirmed/pending — NEVER a green ok (never-optimistic).
+	rv := findRouterViewByStableID(st.Load(), "router1")
+	if rv == nil {
+		t.Fatal("router1 vanished")
+	}
+	if rv.State == store.RouterOK {
+		t.Errorf("poll published a FALSE ok during an in-flight set: state=%q current=%+v desired=%+v",
+			rv.State, rv.CurrentExitNode, rv.Desired)
+	}
+
+	// Cleanup: release the set's apply (step 3) and let it finish.
+	close(rc.applyGate)
+	if err := <-setDone; err != nil {
+		t.Fatalf("set: %v", err)
 	}
 }
 

@@ -1,9 +1,9 @@
 # tsctl — handoff
 
-State at the **v0.3.0** release (guest mode). Published tags (GHCR + GitHub
-Release): **v0.1.0**, **v0.2.4**, **v0.3.0**; the intermediate v0.2.0–v0.2.3 builds
-were local images only (Synology Container Manager). The Synology compose tracks
-the latest local `tsctl:v0.3.0` tarball.
+State at the **v0.4.0** release (live-state correctness + guest UX). Published tags
+(GHCR + GitHub Release): **v0.1.0**, **v0.2.4**, **v0.3.0**, **v0.4.0**; the
+intermediate v0.2.0–v0.2.3 builds were local images only (Synology Container
+Manager). The Synology compose tracks the latest local `tsctl:v0.4.0` tarball.
 
 ## What it is
 
@@ -20,7 +20,7 @@ Authoritative specs: **`DESIGN.md`** (locked), **`PHASE_B.md`** (§3 wire contra
 §4 types), and `docs/design/{zones,ip-password-ssh,keep-egress,guest-mode}.md`.
 **Read those before changing the seam** — interface/field names are a frozen contract.
 
-Toolchain: **Go 1.26.4**, **tailscale.com v1.100.0**. 149 test funcs; CI runs
+Toolchain: **Go 1.26.4**, **tailscale.com v1.100.0**. 152 test funcs; CI runs
 gofmt / vet / build / `go test -race` / `go mod tidy` check on every push.
 
 ## Architecture (the load-bearing invariants — do not break these)
@@ -41,7 +41,14 @@ gofmt / vet / build / `go test -race` / `go mod tidy` check on every push.
   Getting these wrong = a false-confirm. Three review gates found several; see below.
 - **Never-optimistic.** The device's ACTUAL selection (`CurrentExitNode`) is the
   source of truth; the UI never shows success for an unconfirmed change. States:
-  `ok`/`pending`/`unconfirmed`/`unreachable`/`unprobed`/`awaiting-keep`.
+  `ok`/`pending`/`unconfirmed`/`unreachable`/`unprobed`/`awaiting-keep`. `unconfirmed`
+  is **time-bounded** (v0.4.0): a still-pending `Desired` carries a `DesiredSince`, and
+  once a FRESH read (managed re-dial / probe) past one revert window still mismatches,
+  `reconcileState` drops the stale intent and accepts the device's actual selection —
+  the device may have changed it out-of-band, or its dead-man's switch reverted the
+  set. No router stays stuck `unconfirmed` forever (it even survived a reload before).
+  `DesiredSince` is poll-internal (carried under `mu` on a fresh `*Snapshot`), never on
+  the wire; the fallback path never re-reads, so it can never flip a stale view to `ok`.
 - **Dead-man's-switch** (`internal/router`, DESIGN §8): set = arm a detached
   `nohup sleep N; [ -f marker ] || revert` on the router, apply, confirm by re-read,
   then KEEP (write the marker to cancel the revert). If the link dies, the router
@@ -53,6 +60,33 @@ gofmt / vet / build / `go test -race` / `go mod tidy` check on every push.
   **guest** (guest mode, below); the role rides inside the cookie's HMAC region.
 
 ## Features (what shipped this cycle, newest first)
+
+- **Live-state correctness + guest UX (v0.4.0).** Four fixes so the live state never
+  dead-ends a user:
+  - **Re-read & adjust:** `unconfirmed` is now time-bounded (see the never-optimistic
+    invariant above) — a router whose set never confirmed, or that changed exit node
+    on its own, self-heals to its actual selection after one revert window instead of
+    staying stuck forever, even across a page reload. Regression-pinned by
+    `TestRefresh_Unconfirmed{AdjustsToDeviceSelfChangeAfterGrace,KeptWithinGraceWindow}`.
+    An adversarial poller-review gate caught a transient false-`ok`: `SetExitNode`
+    step 1 must reset `DesiredSince` (else a new set on an already-stale router could,
+    in a step-1↔step-3 poll race, publish a green `ok` on the old selection) — fixed +
+    pinned by `TestSetExitNode_PendingResetsStaleDesiredSinceNoFalseOK`.
+  - **Unconfirmed is actionable again:** the graph card + Devices `<select>` no longer
+    disable on `unconfirmed` (only genuinely in-flight states do); the user can retry,
+    switch, or clear. Re-selecting the device's ACTUAL current node re-issues the set
+    to clear a stuck `Desired` (the `acceptCurrent` path in `confirmExitNodeChange`).
+  - **Graph Keep, all roles:** the explicit-Keep affordance (live countdown + Keep
+    button) now lives on the graph consumer node, not only the Devices view — so a
+    **guest** under `-require-keep` (who can't open Devices) can confirm, and an admin
+    isn't forced out of the default graph. Shown only while live; hidden (never greyed)
+    once a Keep is in flight or the window has elapsed.
+  - **Guest Sign out:** a guest session always shows the Sign out affordance — it was
+    hidden after a reload, since `sessionActive` is set only on a fresh login, and a
+    guest is always a password session (no tailnet-guest). Plus a Guests-panel row
+    layout polish (right-aligned actions).
+  All UI except the poll-internal `DesiredSince`; SSE fan-out already pushes one
+  guest's change to every other client in the zone, per-connection zone-filtered.
 
 - **Guest mode** (per-zone scoped credentials, `docs/design/guest-mode.md`): an
   admin-managed, **bcrypt(cost 12)** credential type (persisted
@@ -99,12 +133,12 @@ go build ./... && go vet ./... && go test -race ./...   # must stay green
   compiled binaries + a multi-arch image (no push unless `PUSH=1`). For Synology I
   build per-arch + rewrite the tarball `RepoTags` to a bare `tsctl:<ver>` (no
   registry → `pull_policy: never` works) into `./dist/` (gitignored). Current local
-  build: **v0.3.0** (`dist/tsctl-v0.3.0-linux-{amd64,arm64}-image.tar.gz`; the
-  Synology compose already points at the v0.3.0 local image).
+  build: **v0.4.0** (`dist/tsctl-v0.4.0-linux-{amd64,arm64}-image.tar.gz`; the
+  Synology compose points at the v0.4.0 local image).
 - **Publish a release:** `git tag vX.Y.Z && git push --tags` → `.github/workflows/
   release.yml` builds + pushes `ghcr.io/lifeart/tsctl:<tag>`+`:latest` and attaches
-  binaries to a GitHub Release. **v0.3.0 (guest mode) is published** (tag pushed);
-  bump the minor for the next feature.
+  binaries to a GitHub Release. **v0.4.0 is published** (tag pushed); bump the minor
+  for the next feature.
 - **Deploy:** `deploy/tsctl.service` (hardened systemd, `LoadCredential` for the
   auth key) or `docker-compose.yml` (NAS) / `deploy/docker-compose.synology.yml`
   (Container Manager, UI on :8087, runs as root for the state-volume perms, loads
