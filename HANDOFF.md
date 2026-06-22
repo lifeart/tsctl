@@ -130,11 +130,12 @@ go build ./... && go vet ./... && go test -race ./...   # must stay green
 ```
 
 - **Local images / Synology tarballs:** `scripts/release.sh [version]` builds cross-
-  compiled binaries + a multi-arch image (no push unless `PUSH=1`). For Synology I
-  build per-arch + rewrite the tarball `RepoTags` to a bare `tsctl:<ver>` (no
-  registry → `pull_policy: never` works) into `./dist/` (gitignored). Current local
-  build: **v0.4.0** (`dist/tsctl-v0.4.0-linux-{amd64,arm64}-image.tar.gz`; the
-  Synology compose points at the v0.4.0 local image).
+  compiled binaries + a multi-arch image (no push unless `PUSH=1`). For Synology,
+  `scripts/synology-tarballs.sh [version]` builds each arch and rewrites the tarball
+  `RepoTags` to a bare `tsctl:<ver>` (no registry → `pull_policy: never` works) into
+  `./dist/` (gitignored) — so a NAS `docker load` matches `image: tsctl:<ver>`.
+  Current local build: **v0.4.0** (`dist/tsctl-v0.4.0-linux-{amd64,arm64}-image.tar.gz`;
+  the Synology compose points at the v0.4.0 local image).
 - **Publish a release:** `git tag vX.Y.Z && git push --tags` → `.github/workflows/
   release.yml` builds + pushes `ghcr.io/lifeart/tsctl:<tag>`+`:latest` and attaches
   binaries to a GitHub Release. **v0.4.0 is published** (tag pushed); bump the minor
