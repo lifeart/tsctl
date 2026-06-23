@@ -2,14 +2,14 @@
 #
 # SETUP — uses a LOCAL image (no registry, nothing is ever downloaded)
 #   1. Copy the image tarball for your NAS's CPU onto the Synology (File Station or
-#      scp): tsctl-v0.4.0-linux-amd64-image.tar.gz (Intel NAS — most models) or
-#      tsctl-v0.4.0-linux-arm64-image.tar.gz (ARM models). Build them locally with
+#      scp): tsctl-v0.4.1-linux-amd64-image.tar.gz (Intel NAS — most models) or
+#      tsctl-v0.4.1-linux-arm64-image.tar.gz (ARM models). Build them locally with
 #      `scripts/release.sh` (they end up in ./dist).
-#   2. Load it as the local image `tsctl:v0.4.0` — either:
-#        a) SSH:  sudo docker load -i tsctl-v0.4.0-linux-amd64-image.tar.gz   or
+#   2. Load it as the local image `tsctl:v0.4.1` — either:
+#        a) SSH:  sudo docker load -i tsctl-v0.4.1-linux-amd64-image.tar.gz   or
 #        b) Container Manager → Image → Add → Add From File → pick the .tar.gz.
 #   3. Container Manager → Project → Create → upload this file, fill in the env
-#      below, then Build → Run. The bare `tsctl:v0.4.0` name + `pull_policy: never`
+#      below, then Build → Run. The bare `tsctl:v0.4.1` name + `pull_policy: never`
 #      mean it uses the loaded image and never contacts a registry.
 #   4. Open  http://<synology-ip>:8087/  and sign in with TSCTL_UI_PASSWORD.
 #
@@ -19,7 +19,7 @@
 
 services:
   tsctl:
-    image: tsctl:v0.4.0       # the LOCAL image loaded from the tarball (no registry URL)
+    image: tsctl:v0.4.1       # the LOCAL image loaded from the tarball (no registry URL)
     pull_policy: never        # never reach out to a registry — use the loaded image only
     container_name: tsctl
     restart: unless-stopped

@@ -1091,7 +1091,9 @@ body {
   padding: 0.6rem 0.75rem;
   min-width: 0;
 }
-.gnode-consumer { touch-action: none; }            /* let pointer drags own the gesture */
+/* Touch input scrolls the page natively — drag-to-rewire is a mouse/pen
+   affordance only (see onConsumerPointerDown), so don't trap the touch gesture. */
+.gnode-consumer { touch-action: auto; }
 .gnode-consumer.is-actionable { cursor: grab; }
 .gnode-consumer.is-actionable:hover { background: var(--fill); }
 .gnode.is-dragging { cursor: grabbing; box-shadow: var(--shadow-pop); opacity: 0.92; }
@@ -1172,6 +1174,8 @@ body {
 
 .graph-hint { margin: 1rem 0 0; font-size: 0.8125rem; color: var(--text-tertiary); text-align: center; }
 .graph-hint[hidden] { display: none; }
+/* The hint swaps copy by input model: drag instructions on desktop, tap on touch. */
+.graph-hint .hint-mobile { display: none; }
 
 body.graph-dragging { cursor: grabbing; user-select: none; -webkit-user-select: none; }
 
@@ -1189,6 +1193,17 @@ body.graph-dragging { cursor: grabbing; user-select: none; -webkit-user-select: 
   padding: 0.3rem;
   display: flex;
   flex-direction: column;
+}
+/* Picker header — hidden for the desktop popover (anchored to the card), shown
+   when the picker becomes a bottom sheet on touch/narrow screens. */
+.zone-menu-title {
+  display: none;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+  padding: 0.55rem 0.65rem 0.4rem;
 }
 .zone-menu-item {
   display: flex;
@@ -1273,10 +1288,51 @@ body.graph-dragging { cursor: grabbing; user-select: none; -webkit-user-select: 
 .btn-danger:hover { opacity: 0.85; }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
-/* stack the columns on narrow screens (wires hide; subtext + menu still work) */
-@media (max-width: 34rem) {
-  .graph-grid { grid-template-columns: 1fr; gap: 1.25rem; }
+/* Touch / narrow: a tap-to-select model. Drag-to-rewire is off (the page must
+   scroll), so the exit-node column — a pure drag target — is hidden and each
+   router becomes a tappable row. Wires hide; the picker opens as a bottom sheet.
+   `(pointer: coarse)` is the PRIMARY pointer, so a mouse-driven desktop with a
+   touchscreen keeps the full two-column drag UI. */
+@media (max-width: 34rem), (pointer: coarse) {
+  .graph-grid { grid-template-columns: 1fr; gap: 0; }
   .wires { display: none; }
+  .gcol-exits { display: none; }
+  .gcol-title { display: none; }       /* the lone router list needs no column header */
+  .gnode-grip { display: none; }       /* drag is off on touch — no drag handle */
+  /* A router row reads as a tappable disclosure: pointer cursor + a chevron, with
+     room reserved on the right so long names ellipsize before it. */
+  .gnode-consumer.is-actionable { cursor: pointer; padding-right: 2rem; }
+  .gnode-consumer.is-actionable::after {
+    content: "›";
+    position: absolute;
+    right: 0.9rem;
+    top: 50%;
+    transform: translateY(-50%);
+    color: var(--text-tertiary);
+    font-size: 1.35rem;
+    line-height: 1;
+  }
+
+  /* exit-node picker as a bottom sheet: full width, large tap targets, a header,
+     and safe-area padding. The fixed positioning from positionMenu is overridden. */
+  .zone-menu {
+    left: 0 !important;
+    right: 0;
+    top: auto !important;
+    bottom: 0;
+    width: 100%;
+    max-width: none;
+    max-height: 72vh;
+    border-radius: var(--radius) var(--radius) 0 0;
+    padding: 0.4rem 0.5rem calc(0.5rem + env(safe-area-inset-bottom));
+    box-shadow: 0 -8px 30px rgba(0, 0, 0, 0.28);
+  }
+  /* sticky so the "Route X through" header stays put while a long list scrolls */
+  .zone-menu-title { display: block; position: sticky; top: 0; background: var(--card); }
+  .zone-menu-item { min-height: 48px; font-size: 1rem; padding: 0.7rem 0.75rem; }
+
+  .graph-hint .hint-desktop { display: none; }
+  .graph-hint .hint-mobile { display: inline; }
 }
 
 /* ----------------------------------------------- responsive ------------ */

@@ -1,9 +1,9 @@
 # tsctl — handoff
 
-State at the **v0.4.0** release (live-state correctness + guest UX). Published tags
-(GHCR + GitHub Release): **v0.1.0**, **v0.2.4**, **v0.3.0**, **v0.4.0**; the
-intermediate v0.2.0–v0.2.3 builds were local images only (Synology Container
-Manager). The Synology compose tracks the latest local `tsctl:v0.4.0` tarball.
+State at the **v0.4.1** release (mobile tap-to-select node view). Published tags
+(GHCR + GitHub Release): **v0.1.0**, **v0.2.4**, **v0.3.0**, **v0.4.0**, **v0.4.1**;
+the intermediate v0.2.0–v0.2.3 builds were local images only (Synology Container
+Manager). The Synology compose tracks the latest local `tsctl:v0.4.1` tarball.
 
 ## What it is
 
@@ -60,6 +60,21 @@ gofmt / vet / build / `go test -race` / `go mod tidy` check on every push.
   **guest** (guest mode, below); the role rides inside the cookie's HMAC region.
 
 ## Features (what shipped this cycle, newest first)
+
+- **Mobile tap-to-select node view (v0.4.1).** The zone graph (where guests live) was
+  unusable on a phone: consumer cards carried `touch-action: none`, so a swipe that
+  began on a card couldn't scroll the page, and drag-to-rewire onto the stacked exit-
+  node column was impractical. On touch/narrow screens (`@media (max-width: 34rem),
+  (pointer: coarse)`) the view is now a tap-to-select list: drag is disabled for touch
+  input (`onConsumerPointerDown` returns on `pointerType === "touch"`, `touch-action:
+  auto`) so the page scrolls natively; each router is a tappable row (disclosure
+  chevron, grip hidden) that opens the exit-node picker as a **bottom sheet** (sticky
+  "Route X through" header, large targets); the non-interactive exit-node drop column
+  is hidden. Tap opens the picker via a `click` listener, guarded by `suppressCardClick`
+  so a mouse drag's trailing click — or a screen reader's synthetic activation click —
+  doesn't re-open it. The footer hint swaps copy (drag on desktop, tap on touch).
+  **Desktop mouse drag is unchanged** (`(pointer: coarse)` is the primary pointer, so a
+  mouse-driven desktop keeps the two-column drag UI). Frontend-only (`web/`, `demo/`).
 
 - **Live-state correctness + guest UX (v0.4.0).** Four fixes so the live state never
   dead-ends a user:
@@ -134,11 +149,11 @@ go build ./... && go vet ./... && go test -race ./...   # must stay green
   `scripts/synology-tarballs.sh [version]` builds each arch and rewrites the tarball
   `RepoTags` to a bare `tsctl:<ver>` (no registry → `pull_policy: never` works) into
   `./dist/` (gitignored) — so a NAS `docker load` matches `image: tsctl:<ver>`.
-  Current local build: **v0.4.0** (`dist/tsctl-v0.4.0-linux-{amd64,arm64}-image.tar.gz`;
-  the Synology compose points at the v0.4.0 local image).
+  Current local build: **v0.4.1** (`dist/tsctl-v0.4.1-linux-{amd64,arm64}-image.tar.gz`;
+  the Synology compose points at the v0.4.1 local image).
 - **Publish a release:** `git tag vX.Y.Z && git push --tags` → `.github/workflows/
   release.yml` builds + pushes `ghcr.io/lifeart/tsctl:<tag>`+`:latest` and attaches
-  binaries to a GitHub Release. **v0.4.0 is published** (tag pushed); bump the minor
+  binaries to a GitHub Release. **v0.4.1 is published** (tag pushed); bump the minor
   for the next feature.
 - **Deploy:** `deploy/tsctl.service` (hardened systemd, `LoadCredential` for the
   auth key) or `docker-compose.yml` (NAS) / `deploy/docker-compose.synology.yml`

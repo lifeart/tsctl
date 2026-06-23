@@ -1200,6 +1200,11 @@
   var UNGROUPED = "__tsctl_ungrouped__"; // sentinel zone id for the implicit section
   var DIRECT_KEY = "__tsctl_direct__";   // key for the "Direct" drop target
   var DRAG_THRESHOLD = 6;            // px of movement before a click becomes a drag
+  // Set when a completed drag OR a keyboard/AT activation should not also be treated
+  // as a fresh tap: the browser (or a screen reader) may synthesize a trailing `click`
+  // on the card, which would (re)open the picker. Cleared by that click, or on the
+  // next task as a safety net if no click follows.
+  var suppressCardClick = false;
 
   function snapGroups() { var s = state.snapshot; return s && Array.isArray(s.groups) ? s.groups : []; }
   function snapRouters() { var s = state.snapshot; return s && Array.isArray(s.routers) ? s.routers : []; }
@@ -1389,10 +1394,23 @@
       if (!rec.interactive) return;
       if (e.key === "Enter" || e.key === " " || e.key === "Spacebar") {
         e.preventDefault();
+        // Some screen readers dispatch a synthetic click when activating an ARIA
+        // button; suppress it so this keydown is the SINGLE open path.
+        suppressCardClick = true;
+        setTimeout(function () { suppressCardClick = false; }, 0);
         openZoneMenu(sid, root);
       }
     });
     root.addEventListener("pointerdown", function (e) { onConsumerPointerDown(e, rec); });
+    // Tap / click opens the exit-node picker. This is the PRIMARY rewire path on
+    // touch (where drag is disabled so the page scrolls — see onConsumerPointerDown)
+    // and the no-drag mouse path. A click synthesized at the end of a mouse drag (or
+    // by a screen reader on keyboard activation) is swallowed via suppressCardClick.
+    root.addEventListener("click", function () {
+      if (!rec.interactive) return;
+      if (suppressCardClick) { suppressCardClick = false; return; }
+      openZoneMenu(rec.sid, rec.root);
+    });
     return rec;
   }
 
@@ -1684,6 +1702,11 @@
   function onConsumerPointerDown(e, rec) {
     if (!rec.interactive) return;
     if (e.button != null && e.button !== 0) return; // primary button only
+    // Touch: never start a drag. Let the browser pan/scroll the page natively
+    // (touch-action: auto in CSS); a tap with no scroll fires a `click`, which
+    // opens the picker. Drag-to-rewire stays a mouse/pen affordance — on the
+    // narrow/touch layout the exit-node drop column is hidden anyway.
+    if (e.pointerType === "touch") return;
     closeZoneMenu();
     var grid = $("#graph-grid");
     var gridRect = grid.getBoundingClientRect();
@@ -1734,11 +1757,12 @@
     state.graphDrag = null;
     removeGhost();
 
-    if (!wasActive) { // a tap/click, not a drag → open the accessible picker menu
-      var anchor = document.querySelector('[data-consumer="' + cssEscape(sid) + '"]');
-      openZoneMenu(sid, anchor || document.activeElement);
-      return;
-    }
+    if (!wasActive) return; // a plain click (no drag) → the card's click handler opens the picker
+    // A drag finished: swallow the click the browser synthesizes on release so it
+    // doesn't immediately re-open the picker. Cleared by that click, or on the next
+    // task if no click follows (so a later genuine click isn't lost).
+    suppressCardClick = true;
+    setTimeout(function () { suppressCardClick = false; }, 0);
     if (e.type === "pointercancel" || !target) { drawWiresForCurrent(); return; }
     // The right column IS the allowed set (UI guard) — any in-column drop is fine,
     // EXCEPT a router that is also an exit node being dropped on itself: the backend
@@ -1770,10 +1794,6 @@
     if (!svg) return;
     var g = svg.querySelector('[data-ghost="1"]');
     if (g && g.parentNode) g.parentNode.removeChild(g);
-  }
-  function cssEscape(s) {
-    if (window.CSS && CSS.escape) return CSS.escape(s);
-    return String(s).replace(/["\\]/g, "\\$&");
   }
 
   // --- keyboard/click rewire menu (drag is NOT the only path — a11y) -------
@@ -1816,6 +1836,12 @@
     var menu = el("div", "zone-menu");
     menu.setAttribute("role", "menu");
     menu.setAttribute("aria-label", "Choose an exit node for " + routerName);
+    // Visible header — hidden on desktop (the popover is anchored to the card), shown
+    // when the menu is a bottom sheet on touch/narrow screens. aria-hidden so the
+    // menu's aria-label isn't double-announced.
+    var title = el("div", "zone-menu-title", "Route " + routerName + " through");
+    title.setAttribute("aria-hidden", "true");
+    menu.appendChild(title);
     var items = [];
     zoneMenuOptions(sid).forEach(function (o) {
       var b = el("button", "zone-menu-item" + (o.current ? " is-current" : ""));
